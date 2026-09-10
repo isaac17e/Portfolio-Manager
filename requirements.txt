@@ -1,0 +1,7 @@
+numpy
+pandas
+yfinance>=1.7
+requests
+plotly
+scipy
+python-dotenv
