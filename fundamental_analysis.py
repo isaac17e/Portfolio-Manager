@@ -78,6 +78,7 @@ VERDE = "🟢 Luz Verde"
 ALERTA = "🔴 Alerta"
 NEUTRAL = "🟡 Neutral"
 NA = "⚪ N/D"
+INFO = "🔵 Informativo"  # sin evaluación de calidad, solo dato de referencia
 
 
 def get_row(
@@ -278,6 +279,16 @@ INDICADORES: List[Indicador] = [
 ]
 IND: Dict[str, Indicador] = {ind.senal: ind for ind in INDICADORES}
 
+# Indicadores informativos: se muestran en su propia sección del reporte (misma
+# presentación que los plazos de arriba), pero sin zonas verde/alerta y sin
+# contar para el Score_Calidad.
+INFO_INDICADORES: List[Indicador] = [
+    Indicador("Ingresos", "Revenue (Ingresos)", ("Revenue_B",), "${:,.2f}B",
+              "Revenue_Info", "Informativo · no forma parte del score", "B"),
+]
+IND.update({ind.senal: ind for ind in INFO_INDICADORES})
+TODOS_INDICADORES: List[Indicador] = INDICADORES + INFO_INDICADORES
+
 
 def clasificar_zonas(valor: float, ind: Indicador) -> str:
     """Clasifica un valor según las zonas verde/alerta del indicador."""
@@ -350,6 +361,7 @@ def metricas_anuales(
         "EBITDA": ebitda,
         "Deuda": deuda,
         "Caja": caja,
+        "Revenue": revenue,
         "FCF": g(cf, "operating_cf") - capex,
         "Deuda_Neta_EBITDA": safe_div(deuda - caja, ebitda),
         "Interest_Coverage": safe_div(ebit, abs(g(fin, "interest_expense"))),
@@ -494,6 +506,22 @@ def calcular_largo_plazo(tk: "yf.Ticker", info: Dict[str, Any], res: ResultadoTi
     res.senales["ROE_Señal"] = _roe_signal()
 
 
+def calcular_info_adicional(tk: "yf.Ticker", info: Dict[str, Any], res: ResultadoTicker) -> None:
+    """
+    Métricas informativas que se muestran en su propia sección del reporte,
+    separadas del catálogo de indicadores: no tienen zonas verde/alerta y no
+    participan en el Score_Calidad.
+    """
+    m = metricas_anuales(*_estados_anuales(tk))
+
+    # Revenue TTM (.info); si falta, el del último ejercicio fiscal
+    revenue_ttm = safe_calc(lambda: get_info_field(info, "totalRevenue"))
+    if pd.isna(revenue_ttm):
+        revenue_ttm = m["Revenue"]
+    res.metricas["Revenue_B"] = safe_div(revenue_ttm, 1e9)
+    res.senales["Revenue_Info"] = INFO
+
+
 # ==============================================================================
 # BLOQUE 5: HISTÓRICO
 # Series de los últimos ejercicios/trimestres para los gráficos del reporte.
@@ -604,6 +632,13 @@ def calcular_historico(
         h[senal] = _serie([(e, m.get(clave, np.nan)) for e, m in zip(etiquetas, ms)],
                           n_anual, anual, nota, hoy)
 
+    # Revenue: ingresos por ejercicio fiscal, escalados a miles de millones (B)
+    h["Revenue_Info"] = _serie(
+        [(e, safe_div(m.get("Revenue", np.nan), 1e9)) for e, m in zip(etiquetas, ms)],
+        n_anual, anual, "Ingresos por ejercicio fiscal · Hoy = TTM (Yahoo)",
+        [("Hoy", met.get("Revenue_B", np.nan))],
+    )
+
 
 # ==============================================================================
 # BLOQUE 6: ANÁLISIS DE LA CARTERA
@@ -640,6 +675,7 @@ def analizar_cartera(tickers_list: Sequence[str]) -> pd.DataFrame:
             calcular_corto_plazo(tk, info, res)
             calcular_mediano_plazo(tk, info, res)
             calcular_largo_plazo(tk, info, res)
+            calcular_info_adicional(tk, info, res)
             try:
                 calcular_historico(tk, res)
             except Exception as exc:
@@ -664,7 +700,7 @@ def analizar_cartera(tickers_list: Sequence[str]) -> pd.DataFrame:
         filas.append(fila)
 
     columnas_orden = ["Ticker"]
-    for ind in INDICADORES:
+    for ind in TODOS_INDICADORES:
         columnas_orden += [*ind.columnas, ind.senal]
     columnas_orden.append("Score_Calidad")
 
@@ -672,9 +708,11 @@ def analizar_cartera(tickers_list: Sequence[str]) -> pd.DataFrame:
     columnas_presentes = [c for c in columnas_orden if c in df.columns]
     df = df[columnas_presentes]
 
-    # Redondeo de columnas numéricas para presentación
+    # Redondeo de columnas numéricas para presentación (se excluyen las columnas
+    # de señal, que guardan texto en vez de números)
+    columnas_senal = {ind.senal for ind in TODOS_INDICADORES}
     for col in df.columns:
-        if col not in ("Ticker", "Score_Calidad") and "Señal" not in col:
+        if col not in ("Ticker", "Score_Calidad") and col not in columnas_senal:
             df[col] = df[col].apply(lambda x: round(x, 2) if pd.notna(x) else np.nan)
 
     df.attrs["historico"] = historicos
@@ -692,6 +730,7 @@ _SENAL_HTML = {
     NEUTRAL: ("warn", "–", "Neutral"),
     ALERTA: ("crit", "!", "Alerta"),
     NA: ("na", "?", "N/D"),
+    INFO: ("info", "i", "Info"),
 }
 
 _HTML_TEMPLATE = Template("""<!DOCTYPE html>
@@ -729,6 +768,7 @@ _HTML_TEMPLATE = Template("""<!DOCTYPE html>
   .warn { --s: var(--warn); --s-ink: #0b0b0b; }
   .crit { --s: var(--crit); --s-ink: #ffffff; }
   .na   { --s: var(--na);   --s-ink: var(--ink-2); }
+  .info { --s: var(--series); --s-ink: #ffffff; }
   .ico { display: inline-grid; place-items: center; width: 16px; height: 16px;
          border-radius: 50%; background: var(--s); color: var(--s-ink);
          font: 700 10px/1 system-ui, sans-serif; font-style: normal; flex: none; }
@@ -858,6 +898,16 @@ _HTML_TEMPLATE = Template("""<!DOCTYPE html>
   Score = señales en verde sobre $n_ind. Una señal sin datos cuenta como no cumplida.
   Tickers ordenados por score. Luz Verde Global ≥ $score_verde · Calidad Media ≥ $score_media ·
   Alerta Global &lt; $score_media.</p>
+
+  <h2 class="section">Ingresos por compañía</h2>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th class="ind">Indicador</th>$thead</tr></thead>
+      <tbody>$tbody_info</tbody>
+    </table>
+  </div>
+  <p class="note">Sección informativa (<i class="ico info" style="width:14px;height:14px;font-size:9px;">i</i>):
+  no participa en el Score_Calidad ni tiene zonas verde/alerta.</p>
 </div>
 <div class="tip" id="tip" role="tooltip" hidden></div>
 <div class="pop" id="pop" role="dialog" hidden></div>
@@ -1185,6 +1235,31 @@ def exportar_html(
         + "</tr>"
     )
 
+    # --- Sección informativa: mismos "plazos" que la matriz de arriba, pero
+    # sin zonas verde/alerta ni participación en el score ---
+    tbody_info = []
+    horizontes_info = list(dict.fromkeys(ind.horizonte for ind in INFO_INDICADORES))
+    for hz in horizontes_info:
+        tbody_info.append(f'<tr class="group"><th colspan="{len(tickers) + 1}">{esc(hz)}</th></tr>')
+        for i, ind in enumerate(INFO_INDICADORES, start=len(INDICADORES)):
+            if ind.horizonte != hz:
+                continue
+            celdas = []
+            for t, (row, _, _) in enumerate(tickers):
+                senal = row.get(ind.senal, NA)
+                senal = senal if senal in _SENAL_HTML else NA
+                cls, glifo, texto = _SENAL_HTML[senal]
+                celdas.append(
+                    f'<td class="cell {cls}" data-t="{t}" data-i="{i}" tabindex="0">'
+                    f'<span class="val">{esc(_formatear_valor(row, ind))}</span>'
+                    f'<span class="sub"><span class="pill"><i class="ico">{glifo}</i>{texto}</span>'
+                    f'<span class="spk"></span></span></td>'
+                )
+            tbody_info.append(
+                f'<tr><th class="ind">{esc(ind.nombre)}<span class="rule">{esc(ind.regla)}</span></th>'
+                f'{"".join(celdas)}</tr>'
+            )
+
     # --- Datos para los gráficos (JSON embebido) ---
     def _limites(zona: Tuple[float, float]) -> List[Optional[float]]:
         return [None if np.isinf(x) else x for x in zona]
@@ -1197,10 +1272,10 @@ def exportar_html(
         {"n": ind.nombre, "u": ind.unidad,
          "v": _limites(ind.verde) if ind.verde else None,
          "a": [_limites(z) for z in ind.alerta]}
-        for ind in INDICADORES
+        for ind in TODOS_INDICADORES
     ]
     hist_json = [
-        [historico.get(str(row["Ticker"]), {}).get(ind.senal) for ind in INDICADORES]
+        [historico.get(str(row["Ticker"]), {}).get(ind.senal) for ind in TODOS_INDICADORES]
         for row, _, _ in tickers
     ]
 
@@ -1213,6 +1288,7 @@ def exportar_html(
         cards="".join(cards),
         thead=thead,
         tbody="".join(tbody),
+        tbody_info="".join(tbody_info),
         ind_json=_json(ind_json),
         hist_json=_json(hist_json),
         tk_json=_json([str(row["Ticker"]) for row, _, _ in tickers]),
