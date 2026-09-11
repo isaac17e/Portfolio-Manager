@@ -26,13 +26,11 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 INF = float("inf")  # "sin límite" en los umbrales
 
-
 # ==============================================================================
 # BLOQUE 1: CONFIGURACIÓN  <<<  EDITA AQUÍ  >>>
-# Portafolio, salida del reporte, profundidad del histórico y umbrales de las
-# señales. Es el único bloque pensado para tocar.
 # ==============================================================================
-PORTFOLIO_TICKERS: List[str] = ["AAPL", "MSFT", "GOOGL", "NVDA"]
+
+PORTFOLIO_TICKERS: List[str] = ["CRM", "DELL", "EBAY", "GOOGL", "META", "MSFT", "ORCL"]
 
 # --- salida -------------------------------------------------------------------
 OUTPUT_HTML: str = "reporte_fundamental.html"   # relativo a la carpeta del script
@@ -51,9 +49,6 @@ TASA_IMPOSITIVA_FALLBACK: float = 0.21   # NOPAT si la tasa efectiva falta o es 
 
 # --- umbrales de las señales --------------------------------------------------
 # verde: rango (mín, máx) que da luz verde · alerta: lista de rangos que dan alerta.
-# Límites exclusivos; INF = sin límite; lo que no cae en ninguno es Neutral.
-# De aquí salen las señales, el texto de reglas del reporte y las zonas de los
-# gráficos. P/E no usa umbrales: compara Forward contra Trailing.
 UMBRALES: Dict[str, Dict[str, Any]] = {
     "Current_Ratio":       {"verde": (1.5, 2.5),   "alerta": [(-INF, 1.0), (3.0, INF)]},
     "EV_EBITDA":           {"verde": (0.0, 12.0),  "alerta": [(-INF, 0.0), (20.0, INF)]},
@@ -197,8 +192,6 @@ ROWS = {
 
 # ==============================================================================
 # BLOQUE 3: CATÁLOGO DE INDICADORES
-# Orden de columnas, formato y reglas de cada indicador. Las zonas y el texto
-# de las reglas se construyen a partir de UMBRALES (bloque 1).
 # ==============================================================================
 @dataclass(frozen=True)
 class Indicador:
@@ -316,8 +309,6 @@ class ResultadoTicker:
 
 # ==============================================================================
 # BLOQUE 4: CÁLCULO DE MÉTRICAS
-# Métricas contables por ejercicio (compartidas por valor actual e histórico)
-# y los 12 indicadores agrupados por horizonte.
 # ==============================================================================
 def deuda_total(bs: Optional[pd.DataFrame], j: int = 0) -> float:
     total_debt = get_row(bs, ROWS["total_debt"], j)
