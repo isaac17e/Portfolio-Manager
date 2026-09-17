@@ -30,7 +30,7 @@ INF = float("inf")  # "sin límite" en los umbrales
 # BLOQUE 1: CONFIGURACIÓN  <<<  EDITA AQUÍ  >>>
 # ==============================================================================
 
-PORTFOLIO_TICKERS: List[str] = ["CRM", "DELL", "EBAY", "GOOGL", "META", "MSFT", "ORCL"]
+PORTFOLIO_TICKERS: List[str] = ["BBWI", "HP", "CROX", "ZM", "ADBE"]
 
 # --- salida -------------------------------------------------------------------
 OUTPUT_HTML: str = "reporte_fundamental.html"   # relativo a la carpeta del script
@@ -285,6 +285,8 @@ IND: Dict[str, Indicador] = {ind.senal: ind for ind in INDICADORES}
 INFO_INDICADORES: List[Indicador] = [
     Indicador("Ingresos", "Revenue (Ingresos)", ("Revenue_B",), "${:,.2f}B",
               "Revenue_Info", "Informativo · no forma parte del score", "B"),
+    Indicador("Ingresos", "Earnings Yield", ("Earnings_Yield_%",), "{:.2f}%",
+              "Earnings_Yield_Info", "Informativo · no forma parte del score", "%"),
 ]
 IND.update({ind.senal: ind for ind in INFO_INDICADORES})
 TODOS_INDICADORES: List[Indicador] = INDICADORES + INFO_INDICADORES
@@ -521,6 +523,12 @@ def calcular_info_adicional(tk: "yf.Ticker", info: Dict[str, Any], res: Resultad
     res.metricas["Revenue_B"] = safe_div(revenue_ttm, 1e9)
     res.senales["Revenue_Info"] = INFO
 
+    # Earnings Yield TTM = inverso del P/E trailing (Net Income / Market Cap)
+    pe_trailing = res.metricas.get("PE_Trailing", np.nan)
+    earnings_yield = safe_div(100, pe_trailing) if not pd.isna(pe_trailing) and pe_trailing > 0 else np.nan
+    res.metricas["Earnings_Yield_%"] = earnings_yield
+    res.senales["Earnings_Yield_Info"] = INFO
+
 
 # ==============================================================================
 # BLOQUE 5: HISTÓRICO
@@ -637,6 +645,13 @@ def calcular_historico(
         [(e, safe_div(m.get("Revenue", np.nan), 1e9)) for e, m in zip(etiquetas, ms)],
         n_anual, anual, "Ingresos por ejercicio fiscal · Hoy = TTM (Yahoo)",
         [("Hoy", met.get("Revenue_B", np.nan))],
+    )
+
+    # Earnings Yield: inverso del P/E de cierre de cada ejercicio
+    h["Earnings_Yield_Info"] = _serie(
+        [(e, safe_div(100, m.get("PE", np.nan))) for e, m in zip(etiquetas, ms)],
+        n_anual, anual, "Earnings Yield = 100 / P/E trailing · Hoy = TTM (Yahoo)",
+        [("Hoy", met.get("Earnings_Yield_%", np.nan))],
     )
 
 
