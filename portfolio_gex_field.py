@@ -40,6 +40,9 @@ BASE_STRIKE_RANGE_PCT = 0.08
 RISK_FREE_RATE = 0.05
 NEAR_ATM_BAND_PCT = 0.03
 IV_SANITY_MIN, IV_SANITY_MAX = 0.01, 2.50
+DIVIDEND_YIELD_FALLBACK = 0.0
+GREEK_BUMP_PCT = 0.01
+MIN_TOTAL_VOL = 1e-3
 NEAR_TERM_DAYS_CUTOFF = 7
 
 MACRO_LOOKBACK_PERIOD = "1y"
@@ -113,39 +116,104 @@ def clamp_iv(iv):
     return iv if (IV_SANITY_MIN <= iv <= IV_SANITY_MAX) else np.nan
 
 
-def bs_price(S, K, T, r, sigma, option_type="call"):
+@functools.lru_cache(maxsize=None)
+def get_dividend_yield(ticker):
+    try:
+        raw = yf.Ticker(ticker).info.get("dividendYield")
+    except Exception as e:
+        print(f"⚠️  [{ticker}] No se pudo leer el dividend yield ({e}). Se asume {DIVIDEND_YIELD_FALLBACK:.2%}.")
+        return DIVIDEND_YIELD_FALLBACK
+    if raw is None:
+        return DIVIDEND_YIELD_FALLBACK
+    q = float(raw)
+    if q > 1.0:  # yfinance alterna entre fracción (0.0072) y porcentaje (0.72) según versión
+        q /= 100.0
+    return q if 0.0 <= q < 0.25 else DIVIDEND_YIELD_FALLBACK
+
+
+def bs_price(S, K, T, r, q, sigma, option_type="call"):
     if T <= 0 or sigma <= 0:
         return max(0.0, (S - K) if option_type == "call" else (K - S))
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
+    scaled_vol = sigma * np.sqrt(T)
+    d1 = (np.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / scaled_vol
+    d2 = d1 - scaled_vol
+    carry_factor = np.exp(-q * T)
+    discount = np.exp(-r * T)
     if option_type == "call":
-        return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+        return S * carry_factor * norm.cdf(d1) - K * discount * norm.cdf(d2)
     else:
-        return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+        return K * discount * norm.cdf(-d2) - S * carry_factor * norm.cdf(-d1)
 
 
-def bs_gamma(S, K, T, r, sigma):
+def _bs93_phi(S, T, gamma, boundary, trigger, r, b, sigma, log_offset=0.0):
+    variance = sigma ** 2
+    scaled_vol = sigma * np.sqrt(T)
+    lam = (-r + gamma * b + 0.5 * gamma * (gamma - 1.0) * variance) * T
+    kappa = 2.0 * b / variance + (2.0 * gamma - 1.0)
+    d = -(np.log(S / boundary) + (b + (gamma - 0.5) * variance) * T) / scaled_vol
+    d_reflected = d - 2.0 * np.log(trigger / S) / scaled_vol
+    # Todo se arma en logaritmos y log_offset absorbe el alpha del llamador: a vol baja beta crece
+    # como 1/sigma^2 y los factores sueltos (S**beta, (trigger/S)**kappa) desbordan por separado
+    # aunque el producto siga siendo finito.
+    log_scale = lam + gamma * np.log(S) + log_offset
+    reflected = np.exp(log_scale + kappa * np.log(trigger / S) + norm.logcdf(d_reflected))
+    return np.exp(log_scale) * norm.cdf(d) - reflected
+
+
+def _bs93_american_call(S, K, T, r, q, sigma):
+    european = bs_price(S, K, T, r, q, sigma, "call")
+    b = r - q
+    if b >= r:  # sin dividendos nunca conviene ejercer una call anticipadamente
+        return european
+    if sigma * np.sqrt(T) < MIN_TOTAL_VOL:  # régimen casi determinista: la frontera plana degenera
+        return max(S - K, european)
+    variance = sigma ** 2
+    beta = (0.5 - b / variance) + np.sqrt((b / variance - 0.5) ** 2 + 2.0 * r / variance)
+    boundary_inf = beta / (beta - 1.0) * K
+    boundary_now = max(K, r / (r - b) * K)
+    if boundary_inf <= boundary_now:
+        return european
+    h = -(b * T + 2.0 * sigma * np.sqrt(T)) * boundary_now / (boundary_inf - boundary_now)
+    if h >= 0.0:  # frontera degenerada (sigma -> 0): se cae a la cota inferior del americano
+        return max(S - K, european)
+    trigger = boundary_now + (boundary_inf - boundary_now) * (1.0 - np.exp(h))
+    if S >= trigger:
+        return S - K
+    premium, log_alpha = trigger - K, -beta * np.log(trigger)
+    return (premium * np.exp(beta * np.log(S / trigger))
+            - premium * _bs93_phi(S, T, beta, trigger, trigger, r, b, sigma, log_alpha)
+            + _bs93_phi(S, T, 1.0, trigger, trigger, r, b, sigma)
+            - _bs93_phi(S, T, 1.0, K, trigger, r, b, sigma)
+            - K * _bs93_phi(S, T, 0.0, trigger, trigger, r, b, sigma)
+            + K * _bs93_phi(S, T, 0.0, K, trigger, r, b, sigma))
+
+
+def american_price(S, K, T, r, q, sigma, option_type="call"):
     if T <= 0 or sigma <= 0:
-        return 0.0
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-    return norm.pdf(d1) / (S * sigma * np.sqrt(T))
+        return max(0.0, (S - K) if option_type == "call" else (K - S))
+    if option_type == "call":
+        return _bs93_american_call(S, K, T, r, q, sigma)
+    return _bs93_american_call(K, S, T, q, r, sigma)
 
 
-def bs_delta(S, K, T, r, sigma, option_type="call"):
-    if T <= 0 or sigma <= 0:
-        return 1.0 if (option_type == "call" and S > K) else 0.0
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-    return norm.cdf(d1) if option_type == "call" else norm.cdf(d1) - 1.0
-
-
-def implied_vol_bisection(market_price, S, K, T, r, option_type="call"):
+def american_iv_bisection(market_price, S, K, T, r, q, option_type="call"):
     if market_price <= 0 or T <= 0:
         return np.nan
     try:
-        f = lambda sigma: bs_price(S, K, T, r, sigma, option_type) - market_price
+        f = lambda sigma: american_price(S, K, T, r, q, sigma, option_type) - market_price
         return brentq(f, 1e-4, 5.0, maxiter=200)
     except (ValueError, RuntimeError):
         return np.nan
+
+
+def american_delta_gamma(S, K, T, r, q, sigma, option_type="call"):
+    if T <= 0 or sigma <= 0 or S <= 0:
+        return np.nan, np.nan
+    bump = max(S * GREEK_BUMP_PCT, 1e-4)
+    up = american_price(S + bump, K, T, r, q, sigma, option_type)
+    mid = american_price(S, K, T, r, q, sigma, option_type)
+    down = american_price(S - bump, K, T, r, q, sigma, option_type)
+    return (up - down) / (2.0 * bump), (up - 2.0 * mid + down) / (bump ** 2)
 
 
 # ============================================================
@@ -283,6 +351,8 @@ def get_polygon_options_data(ticker, current_price, horizon_months=TIME_HORIZON_
         reliable = near_atm["iv_polygon"].dropna()
         atm_iv_by_exp[exp] = float(reliable.median()) if len(reliable) > 0 else np.nan
 
+    div_yield = get_dividend_yield(ticker)
+
     rows = []
     n_far_proxy = 0
     for _, r in df_raw.iterrows():
@@ -298,8 +368,8 @@ def get_polygon_options_data(ticker, current_price, horizon_months=TIME_HORIZON_
 
             if pd.isna(iv):
                 if is_near_atm and r["ref_price"]:
-                    iv_solved = clamp_iv(implied_vol_bisection(r["ref_price"], current_price, r["strike"],
-                                                                 T_eff, RISK_FREE_RATE, r["type"]))
+                    iv_solved = clamp_iv(american_iv_bisection(r["ref_price"], current_price, r["strike"],
+                                                                T_eff, RISK_FREE_RATE, div_yield, r["type"]))
                     if not np.isnan(iv_solved):
                         iv = iv_solved
                 if pd.isna(iv):
@@ -308,11 +378,15 @@ def get_polygon_options_data(ticker, current_price, horizon_months=TIME_HORIZON_
                         iv = proxy
                         n_far_proxy += 1
 
-            if (pd.isna(gamma) or gamma == 0) and iv and not np.isnan(iv):
-                gamma = bs_gamma(current_price, r["strike"], T_eff, RISK_FREE_RATE, iv)
-
-            if pd.isna(delta) and iv and not np.isnan(iv):
-                delta = bs_delta(current_price, r["strike"], T_eff, RISK_FREE_RATE, iv, r["type"])
+            needs_gamma = pd.isna(gamma) or gamma == 0
+            needs_delta = pd.isna(delta)
+            if (needs_gamma or needs_delta) and iv and not np.isnan(iv):
+                delta_bs93, gamma_bs93 = american_delta_gamma(current_price, r["strike"], T_eff,
+                                                              RISK_FREE_RATE, div_yield, iv, r["type"])
+                if needs_gamma:
+                    gamma = gamma_bs93
+                if needs_delta:
+                    delta = delta_bs93
 
             rows.append({
                 "strike": r["strike"], "expiration": r["expiration"], "type": r["type"],
