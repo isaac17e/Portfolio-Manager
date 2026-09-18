@@ -41,6 +41,7 @@ RISK_FREE_RATE = 0.05
 NEAR_ATM_BAND_PCT = 0.03
 IV_SANITY_MIN, IV_SANITY_MAX = 0.01, 2.50
 DIVIDEND_YIELD_FALLBACK = 0.0
+MAX_DIVIDEND_YIELD = 0.25
 GREEK_BUMP_PCT = 0.01
 MIN_TOTAL_VOL = 1e-3
 NEAR_TERM_DAYS_CUTOFF = 7
@@ -126,9 +127,11 @@ def get_dividend_yield(ticker):
     if raw is None:
         return DIVIDEND_YIELD_FALLBACK
     q = float(raw)
-    if q > 1.0:  # yfinance alterna entre fracción (0.0072) y porcentaje (0.72) según versión
+    # yfinance alterna entre fracción (0.0072) y porcentaje (0.72) según versión. Ninguna acción
+    # rinde más de 25% en forma fraccionaria, así que por encima de ese corte es porcentaje.
+    if q > MAX_DIVIDEND_YIELD:
         q /= 100.0
-    return q if 0.0 <= q < 0.25 else DIVIDEND_YIELD_FALLBACK
+    return q if 0.0 <= q <= MAX_DIVIDEND_YIELD else DIVIDEND_YIELD_FALLBACK
 
 
 def bs_price(S, K, T, r, q, sigma, option_type="call"):
