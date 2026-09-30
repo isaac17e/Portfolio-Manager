@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import json
+import time
 import warnings
 import webbrowser
 from dataclasses import dataclass, field
@@ -46,6 +47,10 @@ SCORE_CALIDAD_MEDIA_MIN: int = 6   # para "Calidad Media"; debajo, "Alerta Globa
 
 # --- supuestos de cálculo -----------------------------------------------------
 TASA_IMPOSITIVA_FALLBACK: float = 0.21   # NOPAT si la tasa efectiva falta o es anómala
+
+# --- descarga -----------------------------------------------------------------
+INFO_REINTENTOS: int = 1           # reintentos de .info si Yahoo falla o limita
+INFO_ESPERA_REINTENTO: float = 3.0  # segundos entre intentos
 
 # --- umbrales de las señales --------------------------------------------------
 # verde: rango (mín, máx) que da luz verde · alerta: lista de rangos que dan alerta.
@@ -318,6 +323,7 @@ class ResultadoTicker:
     errores: List[str] = field(default_factory=list)
     # señal -> {"f": frecuencia, "n": nota, "p": [(etiqueta, valor, es_hoy), ...]}
     historico: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    datos_incompletos: bool = False  # .info no se pudo descargar tras los reintentos
 
 
 # ==============================================================================
@@ -378,6 +384,23 @@ def metricas_anuales(
 
 def _estados_anuales(tk: "yf.Ticker") -> Tuple[Optional[pd.DataFrame], ...]:
     return tuple(safe_get_df(tk, a) for a in ("balance_sheet", "financials", "cashflow"))
+
+
+def obtener_info(tk: "yf.Ticker") -> Dict[str, Any]:
+    """
+    Descarga .info con reintentos. Yahoo a veces limita (429) y devuelve un
+    error o un diccionario vacío; un solo reintento suele bastar.
+    """
+    for intento in range(INFO_REINTENTOS + 1):
+        try:
+            info = tk.info or {}
+        except Exception:
+            info = {}
+        if info:
+            return info
+        if intento < INFO_REINTENTOS:
+            time.sleep(INFO_ESPERA_REINTENTO)
+    return {}
 
 
 def calcular_corto_plazo(tk: "yf.Ticker", info: Dict[str, Any], res: ResultadoTicker) -> None:
@@ -681,11 +704,13 @@ def analizar_cartera(tickers_list: Sequence[str]) -> pd.DataFrame:
         res = ResultadoTicker(ticker=ticker_str)
         try:
             tk = yf.Ticker(ticker_str)
-            try:
-                info = tk.info or {}
-            except Exception:
-                info = {}
-                res.errores.append("No se pudo obtener .info")
+            info = obtener_info(tk)
+            if not info:
+                res.datos_incompletos = True
+                res.errores.append(
+                    f"No se pudo obtener .info tras {INFO_REINTENTOS + 1} intento(s): "
+                    "EV/EBITDA, P/E, PEG, FCF Yield y otros quedan en N/D"
+                )
 
             calcular_corto_plazo(tk, info, res)
             calcular_mediano_plazo(tk, info, res)
@@ -707,17 +732,22 @@ def analizar_cartera(tickers_list: Sequence[str]) -> pd.DataFrame:
         n_verde = sum(1 for v in res.senales.values() if v == VERDE)
         etiqueta, _ = etiqueta_score(n_verde)
         score = f"{n_verde}/{len(INDICADORES)} Criterios Cumplidos - {etiqueta}"
+        if res.datos_incompletos:
+            # El score sigue la regla de siempre (N/D = no cumplido), pero queda
+            # marcado: un bloqueo de Yahoo no es lo mismo que una mala empresa.
+            score += " (DATOS INCOMPLETOS: falló la descarga de .info)"
 
         fila = {"Ticker": ticker_str}
         fila.update(res.metricas)
         fila.update(res.senales)
         fila["Score_Calidad"] = score
+        fila["Datos_Incompletos"] = res.datos_incompletos
         filas.append(fila)
 
     columnas_orden = ["Ticker"]
     for ind in TODOS_INDICADORES:
         columnas_orden += [*ind.columnas, ind.senal]
-    columnas_orden.append("Score_Calidad")
+    columnas_orden += ["Score_Calidad", "Datos_Incompletos"]
 
     df = pd.DataFrame(filas)
     columnas_presentes = [c for c in columnas_orden if c in df.columns]
@@ -727,7 +757,7 @@ def analizar_cartera(tickers_list: Sequence[str]) -> pd.DataFrame:
     # de señal, que guardan texto en vez de números)
     columnas_senal = {ind.senal for ind in TODOS_INDICADORES}
     for col in df.columns:
-        if col not in ("Ticker", "Score_Calidad") and col not in columnas_senal:
+        if col not in ("Ticker", "Score_Calidad", "Datos_Incompletos") and col not in columnas_senal:
             df[col] = df[col].apply(lambda x: round(x, 2) if pd.notna(x) else np.nan)
 
     df.attrs["historico"] = historicos
@@ -1195,6 +1225,8 @@ def exportar_html(
             etiqueta, clave = "Sin datos", "na"
         else:
             etiqueta, clave = etiqueta_score(n_verde)
+            if bool(row.get("Datos_Incompletos", False)):
+                etiqueta += " · datos incompletos"
         glifo_badge = {"good": "✓", "warn": "–", "crit": "!", "na": "?"}[clave]
         grupos = []
         for hz in horizontes:

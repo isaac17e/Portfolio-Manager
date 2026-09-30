@@ -3,17 +3,17 @@
 # ============================================================================
 
 import os
-import time
 import math
 import warnings
 from datetime import date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
-import requests
 from scipy.stats import norm
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+
+from polygon_client import PolygonClient, PolygonError
 
 # ============================================================================
 # BLOQUE 1: PARAMETROS CONFIGURABLES
@@ -45,9 +45,8 @@ strike_window_pct        = 0.15
 
 POLYGON_BASE_URL = "https://api.polygon.io"
 
-polygon_max_retries    = 2
+polygon_max_retries    = 4
 polygon_retry_wait_sec = 15
-polygon_min_interval_sec = 13.0  # espaciado global entre llamadas: el plan actual limita ~5/min
 polygon_max_pages      = 40
 polygon_page_limit     = 250
 
@@ -143,9 +142,6 @@ implied_corr_scale_iter   = 80
 implied_corr_block_tol    = 1e-4
 implied_corr_block_repair = 8
 
-history_request_pause_sec = 1.0
-history_max_retries       = 4
-
 ctr_cap_multiple        = 1.5            # techo de CTR = multiplo del reparto equiponderado
 guardrail_max_iter      = 25
 guardrail_damping       = 0.6
@@ -168,41 +164,25 @@ risk_layer_colors    = {"antes": "#B0BEC5", "despues": "#00695C", "techo": "#C62
 # BLOQUE 2: EXTRACCION Y PROCESAMIENTO DE OPCIONES (POLYGON API v3)
 # ============================================================================
 
-_last_polygon_call_ts = 0.0  # espaciado global entre llamadas, cualquier endpoint
+_clientes_polygon = {}
 
 
-def polygon_get(url, params=None, api_key=polygon_api_key, max_retries=polygon_max_retries):
-    global _last_polygon_call_ts
-    if params is None:
-        params = {}
-    params = dict(params)
-    params["apiKey"] = api_key
-    attempt = 0
-    while True:
-        attempt += 1
-        espera = polygon_min_interval_sec - (time.time() - _last_polygon_call_ts)
-        if espera > 0:
-            time.sleep(espera)
-        try:
-            resp = requests.get(url, params=params, timeout=20)
-        except requests.exceptions.RequestException as e:
-            _last_polygon_call_ts = time.time()
-            warnings.warn(f"Fallo de red en {url}: {e}")
-            return None
-        _last_polygon_call_ts = time.time()
-        status = resp.status_code
-        if status == 200:
-            try:
-                return resp.json()
-            except ValueError:
-                return None
-        elif status == 429 and attempt <= max_retries:
-            warnings.warn("Rate limit alcanzado (429). Esperando antes de reintentar...")
-            time.sleep(polygon_retry_wait_sec)
-            continue
-        else:
-            warnings.warn(f"Polygon API error [{status}] en {url}")
-            return None
+def polygon_client(api_key=polygon_api_key):
+    # Transporte compartido (polygon_client.py): ritmo por ventana de 60s,
+    # reintentos ante 429/5xx/red y paginacion que falla en vez de truncar.
+    if api_key not in _clientes_polygon:
+        _clientes_polygon[api_key] = PolygonClient(
+            api_key=api_key, max_retries=polygon_max_retries, retry_wait=polygon_retry_wait_sec)
+    return _clientes_polygon[api_key]
+
+
+def polygon_get(url, params=None, api_key=polygon_api_key):
+    # Para las llamadas cuyo fallo se tolera (spot, historico): avisa y devuelve None.
+    try:
+        return polygon_client(api_key).get(url, params)
+    except PolygonError as e:
+        warnings.warn(str(e))
+        return None
 
 
 def get_options_snapshot(ticker, exp_date_from, exp_date_to, api_key=polygon_api_key):
@@ -215,29 +195,10 @@ def get_options_snapshot(ticker, exp_date_from, exp_date_to, api_key=polygon_api
         "sort": "strike_price",
     }
 
-    all_results = []
-    next_url = url
-    next_params = params
-    page_guard = 0
-
-    while True:
-        page_guard += 1
-        if page_guard > polygon_max_pages:
-            warnings.warn(f"Se alcanzo el limite de paginas de seguridad para {ticker}")
-            break
-
-        resp = polygon_get(next_url, params=next_params, api_key=api_key)
-        if not resp or not resp.get("results"):
-            break
-
-        all_results.extend(resp["results"])
-
-        next_url_val = resp.get("next_url")
-        if next_url_val:
-            next_url = next_url_val
-            next_params = {"apiKey": api_key}
-        else:
-            break
+    # Si una pagina falla o se alcanza el tope, se lanza PolygonError: una cadena
+    # a medias (ordenada por strike, perderia los strikes altos) sesgaria el GEX,
+    # el flip y el PCR sin avisar. analyze_ticker_options marca el ticker como ERROR.
+    all_results = polygon_client(api_key).paginate(url, params, max_pages=polygon_max_pages)
 
     if not all_results:
         warnings.warn(f"Sin cadena de opciones disponible para {ticker} en el rango solicitado.")
@@ -300,27 +261,41 @@ def get_spot_price(ticker, api_key=polygon_api_key):
 
 
 def select_target_expiration(ticker, horizon_days, api_key=polygon_api_key):
-    target_date = date.today() + timedelta(days=math.ceil(horizon_days * 7 / 5))
+    # Se buscan solo los dos vencimientos que rodean al objetivo (el primero en o
+    # despues, y el ultimo en o antes) con limit=1 cada uno. Pedir una sola pagina
+    # de contratos ordenada por fecha no sirve: en subyacentes con vencimientos
+    # diarios o semanales (SPY, GLD) los primeros 1000 contratos cubren apenas
+    # 2-5 dias y el "mas cercano al objetivo" terminaba siendo uno de esos.
+    today = date.today()
+    target_date = today + timedelta(days=math.ceil(horizon_days * 7 / 5))
     url = f"{POLYGON_BASE_URL}/v3/reference/options/contracts"
-    params = {
-        "underlying_ticker": ticker,
-        "expiration_date.gte": str(date.today()),
+    base = {"underlying_ticker": ticker, "contract_type": "call",
+            "sort": "expiration_date", "limit": 1}
+
+    # Si cualquiera de las dos consultas falla se propaga el error: con un solo
+    # lado se elegiria un vencimiento lejano al objetivo sin saberlo.
+    cliente = polygon_client(api_key)
+    lado_posterior = cliente.get(url, params={
+        **base, "order": "asc",
+        "expiration_date.gte": str(target_date),
         "expiration_date.lte": str(target_date + timedelta(days=expiration_search_window_days)),
-        "limit": 1000,
-        "order": "asc",
-        "sort": "expiration_date",
-    }
-    resp = polygon_get(url, params=params, api_key=api_key)
-    if not resp or not resp.get("results"):
+    })
+    lado_anterior = cliente.get(url, params={
+        **base, "order": "desc",
+        "expiration_date.gte": str(today),
+        "expiration_date.lte": str(target_date),
+    })
+
+    candidatos = sorted({
+        datetime.strptime(r["expiration_date"], "%Y-%m-%d").date()
+        for resp in (lado_anterior, lado_posterior)
+        for r in ((resp or {}).get("results") or [])
+        if r.get("expiration_date")
+    })
+    if not candidatos:
         warnings.warn(f"No se encontraron contratos de opciones para {ticker}")
         return None
-
-    expirations = sorted({r["expiration_date"] for r in resp["results"] if r.get("expiration_date")})
-    if not expirations:
-        return None
-
-    expirations = [datetime.strptime(e, "%Y-%m-%d").date() for e in expirations]
-    return min(expirations, key=lambda d: abs((d - target_date).days))
+    return min(candidatos, key=lambda d: abs((d - target_date).days))
 
 # ============================================================================
 # BLOQUE 3: METRICAS DE MICROESTRUCTURA (GEX / ORDER FLOW / VANNA-CHARM)
@@ -714,13 +689,11 @@ def get_price_history(tickers, lookback_days=corr_lookback_days, api_key=polygon
     start = end - timedelta(days=lookback_days)
     series = {}
 
-    for i, tk in enumerate(tickers):
-        if i > 0:
-            time.sleep(history_request_pause_sec)  # el plan gratuito de Polygon limita por minuto
+    for tk in tickers:
         url = (f"{POLYGON_BASE_URL}/v2/aggs/ticker/{tk}/range/1/day/"
                f"{start.isoformat()}/{end.isoformat()}")
         resp = polygon_get(url, params={"adjusted": "true", "sort": "asc", "limit": 50000},
-                           api_key=api_key, max_retries=history_max_retries)
+                           api_key=api_key)
         rows = (resp or {}).get("results") or []
         if not rows:
             warnings.warn(f"Sin historico de precios para {tk}: queda fuera de la capa de riesgo.")

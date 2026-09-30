@@ -9,7 +9,6 @@ from __future__ import annotations
 import argparse
 import math
 import os
-import time
 import warnings
 import webbrowser
 from dataclasses import dataclass, field
@@ -18,7 +17,7 @@ from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-import requests
+from polygon_client import PolygonClient
 from scipy.interpolate import CubicSpline
 from scipy.optimize import brentq, least_squares
 from scipy.stats import norm
@@ -95,8 +94,8 @@ IV_SANITY_MAX: float = 3.00
 QUOTE_SPREAD_LIQUID: float = 0.02        # semi-spread sintético (OI o volumen > 0)
 QUOTE_SPREAD_ILLIQUID: float = 0.12      # semi-spread sintético (contrato sin actividad)
 QUOTE_MIN_HALF_SPREAD: float = 0.01      # tick mínimo
-POLYGON_MAX_PAGES: int = 25              # tope de paginación por petición
-STOCKS_THROTTLE_SECONDS: float = 13.0    # respeta el límite de 5/min del tier Stocks
+POLYGON_MAX_PAGES: int = 25              # tope de paginación por cadena (si se alcanza: error)
+POLYGON_MAX_PAGES_EXPIRATIONS: int = 15  # tope al listar vencimientos (si se alcanza: error)
 
 
 # ==============================================================================
@@ -444,12 +443,34 @@ class DeAmericanizer:
     def transform(
         self, chain: pd.DataFrame, S: float, T: float, r: float, q: float, tag: str = ""
     ) -> pd.DataFrame:
+        # Contratos americanos de Polygon con IV publicada: su precio se construyo
+        # en PolygonMarketLoader._chain valorando esa misma IV con el modelo
+        # americano, asi que invertirlo con brentq devolvia la IV publicada (hasta
+        # la tolerancia del solver). Se usa directamente y solo se repricia como
+        # europea. El resto (cierre del dia, Yahoo, sinteticos) sigue invirtiendose.
+        # Se excluyen los contratos cuyo precio americano es el intrinseco (puts
+        # muy ITM con ejercicio inmediato): ahi el precio no depende de sigma y el
+        # solver devuelve su cota inferior; se conserva ese comportamiento original.
+        if {"iv_publicada", "style", "iv_polygon"}.issubset(chain.columns):
+            intrinseco = np.where(
+                chain["type"].eq("call"), S - chain["strike"], chain["strike"] - S
+            ).clip(min=0.0)
+            usar_publicada = (
+                chain["iv_publicada"].fillna(False).astype(bool)
+                & chain["style"].eq("american")
+                & (chain["mid"] > intrinseco + 1e-6)
+            )
+        else:
+            usar_publicada = pd.Series(False, index=chain.index)
         ivs, prices_eu, premia = [], [], []
-        for _, row in chain.iterrows():
+        for idx, row in chain.iterrows():
             k, kind, mid = float(row["strike"]), str(row["type"]), float(row["mid"])
-            iv = implied_vol(mid, S, k, T, r, q, kind, "american", self.engine)
-            if not np.isfinite(iv):
-                iv = implied_vol(mid, S, k, T, r, q, kind, "european")
+            if usar_publicada[idx]:
+                iv = float(row["iv_polygon"])
+            else:
+                iv = implied_vol(mid, S, k, T, r, q, kind, "american", self.engine)
+                if not np.isfinite(iv):
+                    iv = implied_vol(mid, S, k, T, r, q, kind, "european")
             p_eu = bs_price(S, k, T, r, q, iv, kind) if np.isfinite(iv) else float("nan")
             ivs.append(iv)
             prices_eu.append(p_eu)
@@ -1029,48 +1050,25 @@ class PolygonMarketLoader:
             raise RuntimeError(
                 "No se encontró POLYGON_API_KEY (defínela en el archivo .env o en el entorno)"
             )
+        self.client = PolygonClient(api_key=self.api_key, timeout=30, verbose=verbose)
         self.r = r
         self.engine = engine
         self.min_days = min_days
         self.max_days = max_days
         self.strike_range_pct = strike_range_pct
         self.verbose = verbose
-        self.session = requests.Session()
-        self._last_stock_call = 0.0
 
     # -- transporte ------------------------------------------------------------
+    # polygon_client.py: ritmo por ventana de 60s (POLYGON_CALLS_PER_MINUTE en el
+    # .env), timeout, reintentos ante 429/5xx/red y paginacion que lanza error
+    # en vez de devolver una cadena a medias.
     def _get(self, url: str, params: Optional[Dict[str, object]] = None) -> Dict[str, object]:
-        for attempt in range(4):
-            resp = self.session.get(url, params=params, timeout=30)
-            if resp.status_code == 429:
-                wait = STOCKS_THROTTLE_SECONDS * (attempt + 1)
-                if self.verbose:
-                    print(f"    [polygon] límite de peticiones alcanzado; espera {wait:.0f}s...")
-                time.sleep(wait)
-                continue
-            resp.raise_for_status()
-            return resp.json()
-        raise RuntimeError(f"límite de peticiones de Polygon persistente en {url}")
+        return self.client.get(url, params)
 
     def _paginate(
         self, url: str, params: Dict[str, object], max_pages: int = POLYGON_MAX_PAGES
     ) -> List[Dict[str, object]]:
-        out: List[Dict[str, object]] = []
-        next_url: Optional[str] = url
-        page = 0
-        while next_url and page < max_pages:
-            payload = self._get(next_url, params if page == 0 else {"apiKey": self.api_key})
-            results = payload.get("results") or []
-            out.extend(results)
-            next_url = payload.get("next_url")  # type: ignore[assignment]
-            page += 1
-        return out
-
-    def _throttle_stocks(self) -> None:
-        elapsed = time.time() - self._last_stock_call
-        if self._last_stock_call and elapsed < STOCKS_THROTTLE_SECONDS:
-            time.sleep(STOCKS_THROTTLE_SECONDS - elapsed)
-        self._last_stock_call = time.time()
+        return self.client.paginate(url, params, max_pages=max_pages)
 
     # -- datos del subyacente --------------------------------------------------
     @staticmethod
@@ -1090,11 +1088,10 @@ class PolygonMarketLoader:
     def _history_polygon(self, ticker: str, lookback: str) -> pd.Series:
         end = date.today()
         start = end - timedelta(days=self._lookback_days(lookback) + 10)
-        self._throttle_stocks()
         payload = self._get(
             f"{POLYGON_BASE_URL}/v2/aggs/ticker/{ticker}/range/1/day/"
             f"{start.isoformat()}/{end.isoformat()}",
-            {"apiKey": self.api_key, "adjusted": "true", "sort": "asc", "limit": 50000},
+            {"adjusted": "true", "sort": "asc", "limit": 50000},
         )
         rows = payload.get("results") or []
         if not rows:
@@ -1125,7 +1122,6 @@ class PolygonMarketLoader:
             payload = self._get(
                 f"{POLYGON_BASE_URL}/v3/reference/dividends",
                 {
-                    "apiKey": self.api_key,
                     "ticker": ticker,
                     "limit": 12,
                     "order": "desc",
@@ -1185,7 +1181,6 @@ class PolygonMarketLoader:
     def _expirations(self, ticker: str) -> List[str]:
         today = date.today()
         params = {
-            "apiKey": self.api_key,
             "underlying_ticker": ticker,
             "contract_type": "call",
             "expired": "false",
@@ -1195,14 +1190,16 @@ class PolygonMarketLoader:
             "sort": "expiration_date",
             "order": "asc",
         }
+        # Antes se cortaba en 3 paginas sin avisar; en subyacentes con muchos
+        # vencimientos podian faltar justo los posteriores a 30 dias.
         contracts = self._paginate(
-            f"{POLYGON_BASE_URL}/v3/reference/options/contracts", params, max_pages=3
+            f"{POLYGON_BASE_URL}/v3/reference/options/contracts", params,
+            max_pages=POLYGON_MAX_PAGES_EXPIRATIONS,
         )
         return sorted({str(c.get("expiration_date")) for c in contracts if c.get("expiration_date")})
 
     def _chain(self, ticker: str, expiration: str, spot: float, T: float, q: float) -> pd.DataFrame:
         params = {
-            "apiKey": self.api_key,
             "limit": 250,
             "expiration_date": expiration,
             "strike_price.gte": round(spot * (1.0 - self.strike_range_pct), 2),
@@ -1227,7 +1224,8 @@ class PolygonMarketLoader:
             close = day.get("close")
 
             iv = clamp_iv(c.get("implied_volatility"))
-            if np.isfinite(iv):
+            iv_publicada = bool(np.isfinite(iv))
+            if iv_publicada:
                 if style == "american":
                     price = bjerksund_stensland_price(
                         spot, float(strike), T, self.r, q, iv, str(kind)
@@ -1260,6 +1258,8 @@ class PolygonMarketLoader:
                     "bid": price - half,
                     "ask": price + half,
                     "iv_polygon": iv,
+                    "style": style,
+                    "iv_publicada": iv_publicada,
                     "open_interest": oi,
                     "volume": vol,
                 }
@@ -1509,11 +1509,20 @@ class ReportPlotter:
     NEXT_COLOR = "#e6893c"
 
     @staticmethod
+    def source_label(source: str) -> str:
+        return {
+            "polygon": "Fuente de opciones: Polygon.io",
+            "yahoo": "Fuente de opciones: Yahoo Finance (respaldo: Polygon no disponible)",
+            "synthetic": "DATOS SINTÉTICOS DE PRUEBA — no representan el mercado",
+        }.get(source, f"Fuente de opciones: {source}")
+
+    @staticmethod
     def build_figure(
         fits_by_asset: Dict[str, List[SmileFit]],
         breakdown: pd.DataFrame,
         metrics: Dict[str, float],
         corr: np.ndarray,
+        source: str = "polygon",
     ) -> "go.Figure":
         tickers = list(fits_by_asset.keys())
         n = len(tickers)
@@ -1708,6 +1717,7 @@ class ReportPlotter:
                     f"   |   ratio de diversificación = {metrics['ratio_diversificacion']:.3f}"
                     f"   |   correlación implícita media = "
                     f"{metrics['correlacion_implicita_media']:.3f}"
+                    f"<br><span style='font-size:13px'>{ReportPlotter.source_label(source)}</span>"
                 ),
                 x=0.5,
                 xanchor="center",
@@ -1732,6 +1742,8 @@ class ReportPlotter:
         corr: np.ndarray,
         html_file: str = OUTPUT_HTML,
         show: bool = False,
+        source: str = "polygon",
+        fig: Optional["go.Figure"] = None,
     ) -> Optional[str]:
         if not _HAS_PLOTLY:
             warnings.warn(
@@ -1741,7 +1753,8 @@ class ReportPlotter:
             )
             return None
 
-        fig = ReportPlotter.build_figure(fits_by_asset, breakdown, metrics, corr)
+        if fig is None:
+            fig = ReportPlotter.build_figure(fits_by_asset, breakdown, metrics, corr, source)
 
         out_html = os.path.abspath(html_file)
         fig.write_html(out_html, include_plotlyjs="cdn", full_html=True)
@@ -1813,25 +1826,25 @@ class PortfolioVIXCalculator:
                 src = "yahoo"
 
         if src == "yahoo":
-            if _HAS_YF:
-                try:
-                    data = YahooMarketLoader(verbose=self.cfg.verbose).load(
-                        self.cfg.tickers, self.cfg.lookback
-                    )
-                    self.source_used = "yahoo"
-                    return data
-                except Exception as exc:  # noqa: BLE001
-                    warnings.warn(
-                        f"Fallo al descargar datos de mercado ({exc}); se conmuta a datos "
-                        "sintéticos autogenerados.",
-                        RuntimeWarning,
-                    )
-            else:
-                warnings.warn(
-                    "yfinance no está instalado; se usan datos sintéticos autogenerados "
-                    "(`pip install yfinance` para datos reales).",
-                    RuntimeWarning,
+            # Los datos sinteticos solo se usan si se piden explicitamente
+            # (--synthetic / source="synthetic"). Antes, un fallo aqui producia un
+            # VIX calculado sobre cadenas aleatorias con el mismo aspecto que uno real.
+            if not _HAS_YF:
+                raise RuntimeError(
+                    "No hay datos reales disponibles: Polygon falló y yfinance no está "
+                    "instalado (`pip install yfinance`). Usa --synthetic solo para pruebas."
                 )
+            try:
+                data = YahooMarketLoader(verbose=self.cfg.verbose).load(
+                    self.cfg.tickers, self.cfg.lookback
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(
+                    f"No hay datos reales disponibles: Polygon y yfinance fallaron ({exc}). "
+                    "Usa --synthetic solo para pruebas."
+                ) from exc
+            self.source_used = "yahoo"
+            return data
 
         self.source_used = "synthetic"
         return SyntheticMarketGenerator(r=self.cfg.r, verbose=self.cfg.verbose).generate(
@@ -1872,7 +1885,7 @@ class PortfolioVIXCalculator:
             used, w, np.array(sig30), corr
         )
         figure = (
-            ReportPlotter.build_figure(fits_by_asset, breakdown, metrics, corr)
+            ReportPlotter.build_figure(fits_by_asset, breakdown, metrics, corr, self.source_used)
             if _HAS_PLOTLY
             else None
         )
@@ -1883,10 +1896,12 @@ class PortfolioVIXCalculator:
             corr,
             self.cfg.html_file,
             self.cfg.show_plot,
+            source=self.source_used,
+            fig=figure,
         )
 
         if self.cfg.verbose:
-            self._print_report(breakdown, metrics, corr, used, plot)
+            self._print_report(breakdown, metrics, corr, used, plot, self.source_used)
 
         return {
             "vix": vix,
@@ -1907,12 +1922,14 @@ class PortfolioVIXCalculator:
         corr: np.ndarray,
         tickers: Sequence[str],
         plot: Optional[str],
+        source: str = "polygon",
     ) -> None:
         with pd.option_context("display.float_format", lambda v: f"{v:,.4f}"):
             print("\n" + "=" * 80)
             print(" RESULTADO — VIX DE PORTAFOLIO (30 días, model-free)")
             print("=" * 80)
-            print(f"\n  VIX_port = {metrics['VIX_portfolio']:.2f}\n")
+            print(f"\n  VIX_port = {metrics['VIX_portfolio']:.2f}")
+            print(f"  {ReportPlotter.source_label(source)}\n")
             print("--- Desglose y atribución de riesgo ---")
             print(breakdown.to_string())
             print("\n--- Matriz de correlación ---")

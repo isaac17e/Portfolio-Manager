@@ -17,7 +17,7 @@ from scipy.optimize import brentq
 from scipy.interpolate import interp1d
 from scipy.ndimage import gaussian_filter1d
 from datetime import datetime, timedelta
-import requests
+from polygon_client import PolygonClient, PolygonError
 import plotly.graph_objects as go
 import plotly.io as pio
 import yfinance as yf
@@ -88,6 +88,14 @@ PORTFOLIO_HOLDINGS = {
 
 REFRESH_SECONDS = 60
 MAX_ITERATIONS = None
+# Los indicadores macro (1 año de cierres diarios) no cambian de un minuto a otro:
+# se descargan de nuevo solo cuando su cache supera esta antiguedad.
+MACRO_REFRESH_SECONDS = 3600
+# Si un holding falla por datos (sin precio o sin cadena) se reutiliza su ultimo
+# dato valido mientras no sea mas antiguo que esto, en vez de excluirlo y
+# renormalizar los pesos (la superficie saltaria entre iteraciones).
+STALE_DATA_MAX_SECONDS = 900
+POLYGON_MAX_PAGES = 40
 ROTATE_CAMERA = True
 OUTPUT_HTML_PATH = "portfolio_gex_field.html"
 DATA_JSON_FILENAME = "portfolio_gex_field_data.json"
@@ -101,6 +109,19 @@ NORM_PERCENTILE = 90
 
 if not POLYGON_API_KEY or POLYGON_API_KEY == "TU_API_KEY":
     print("ADVERTENCIA: No se detectó una API Key válida de Polygon.")
+
+
+_cliente_polygon = None
+
+
+def polygon():
+    # Transporte compartido (polygon_client.py): ritmo por ventana de 60s
+    # (POLYGON_CALLS_PER_MINUTE en el .env), timeout, reintentos ante 429/5xx/red
+    # y paginacion que falla en vez de truncar.
+    global _cliente_polygon
+    if _cliente_polygon is None:
+        _cliente_polygon = PolygonClient(api_key=POLYGON_API_KEY)
+    return _cliente_polygon
 
 
 # ============================================================
@@ -240,10 +261,8 @@ def get_current_price(ticker):
         except Exception as e2:
             print(f"⚠️  [{ticker}] yfinance history() también falló ({e2}). Usando Polygon /prev...")
             try:
-                url = f"{BASE_URL}/v2/aggs/ticker/{ticker}/prev"
-                resp = requests.get(url, params={"apiKey": POLYGON_API_KEY}, timeout=10)
-                resp.raise_for_status()
-                return float(resp.json()["results"][0]["c"])
+                payload = polygon().get(f"{BASE_URL}/v2/aggs/ticker/{ticker}/prev")
+                return float(payload["results"][0]["c"])
             except Exception as e3:
                 print(f"❌ [{ticker}] ERROR CRÍTICO: no se pudo obtener el precio spot por ninguna fuente: {e3}")
                 return None
@@ -261,10 +280,8 @@ def get_polygon_options_data(ticker, current_price, horizon_months=TIME_HORIZON_
     today = datetime.utcnow().date()
     cutoff_date = today + timedelta(days=int(horizon_months * 30.44))
 
-    all_contracts = []
     url = f"{BASE_URL}/v3/snapshot/options/{ticker}"
     params = {
-        "apiKey": POLYGON_API_KEY,
         "limit": 250,
         "strike_price.gte": round(current_price * (1 - strike_range_pct), 2),
         "strike_price.lte": round(current_price * (1 + strike_range_pct), 2),
@@ -272,26 +289,12 @@ def get_polygon_options_data(ticker, current_price, horizon_months=TIME_HORIZON_
         "expiration_date.lte": cutoff_date.isoformat(),
     }
 
+    # Una pagina fallida o el tope de paginas cuentan como fallo del ticker: antes
+    # el corte a las 40 paginas era silencioso y el GEX salia de una cadena parcial.
     try:
-        next_url = url
-        page_count = 0
-        while next_url and page_count < 40:
-            resp = requests.get(next_url, params=params if page_count == 0 else None, timeout=15)
-            resp.raise_for_status()
-            payload = resp.json()
-            results = payload.get("results", [])
-            if not results:
-                break
-            all_contracts.extend(results)
-            next_url = payload.get("next_url")
-            if next_url:
-                next_url = f"{next_url}&apiKey={POLYGON_API_KEY}"
-            page_count += 1
-    except requests.exceptions.RequestException as e:
-        print(f"❌ [{ticker}] ERROR de conexión con Polygon API: {e}")
-        return pd.DataFrame()
-    except ValueError as e:
-        print(f"❌ [{ticker}] ERROR parseando respuesta JSON de Polygon: {e}")
+        all_contracts = polygon().paginate(url, params, max_pages=POLYGON_MAX_PAGES)
+    except PolygonError as e:
+        print(f"❌ [{ticker}] ERROR con Polygon API: {e}")
         return pd.DataFrame()
 
     if not all_contracts:
@@ -519,7 +522,18 @@ def _percentile_rank(series, current_value):
     return float((series < current_value).sum() / len(series))
 
 
-def get_macro_indicators(lookback=MACRO_LOOKBACK_PERIOD):
+_macro_cache = {"t": None, "lookback": None, "data": None}
+
+
+def get_macro_indicators(lookback=MACRO_LOOKBACK_PERIOD, max_age_seconds=MACRO_REFRESH_SECONDS):
+    ahora = time.time()
+    if (_macro_cache["data"] is not None and _macro_cache["lookback"] == lookback
+            and ahora - _macro_cache["t"] < max_age_seconds):
+        edad_min = (ahora - _macro_cache["t"]) / 60
+        print(f"ℹ️  Indicadores macro en cache (hace {edad_min:.0f} min; se refrescan cada "
+              f"{max_age_seconds / 60:.0f} min).")
+        return _macro_cache["data"]
+
     results = {}
     for name, candidates in MACRO_TICKERS.items():
         series, used_ticker = _fetch_macro_series(candidates, lookback)
@@ -535,6 +549,10 @@ def get_macro_indicators(lookback=MACRO_LOOKBACK_PERIOD):
         print(f"✅ {name} ({used_ticker}): valor actual={current_value:.2f} | "
               f"percentil {lookback}={percentile*100:.0f}%")
 
+    # Solo se cachea una descarga completa; si falto algun componente se
+    # reintenta en la proxima iteracion.
+    if all(v["ok"] for v in results.values()):
+        _macro_cache.update(t=ahora, lookback=lookback, data=results)
     return results
 
 
@@ -592,6 +610,24 @@ def calculate_expected_move(df_options, current_price, horizon_months=TIME_HORIZ
 # BLOQUE 7: DATOS POR HOLDING Y CAMPO DE FUERZA COMPUESTO
 # ============================================================
 
+# Ultimo dato valido por holding, para cubrir fallos de descarga puntuales.
+_ultimo_dato_valido = {}
+
+
+def _reusar_ultimo_dato(ticker, motivo, max_age_seconds=STALE_DATA_MAX_SECONDS):
+    guardado = _ultimo_dato_valido.get(ticker)
+    if guardado is None:
+        return None
+    edad = time.time() - guardado["t"]
+    if edad > max_age_seconds:
+        print(f"⚠️  {ticker}: el último dato válido tiene {edad/60:.0f} min "
+              f"(máximo {max_age_seconds/60:.0f}); no se reutiliza.")
+        return None
+    print(f"♻️  {ticker}: {motivo}; se reutiliza su último dato válido "
+          f"(de hace {edad/60:.1f} min) para no renormalizar los pesos.")
+    return dict(guardado["data"], stale_seconds=edad)
+
+
 def get_portfolio_chains(holdings, horizon_months=TIME_HORIZON_MONTHS):
     portfolio_data = {}
     failed = []
@@ -601,12 +637,20 @@ def get_portfolio_chains(holdings, horizon_months=TIME_HORIZON_MONTHS):
 
         price = get_current_price(ticker)
         if price is None:
+            reutilizado = _reusar_ultimo_dato(ticker, "sin precio spot")
+            if reutilizado is not None:
+                portfolio_data[ticker] = reutilizado
+                continue
             print(f"❌ {ticker}: sin precio spot, se excluye del portafolio.")
             failed.append(ticker)
             continue
 
         df_opts = get_polygon_options_data(ticker, price, horizon_months=horizon_months)
         if df_opts.empty:
+            reutilizado = _reusar_ultimo_dato(ticker, "sin cadena de opciones en esta iteración")
+            if reutilizado is not None:
+                portfolio_data[ticker] = reutilizado
+                continue
             print(f"❌ {ticker}: sin cadena de opciones válida, se excluye.")
             failed.append(ticker)
             continue
@@ -664,6 +708,7 @@ def get_portfolio_chains(holdings, horizon_months=TIME_HORIZON_MONTHS):
             "metrics_structural": metrics_structural,
             "expected_move": expected_move,
         }
+        _ultimo_dato_valido[ticker] = {"t": time.time(), "data": dict(portfolio_data[ticker])}
 
     if not portfolio_data:
         print("❌ ERROR CRÍTICO: no quedó ningún holding válido en el portafolio.")
@@ -687,8 +732,11 @@ def get_portfolio_chains(holdings, horizon_months=TIME_HORIZON_MONTHS):
             coverage_note = f"| cobertura real ±{achieved_sigma:.2f}σ"
         except Exception:
             coverage_note = ""
+        stale_note = (f"| dato reutilizado de hace {v['stale_seconds']/60:.1f} min"
+                      if v.get("stale_seconds") else "")
         print(f"   {t}: peso={v['weight_normalized']:.2%} | "
-              f"movimiento esperado (1σ, {horizon_months}m)=±{v['expected_move']*100:.2f}% {coverage_note}")
+              f"movimiento esperado (1σ, {horizon_months}m)=±{v['expected_move']*100:.2f}% "
+              f"{coverage_note} {stale_note}")
 
     return portfolio_data
 
@@ -1190,6 +1238,7 @@ def run_live(refresh_seconds=REFRESH_SECONDS, max_iterations=MAX_ITERATIONS,
         print(f"\n{'='*60}\n🔄 Iteración {iteration + 1} | refrescando cada {refresh_seconds}s | "
               f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n{'='*60}\n")
 
+        inicio_iteracion = time.time()
         result = run_once()
 
         if result is not None:
@@ -1217,8 +1266,17 @@ def run_live(refresh_seconds=REFRESH_SECONDS, max_iterations=MAX_ITERATIONS,
             print("⚠️  No se generó gráfico en esta iteración; se reintentará en el próximo refresh.")
 
         iteration += 1
+        duracion = time.time() - inicio_iteracion
         if max_iterations is None or iteration < max_iterations:
-            time.sleep(refresh_seconds)
+            espera = refresh_seconds - duracion
+            if espera > 0:
+                print(f"⏱️  Iteración completada en {duracion:.0f}s; próxima en {espera:.0f}s.")
+                time.sleep(espera)
+            else:
+                print(f"⏱️  La iteración tardó {duracion:.0f}s, más que el refresco de "
+                      f"{refresh_seconds}s: la siguiente arranca de inmediato. Con el límite "
+                      "de llamadas por minuto de Polygon, el refresco efectivo es la duración "
+                      "de la iteración.")
 
     print("\n✅ Loop finalizado.")
 

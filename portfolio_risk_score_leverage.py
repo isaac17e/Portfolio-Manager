@@ -53,7 +53,7 @@ risk_score_weights = {"hv": 0.30, "cvar": 0.30, "iv": 0.25, "gex_pcr": 0.15}
 polygon_base_url = "https://api.polygon.io"
 polygon_max_retries = 5
 polygon_retry_wait_secs = 15
-polygon_request_pause = 0.25
+polygon_max_pages_snapshot = 20
 
 print(
     f"[CONFIG] Portafolio: {', '.join(portfolio.keys())} | "
@@ -64,8 +64,7 @@ print(
 # =============================================================================
 # BLOQUE 2: UTILIDADES Y CONEXION A LA API
 # =============================================================================
-import time
-import requests
+from polygon_client import PolygonClient, PolygonError, PolygonNotFound
 
 def log_info(msg):
     print(f"[INFO]  {msg}")
@@ -76,56 +75,22 @@ def log_warn(msg):
 def log_error(msg):
     print(f"[ERROR] {msg}")
 
-def polygon_get(path, params=None, api_key=None,
-                 max_retries=polygon_max_retries, base_wait=polygon_retry_wait_secs):
-    if params is None:
-        params = {}
-    if api_key is None:
-        api_key = polygon_api_key
+_clientes_polygon = {}
 
-    params = dict(params)
-    params["apiKey"] = api_key
-    url = polygon_base_url + path
+def polygon_client(api_key=None):
+    # Transporte compartido (polygon_client.py): ritmo por ventana de 60s
+    # (POLYGON_CALLS_PER_MINUTE en el .env), timeout, reintentos ante
+    # 429/5xx/red y paginacion que falla en vez de truncar.
+    api_key = api_key or polygon_api_key
+    if api_key not in _clientes_polygon:
+        _clientes_polygon[api_key] = PolygonClient(
+            api_key=api_key, max_retries=polygon_max_retries,
+            retry_wait=polygon_retry_wait_secs, base_url=polygon_base_url)
+    return _clientes_polygon[api_key]
 
-    attempt = 0
-    while True:
-        attempt += 1
-        time.sleep(polygon_request_pause)
-
-        try:
-            resp = requests.get(url, params=params, timeout=20)
-        except requests.RequestException as e:
-            log_warn(f"Fallo de red en {path} (intento {attempt}/{max_retries}): {e}")
-            if attempt >= max_retries:
-                return None
-            time.sleep(base_wait)
-            continue
-
-        status = resp.status_code
-
-        if status == 200:
-            try:
-                return resp.json()
-            except ValueError:
-                return None
-
-        if status == 429:
-            wait_time = base_wait * attempt
-            log_warn(f"Rate limit (429) en {path}. Esperando {wait_time}s (intento {attempt}/{max_retries})...")
-            if attempt >= max_retries:
-                log_error(f"Se agotaron los reintentos por rate limit en {path}")
-                return None
-            time.sleep(wait_time)
-            continue
-
-        if status == 404:
-            log_warn(f"Recurso no encontrado (404) en {path}. Posible activo sin mercado de opciones.")
-            return None
-
-        log_warn(f"Respuesta HTTP {status} en {path} (intento {attempt}/{max_retries})")
-        if attempt >= max_retries:
-            return None
-        time.sleep(base_wait)
+def polygon_get(path, params=None, api_key=None):
+    # Lanza PolygonError si la API no responde algo utilizable; nunca devuelve None.
+    return polygon_client(api_key).get(path, params)
 
 def pct(x, digits=2):
     return f"{x * 100:.{digits}f}%"
@@ -240,7 +205,8 @@ def compute_max_drawdown(returns_df):
     rows = []
     for asset in returns_df.columns:
         r = returns_df[asset]
-        cum = (1 + r).cumprod()
+        # Los retornos son logaritmicos: el valor acumulado es exp(suma), no prod(1 + r)
+        cum = np.exp(r.cumsum())
         running_max = cum.cummax()
         drawdown = (cum - running_max) / running_max
         mdd = -drawdown.min()
@@ -347,46 +313,65 @@ def run_expost_risk_module(asset_returns, portfolio_returns, weights, horizon_da
 import datetime as dt
 from scipy.stats import norm
 
-def bs_price(S, K, Tt, r, sigma, opt_type):
-    if any(pd.isna(x) for x in [S, K, Tt, r, sigma]) or sigma <= 0 or Tt <= 0 or S <= 0 or K <= 0:
-        return np.nan
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * Tt) / (sigma * np.sqrt(Tt))
-    d2 = d1 - sigma * np.sqrt(Tt)
-    if opt_type == "call":
-        return S * norm.cdf(d1) - K * np.exp(-r * Tt) * norm.cdf(d2)
-    else:
-        return K * np.exp(-r * Tt) * norm.cdf(-d2) - S * norm.cdf(-d1)
+# Black-Scholes vectorizado: S, K, sigma e is_call son arreglos (uno por contrato);
+# Tt y r son escalares. Devuelve NaN donde las entradas no son validas.
+def bs_price(S, K, Tt, r, sigma, is_call):
+    S, K, sigma = (np.asarray(x, dtype=float) for x in (S, K, sigma))
+    with np.errstate(all="ignore"):
+        valido = (np.isfinite(S) & np.isfinite(K) & np.isfinite(sigma)
+                  & (S > 0) & (K > 0) & (sigma > 0) & (Tt > 0) & np.isfinite(r))
+        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * Tt) / (sigma * np.sqrt(Tt))
+        d2 = d1 - sigma * np.sqrt(Tt)
+        call = S * norm.cdf(d1) - K * np.exp(-r * Tt) * norm.cdf(d2)
+        put = K * np.exp(-r * Tt) * norm.cdf(-d2) - S * norm.cdf(-d1)
+    return np.where(valido, np.where(is_call, call, put), np.nan)
 
 def bs_gamma(S, K, Tt, r, sigma):
-    if any(pd.isna(x) for x in [S, K, Tt, r, sigma]) or sigma <= 0 or Tt <= 0 or S <= 0 or K <= 0:
-        return np.nan
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * Tt) / (sigma * np.sqrt(Tt))
-    return norm.pdf(d1) / (S * sigma * np.sqrt(Tt))
+    S, K, sigma = (np.asarray(x, dtype=float) for x in (S, K, sigma))
+    with np.errstate(all="ignore"):
+        valido = (np.isfinite(S) & np.isfinite(K) & np.isfinite(sigma)
+                  & (S > 0) & (K > 0) & (sigma > 0) & (Tt > 0) & np.isfinite(r))
+        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * Tt) / (sigma * np.sqrt(Tt))
+        gamma = norm.pdf(d1) / (S * sigma * np.sqrt(Tt))
+    return np.where(valido, gamma, np.nan)
 
-def implied_vol_bisection(market_price, S, K, Tt, r, opt_type,
+def implied_vol_bisection(market_price, S, K, Tt, r, is_call,
                            tol=1e-4, max_iter=100, lower=1e-4, upper=5):
-    if any(pd.isna(x) for x in [market_price, S, K, Tt]) or market_price <= 0 or Tt <= 0:
-        return np.nan
+    # Biseccion sobre todos los contratos a la vez. Cada contrato sigue la misma
+    # regla que la version escalar: se detiene cuando |f(mid)| < tol, devuelve
+    # NaN si el precio no queda acotado entre lower y upper, y si agota las
+    # iteraciones devuelve el ultimo punto medio.
+    mp, S, K = (np.asarray(x, dtype=float) for x in (market_price, S, K))
+    is_call = np.asarray(is_call, dtype=bool)
+    iv = np.full(mp.shape, np.nan)
+    if Tt <= 0:
+        return iv
 
-    f_lower = bs_price(S, K, Tt, r, lower, opt_type) - market_price
-    f_upper = bs_price(S, K, Tt, r, upper, opt_type) - market_price
-    if pd.isna(f_lower) or pd.isna(f_upper) or f_lower * f_upper > 0:
-        return np.nan
+    lo = np.full(mp.shape, float(lower))
+    hi = np.full(mp.shape, float(upper))
+    with np.errstate(invalid="ignore"):
+        f_lo = bs_price(S, K, Tt, r, lo, is_call) - mp
+        f_hi = bs_price(S, K, Tt, r, hi, is_call) - mp
+        activo = (np.isfinite(mp) & np.isfinite(S) & np.isfinite(K) & (mp > 0)
+                  & np.isfinite(f_lo) & np.isfinite(f_hi) & ~(f_lo * f_hi > 0))
 
-    mid = (lower + upper) / 2
+    mid = (lo + hi) / 2
     for _ in range(max_iter):
-        mid = (lower + upper) / 2
-        f_mid = bs_price(S, K, Tt, r, mid, opt_type) - market_price
-        if pd.isna(f_mid):
-            return np.nan
-        if abs(f_mid) < tol:
-            return mid
-        if f_lower * f_mid < 0:
-            upper = mid
-        else:
-            lower = mid
-            f_lower = f_mid
-    return mid
+        if not activo.any():
+            break
+        mid = np.where(activo, (lo + hi) / 2, mid)
+        f_mid = bs_price(S, K, Tt, r, mid, is_call) - mp
+        activo &= np.isfinite(f_mid)             # f(mid) invalido -> queda NaN
+        listo = activo & (np.abs(f_mid) < tol)
+        iv[listo] = mid[listo]
+        activo &= ~listo
+        izquierda = f_lo * f_mid < 0
+        hi = np.where(activo & izquierda, mid, hi)
+        derecha = activo & ~izquierda
+        lo = np.where(derecha, mid, lo)
+        f_lo = np.where(derecha, f_mid, f_lo)
+    iv[activo] = mid[activo]
+    return iv
 
 def fill_missing_iv_greeks(chain, days_to_expiry, rf_annual, spot_fallback):
     chain = chain.copy()
@@ -396,86 +381,70 @@ def fill_missing_iv_greeks(chain, days_to_expiry, rf_annual, spot_fallback):
     Tt = days_to_expiry / 365
     market_price = chain["last_quote_mid"].combine_first(chain["day_close"])
 
-    needs_iv = chain["iv"].isna() | (chain["iv"] <= 0)
-    for idx in chain.index[needs_iv]:
-        mp = market_price.loc[idx]
-        S = chain.loc[idx, "spot"]
-        K = chain.loc[idx, "strike"]
-        ty = chain.loc[idx, "contract_type"]
-        chain.loc[idx, "iv"] = implied_vol_bisection(mp, S, K, Tt, rf_annual, ty)
+    needs_iv = (chain["iv"].isna() | (chain["iv"] <= 0)).to_numpy()
+    if needs_iv.any():
+        sub = chain.loc[needs_iv]
+        chain.loc[needs_iv, "iv"] = implied_vol_bisection(
+            market_price[needs_iv].to_numpy(), sub["spot"].to_numpy(), sub["strike"].to_numpy(),
+            Tt, rf_annual, (sub["contract_type"] == "call").to_numpy())
 
-    needs_gamma = chain["gamma"].isna()
-    for idx in chain.index[needs_gamma]:
-        S = chain.loc[idx, "spot"]
-        K = chain.loc[idx, "strike"]
-        sigma = chain.loc[idx, "iv"]
-        chain.loc[idx, "gamma"] = bs_gamma(S, K, Tt, rf_annual, sigma)
+    needs_gamma = chain["gamma"].isna().to_numpy()
+    if needs_gamma.any():
+        sub = chain.loc[needs_gamma]
+        chain.loc[needs_gamma, "gamma"] = bs_gamma(
+            sub["spot"].to_numpy(), sub["strike"].to_numpy(), Tt, rf_annual, sub["iv"].to_numpy())
 
     return chain
 
 def get_target_expiration(ticker, horizon_days, api_key):
-    target_date = dt.date.today() + dt.timedelta(days=round(horizon_days * 7 / 5))
+    today = dt.date.today()
+    target_date = today + dt.timedelta(days=round(horizon_days * 7 / 5))
 
-    resp = polygon_get(
-        "/v3/reference/options/contracts",
-        params={
-            "underlying_ticker": ticker,
-            "expired": "false",
-            "limit": 1000,
-            "order": "asc",
-            "sort": "expiration_date"
-        },
-        api_key=api_key
-    )
+    # Se piden solo los dos vencimientos que rodean al objetivo (el primero en o
+    # despues y el ultimo en o antes), con limit=1 cada uno. Antes se pedia una
+    # sola pagina de 1000 contratos sin filtro de fecha: en activos con
+    # vencimientos semanales esa pagina cubria apenas los proximos dias y el
+    # vencimiento "mas cercano al objetivo" salia de ahi.
+    base = {"underlying_ticker": ticker, "contract_type": "call",
+            "sort": "expiration_date", "limit": 1}
+    respuestas = [
+        polygon_get("/v3/reference/options/contracts",
+                    params={**base, "order": "asc", "expiration_date.gte": target_date.isoformat()},
+                    api_key=api_key),
+        polygon_get("/v3/reference/options/contracts",
+                    params={**base, "order": "desc",
+                            "expiration_date.gte": today.isoformat(),
+                            "expiration_date.lte": target_date.isoformat()},
+                    api_key=api_key),
+    ]
 
-    if not resp or not resp.get("results"):
+    expirations = sorted({
+        dt.date.fromisoformat(r["expiration_date"])
+        for resp in respuestas
+        for r in ((resp or {}).get("results") or [])
+        if r.get("expiration_date")
+    })
+    if not expirations:
         log_warn(f"Sin contratos de opciones disponibles para {ticker} (posible activo sin mercado de opciones).")
         return {"expiration": None, "days_to_expiry": None}
 
-    results = pd.DataFrame(resp["results"])
-    if "expiration_date" not in results.columns:
-        log_warn(f"Payload de contratos sin 'expiration_date' para {ticker}.")
-        return {"expiration": None, "days_to_expiry": None}
-
-    expirations = sorted(pd.to_datetime(results["expiration_date"]).dt.date.unique())
-    expirations = [e for e in expirations if e >= dt.date.today()]
-    if not expirations:
-        return {"expiration": None, "days_to_expiry": None}
-
     best_exp = min(expirations, key=lambda e: abs((e - target_date).days))
-    return {"expiration": best_exp, "days_to_expiry": (best_exp - dt.date.today()).days}
+    return {"expiration": best_exp, "days_to_expiry": (best_exp - today).days}
 
 def get_option_chain_snapshot(ticker, expiration_date, api_key):
     if expiration_date is None:
         return None
 
-    all_results = []
-    resp = polygon_get(
+    # Una pagina fallida o el tope de paginas lanzan PolygonError: antes se
+    # cortaba en silencio y el GEX / max pain se calculaban sobre media cadena.
+    all_results = polygon_client(api_key).paginate(
         f"/v3/snapshot/options/{ticker}",
         params={"expiration_date": expiration_date.strftime("%Y-%m-%d"), "limit": 250},
-        api_key=api_key
+        max_pages=polygon_max_pages_snapshot,
     )
-    if not resp or not resp.get("results"):
+    if not all_results:
         log_warn(f"Snapshot de opciones vacio para {ticker} @ {expiration_date}.")
         return None
-
-    all_results.extend(resp["results"])
-    next_url = resp.get("next_url")
-    page_count = 1
-    while next_url and page_count < 20:
-        time.sleep(polygon_request_pause)
-        try:
-            resp2 = requests.get(next_url, params={"apiKey": api_key}, timeout=20)
-        except requests.RequestException:
-            break
-        if resp2.status_code != 200:
-            break
-        parsed2 = resp2.json()
-        if not parsed2.get("results"):
-            break
-        all_results.extend(parsed2["results"])
-        page_count += 1
-        next_url = parsed2.get("next_url")
 
     def g(d, path, default=None):
         cur = d
@@ -622,12 +591,20 @@ def run_options_module_for_ticker(ticker, hv_annual, horizon_days, api_key,
                                    spot_fallback=np.nan, rf_annual=0):
     log_info(f"MODULO 2: procesando cadena de opciones de {ticker}...")
 
-    exp_info = get_target_expiration(ticker, horizon_days, api_key)
-    if exp_info["expiration"] is None:
-        log_warn(f"{ticker}: sin expiracion valida encontrada. Se omite del modulo de opciones.")
+    try:
+        exp_info = get_target_expiration(ticker, horizon_days, api_key)
+        if exp_info["expiration"] is None:
+            log_warn(f"{ticker}: sin expiracion valida encontrada. Se omite del modulo de opciones.")
+            return None
+        chain = get_option_chain_snapshot(ticker, exp_info["expiration"], api_key)
+    except PolygonNotFound:
+        log_warn(f"{ticker}: recurso no encontrado (404), posible activo sin mercado de opciones. "
+                 "Se omite del modulo de opciones.")
+        return None
+    except PolygonError as e:
+        log_error(f"{ticker}: {e}. Se omite del modulo de opciones.")
         return None
 
-    chain = get_option_chain_snapshot(ticker, exp_info["expiration"], api_key)
     if chain is None:
         log_warn(f"{ticker}: cadena de opciones no disponible. Se omite del modulo de opciones.")
         return None

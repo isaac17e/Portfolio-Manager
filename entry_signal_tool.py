@@ -2,14 +2,14 @@
 # ENTRY SIGNAL TOOL - Score de Conviccion para Entrada en Portafolio
 # ============================================================
 
-import requests
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
-import time
 import os
 import json
 import plotly.graph_objects as go
+
+from polygon_client import PolygonClient
 
 # ---------------- CONFIGURACION ----------------
 from dotenv import load_dotenv
@@ -48,7 +48,7 @@ DIAS_CICLO = 5
 HORIZON_DIAS_OBJETIVO = 30
 VENTANA_BUSQUEDA_VENCIMIENTO_DIAS = 20
 
-SEGUNDOS_ENTRE_LLAMADAS_STOCKS = 13  # respeta el limite de 5/min del tier gratuito Stocks Basic
+MAX_PAGINAS_CADENA = 40
 
 HIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "entry_signal_history.csv")
 STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "entry_state.json")
@@ -220,12 +220,22 @@ def evaluar_flujo_opciones(ticker, hist_df):
 
 # ---------------- FUNCIONES DE EXTRACCION ----------------
 
+_cliente_polygon = None
+
+# Transporte compartido (polygon_client.py): ritmo por ventana de 60s, timeout,
+# reintentos ante 429/5xx/red y paginacion que falla en vez de truncar.
+def polygon():
+    global _cliente_polygon
+    if _cliente_polygon is None:
+        _cliente_polygon = PolygonClient(api_key=API_KEY)
+    return _cliente_polygon
+
 def get_daily_history(ticker, dias=40):
     fecha_fin = datetime.now(timezone.utc).date()
     fecha_inicio = fecha_fin - timedelta(days=dias * 2)  # buffer por fines de semana
     url = f"{BASE_URL}/v2/aggs/ticker/{ticker}/range/1/day/{fecha_inicio}/{fecha_fin}"
-    params = {"adjusted": "true", "sort": "asc", "limit": 5000, "apiKey": API_KEY}
-    r = requests.get(url, params=params).json()
+    params = {"adjusted": "true", "sort": "asc", "limit": 5000}
+    r = polygon().get(url, params)
     if r.get("status") not in ("OK", "DELAYED") or "results" not in r:
         raise RuntimeError(f"Fallo consultando historico diario de {ticker}: {r}")
     df = pd.DataFrame(r["results"])
@@ -244,28 +254,35 @@ def get_spot_y_volumen_relativo(ticker):
     volumen_relativo = volumen_hoy / adv_20
     return spot, volumen_relativo
 
+# Se piden solo los dos vencimientos que rodean al objetivo (el primero en o despues
+# y el ultimo en o antes) con limit=1 cada uno. Una sola pagina de 1000 contratos
+# ordenada por fecha cubre apenas 2-5 dias en subyacentes con vencimientos
+# semanales (GLD, XLU, KO...) y el "mas cercano" terminaba siendo uno de esos.
 def seleccionar_vencimiento_objetivo(ticker, horizon_days):
     hoy = datetime.now(timezone.utc).date()
     fecha_objetivo = hoy + timedelta(days=horizon_days)
     url = f"{BASE_URL}/v3/reference/options/contracts"
-    params = {
-        "underlying_ticker": ticker,
-        "expiration_date.gte": str(hoy),
-        "expiration_date.lte": str(fecha_objetivo + timedelta(days=VENTANA_BUSQUEDA_VENCIMIENTO_DIAS)),
-        "limit": 1000,
-        "order": "asc",
-        "sort": "expiration_date",
-        "apiKey": API_KEY,
-    }
-    r = requests.get(url, params=params).json()
-    resultados = r.get("results", [])
-    if not resultados:
-        return None
-    vencimientos = sorted({c["expiration_date"] for c in resultados if c.get("expiration_date")})
+    base = {"underlying_ticker": ticker, "contract_type": "call",
+            "sort": "expiration_date", "limit": 1}
+    consultas = [
+        {**base, "order": "asc",
+         "expiration_date.gte": str(fecha_objetivo),
+         "expiration_date.lte": str(fecha_objetivo + timedelta(days=VENTANA_BUSQUEDA_VENCIMIENTO_DIAS))},
+        {**base, "order": "desc",
+         "expiration_date.gte": str(hoy),
+         "expiration_date.lte": str(fecha_objetivo)},
+    ]
+    vencimientos = set()
+    for params in consultas:
+        # Si una de las dos consultas falla se lanza el error: con un solo lado
+        # se elegiria un vencimiento lejano al objetivo sin saberlo.
+        r = polygon().get(url, params)
+        for c in r.get("results", []):
+            if c.get("expiration_date"):
+                vencimientos.add(datetime.strptime(c["expiration_date"], "%Y-%m-%d").date())
     if not vencimientos:
         return None
-    vencimientos = [datetime.strptime(v, "%Y-%m-%d").date() for v in vencimientos]
-    return min(vencimientos, key=lambda d: abs((d - fecha_objetivo).days))
+    return min(sorted(vencimientos), key=lambda d: abs((d - fecha_objetivo).days))
 
 def get_options_chain(ticker, spot, vencimiento):
     url = f"{BASE_URL}/v3/snapshot/options/{ticker}"
@@ -274,19 +291,10 @@ def get_options_chain(ticker, spot, vencimiento):
         "strike_price.lte": round(spot * 1.15, 2),
         "expiration_date": vencimiento.strftime("%Y-%m-%d"),
         "limit": 250,
-        "apiKey": API_KEY
     }
-    resultados = []
-    while url:
-        r = requests.get(url, params=params).json()
-        resultados.extend(r.get("results", []))
-        next_url = r.get("next_url")
-        if next_url:
-            url = next_url
-            params = {"apiKey": API_KEY}
-        else:
-            url = None
-    return resultados
+    # Una pagina fallida o el tope de paginas lanzan PolygonError en vez de
+    # devolver la cadena a medias: el ticker se reporta como error y se omite hoy.
+    return polygon().paginate(url, params, max_pages=MAX_PAGINAS_CADENA)
 
 def parse_chain(chain):
     filas = []
@@ -606,14 +614,12 @@ def correr_entry_signal():
     es_ultimo_dia = dia_ciclo >= DIAS_CICLO
 
     filas_nuevas = []
-    for i, ticker in enumerate(TICKERS):
+    for ticker in TICKERS:
         try:
             fila = calcular_indicadores_ticker(ticker, hist_df)
             filas_nuevas.append(fila)
         except Exception as e:
             print(f"Error con {ticker}: {e}")
-        if i < len(TICKERS) - 1:
-            time.sleep(SEGUNDOS_ENTRE_LLAMADAS_STOCKS)
 
     df_nuevo = pd.DataFrame(filas_nuevas)
     if df_nuevo.empty:
