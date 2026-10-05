@@ -17,6 +17,7 @@ from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from pipeline_io import export_signals, load_portfolio
 from polygon_client import PolygonClient
 from scipy.interpolate import CubicSpline
 from scipy.optimize import brentq, least_squares
@@ -67,6 +68,9 @@ PORTFOLIO_HOLDINGS: Dict[str, Optional[float]] = {
     "ABBV": 0.0235,
     "TMO": 0.0142,
 }
+
+_PORTFOLIO_META = load_portfolio(PORTFOLIO_HOLDINGS)
+PORTFOLIO_HOLDINGS = _PORTFOLIO_META["weights"]
 
 EQUAL_WEIGHTS: bool = False              # True -> ignora los pesos de arriba
 RISK_FREE_RATE: float = 0.045            # tasa libre de riesgo continua
@@ -1947,6 +1951,47 @@ class PortfolioVIXCalculator:
 # Argumentos de linea de comandos. Sin argumentos se usa el portafolio y las
 # rutas declaradas en el BLOQUE 1.
 # ==============================================================================
+def _senal_vix(results: Dict[str, object], cfg: "VIXConfig") -> Dict[str, object]:
+    breakdown = results["breakdown"].reset_index()
+    holdings = []
+    for row in breakdown.to_dict(orient="records"):
+        holdings.append({
+            "ticker": row.get("ticker"),
+            "weight": row.get("peso"),
+            "vix": row.get("VIX_individual"),
+            "sigma_30d": row.get("sigma_30d"),
+            "mcr": row.get("MCR"),
+            "ctr": row.get("CTR"),
+            "ctr_vix_pts": row.get("CTR_VIX_pts"),
+            "ctr_pct": row.get("CTR_%"),
+        })
+    metrics = dict(results["metrics"])
+    return {
+        "vix_portfolio": results["vix"],
+        "sigma_portfolio_30d": metrics.get("sigma_portfolio_30d"),
+        "source": results.get("source"),
+        "vol_method": cfg.vol_method,
+        "corr_method": cfg.corr_method,
+        "metrics": metrics,
+        "holdings": holdings,
+    }
+
+
+def _vix_portfolio_meta(cfg: "VIXConfig") -> Dict[str, object]:
+    meta = dict(_PORTFOLIO_META)
+    if cfg.weights is None:
+        count = max(len(cfg.tickers), 1)
+        meta["weights"] = {ticker: 1.0 / count for ticker in cfg.tickers}
+    else:
+        raw = [float(weight) for weight in cfg.weights]
+        total = sum(raw)
+        if total > 0 and len(raw) == len(cfg.tickers):
+            meta["weights"] = {
+                ticker: weight / total for ticker, weight in zip(cfg.tickers, raw)
+            }
+    return meta
+
+
 def _parse_args() -> VIXConfig:
     p = argparse.ArgumentParser(description="VIX de portafolio model-free (CBOE extendido)")
     p.add_argument("--tickers", nargs="+", default=None, help="sobrescribe PORTFOLIO_HOLDINGS")
@@ -2012,3 +2057,4 @@ if __name__ == "__main__":
         f"  Fuente opciones : {cfg.source}"
     )
     results = PortfolioVIXCalculator(cfg).run()
+    export_signals("portfolio_vix", _senal_vix(results, cfg), _vix_portfolio_meta(cfg))

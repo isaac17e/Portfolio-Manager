@@ -10,6 +10,7 @@ import json
 import plotly.graph_objects as go
 
 from polygon_client import PolygonClient
+from pipeline_io import export_signals, load_portfolio
 
 # ---------------- CONFIGURACION ----------------
 from dotenv import load_dotenv
@@ -25,6 +26,8 @@ PESOS_OBJETIVO = {
     "AMGN": 0.0509, "UNP": 0.0485, "NEE": 0.0484, "ABBV": 0.0235, "TMO": 0.0142,
 }
 
+_PORTFOLIO_META = load_portfolio(PESOS_OBJETIVO)
+PESOS_OBJETIVO = _PORTFOLIO_META["weights"]
 TICKERS = list(PESOS_OBJETIVO.keys())
 
 PESOS = {
@@ -733,8 +736,55 @@ def imprimir_resumen(resumen):
         print(f"  Invertido tras hoy: {pts_invertidos:.2f} pts de portafolio")
         print(f"  Pendiente por asignar: {pendiente:.2f} pts de portafolio")
 
+def construir_senal_entrada(resumen):
+    """entries en orden de ejecucion (mayor conviccion primero); el resto en waiting."""
+    if resumen is None or len(resumen) == 0:
+        return {"entries": [], "waiting": [], "cycle_day": None, "cycle": None}
+
+    dia = resumen["dia_ciclo"].iloc[0]
+    ciclo = resumen["ciclo"].iloc[0]
+    entries = []
+    waiting = []
+    ordered = resumen.sort_values("score_conviccion", ascending=False, na_position="last")
+    for _, fila in ordered.iterrows():
+        score = None if pd.isna(fila["score_conviccion"]) else float(fila["score_conviccion"])
+        target = None if pd.isna(fila["peso_objetivo_pct"]) else float(fila["peso_objetivo_pct"]) / 100.0
+        reason = "" if pd.isna(fila["recomendacion"]) else str(fila["recomendacion"])
+        accion = "" if pd.isna(fila["accion"]) else str(fila["accion"])
+        delta_pct = 0.0 if pd.isna(fila["delta_sugerido_hoy_pct"]) else float(fila["delta_sugerido_hoy_pct"])
+        if delta_pct > 0 and target is not None:
+            if accion == "CIERRE: ENTRAR":
+                signal = "cycle_close"
+            elif score is not None and score >= UMBRAL_ALTO:
+                signal = "high_conviction"
+            elif score is not None and score >= UMBRAL_MEDIO:
+                signal = "medium_conviction"
+            else:
+                signal = "low_conviction"
+            entries.append({
+                "order": len(entries) + 1,
+                "ticker": str(fila["ticker"]),
+                "action": "BUY",
+                "target_weight": round(target, 6),
+                "tranche_weight": round(delta_pct / 100.0 * target, 6),
+                "signal": signal,
+                "score": score,
+                "reason": reason,
+            })
+        else:
+            waiting.append({"ticker": str(fila["ticker"]), "score": score, "reason": reason})
+
+    return {
+        "entries": entries,
+        "waiting": waiting,
+        "cycle_day": None if pd.isna(dia) else int(dia),
+        "cycle": None if pd.isna(ciclo) else int(ciclo),
+    }
+
+
 resumen, historial = correr_entry_signal()
 imprimir_resumen(resumen)
+export_signals("entry_signal_tool", construir_senal_entrada(resumen), _PORTFOLIO_META)
 
 fig_resumen = graficar_resumen(resumen)
 if fig_resumen is not None:

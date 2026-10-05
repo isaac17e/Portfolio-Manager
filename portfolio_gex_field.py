@@ -17,6 +17,7 @@ from scipy.optimize import brentq
 from scipy.interpolate import interp1d
 from scipy.ndimage import gaussian_filter1d
 from datetime import datetime, timedelta
+from pipeline_io import export_signals, load_portfolio
 from polygon_client import PolygonClient, PolygonError
 import plotly.graph_objects as go
 import plotly.io as pio
@@ -85,6 +86,9 @@ PORTFOLIO_HOLDINGS = {
     "EBAY": 0.1142,
     "CRM": 0.0129
 }
+
+_PORTFOLIO_META = load_portfolio(PORTFOLIO_HOLDINGS)
+PORTFOLIO_HOLDINGS = _PORTFOLIO_META["weights"]
 
 REFRESH_SECONDS = 60
 MAX_ITERATIONS = None
@@ -1201,6 +1205,34 @@ def start_local_file_server(directory, preferred_port=LOCAL_SERVER_PORT, attempt
 # BLOQUE 10: EJECUCIÓN
 # ============================================================
 
+def _senal_gex(result):
+    state = result.get("current_state") or {}
+    portfolio_data = result.get("portfolio_data") or {}
+    holdings = []
+    for ticker, data in portfolio_data.items():
+        metrics = data.get("metrics_structural") or {}
+        holdings.append({
+            "ticker": ticker,
+            "weight": data.get("weight_normalized", data.get("weight")),
+            "price": data.get("price"),
+            "expected_move": data.get("expected_move"),
+            "total_gex": metrics.get("total_gex"),
+            "regime": metrics.get("regime"),
+            "gamma_flip": metrics.get("gamma_flip"),
+            "call_wall": metrics.get("call_wall"),
+            "put_wall": metrics.get("put_wall"),
+        })
+    return {
+        "macro_y": state.get("y"),
+        "potential_z": state.get("z"),
+        "grad_x": state.get("grad_x"),
+        "grad_y": state.get("grad_y"),
+        "grad_magnitude": state.get("grad_magnitude"),
+        "n_holdings": len(holdings),
+        "holdings": holdings,
+    }
+
+
 def run_once():
     macro_indicators = get_macro_indicators()
     macro_y_axis = calculate_macro_y_axis(macro_indicators)
@@ -1242,6 +1274,7 @@ def run_live(refresh_seconds=REFRESH_SECONDS, max_iterations=MAX_ITERATIONS,
         result = run_once()
 
         if result is not None:
+            export_signals("portfolio_gex_field", _senal_gex(result), _PORTFOLIO_META)
             current_state = result["current_state"]
             if current_state is not None:
                 state_history.append({"y": current_state["y"], "z": current_state["z"]})

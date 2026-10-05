@@ -16,6 +16,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
+from pipeline_io import export_signals, load_portfolio
+
 try:
     import yfinance as yf
 except ImportError as exc:  # pragma: no cover
@@ -32,6 +34,9 @@ INF = float("inf")  # "sin límite" en los umbrales
 # ==============================================================================
 
 PORTFOLIO_TICKERS: List[str] = ["BBWI", "HP", "CROX", "ZM", "ADBE"]
+_FALLBACK_WEIGHTS = {ticker: 1.0 / len(PORTFOLIO_TICKERS) for ticker in PORTFOLIO_TICKERS}
+_PORTFOLIO_META = load_portfolio(_FALLBACK_WEIGHTS)
+PORTFOLIO_TICKERS = list(_PORTFOLIO_META["weights"].keys())
 
 # --- salida -------------------------------------------------------------------
 OUTPUT_HTML: str = "reporte_fundamental.html"   # relativo a la carpeta del script
@@ -1351,6 +1356,36 @@ def exportar_html(
     return str(ruta)
 
 
+def _senal_fundamental(df: pd.DataFrame) -> Dict[str, Any]:
+    holdings = []
+    for _, row in df.iterrows():
+        n_green = sum(1 for ind in INDICADORES if row.get(ind.senal) == VERDE)
+        rating, _ = etiqueta_score(n_green)
+        metrics = {}
+        signals = {}
+        for ind in TODOS_INDICADORES:
+            signals[ind.senal] = row.get(ind.senal)
+            for column in ind.columnas:
+                metrics.setdefault(column, row.get(column))
+        holdings.append({
+            "ticker": str(row["Ticker"]),
+            "score_quality": None if pd.isna(row.get("Score_Calidad")) else str(row.get("Score_Calidad")),
+            "n_green": n_green,
+            "n_indicators": len(INDICADORES),
+            "rating": rating,
+            "incomplete": bool(row.get("Datos_Incompletos")),
+            "metrics": metrics,
+            "signals": signals,
+        })
+    return {
+        "n_tickers": len(holdings),
+        "n_indicators": len(INDICADORES),
+        "score_green_min": SCORE_LUZ_VERDE_MIN,
+        "score_medium_min": SCORE_CALIDAD_MEDIA_MIN,
+        "holdings": holdings,
+    }
+
+
 # ==============================================================================
 # BLOQUE 8: EJECUCIÓN
 # ==============================================================================
@@ -1361,4 +1396,5 @@ if __name__ == "__main__":
     print("\n=== TABLERO DE INDICADORES FUNDAMENTALES ===\n")
     print(df_resultado[["Ticker", "Score_Calidad"]].to_string(index=False))
 
+    export_signals("fundamental_analysis", _senal_fundamental(df_resultado), _PORTFOLIO_META)
     exportar_html(df_resultado, OUTPUT_HTML, abrir=OPEN_BROWSER)

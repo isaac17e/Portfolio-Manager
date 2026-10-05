@@ -5,6 +5,8 @@ import numpy as np
 import pandas as pd
 from datetime import date
 
+from pipeline_io import export_signals, load_portfolio
+
 portfolio = {
     "XLU": 0.12,
     "GLD": 0.12,
@@ -22,6 +24,9 @@ portfolio = {
     "ABBV": 0.0235,
     "TMO": 0.0142
 }
+
+_PORTFOLIO_META = load_portfolio(portfolio)
+portfolio = _PORTFOLIO_META["weights"]
 
 total_weight = sum(portfolio.values())
 if abs(total_weight - 1) > 1e-6:
@@ -930,6 +935,54 @@ def run_reporting_module(expost_results, options_module, leverage_results,
 
     return plots
 
+def _senal_riesgo(leverage_results, options_module):
+    summary = leverage_results["summary"]
+    detail = leverage_results["detail"].set_index("Activo")
+    weights = summary["Peso_Inicial"].astype(float)
+    weight_sum = float(weights.sum())
+    if weight_sum > 0:
+        target_leverage = float((summary["Apalancamiento"].astype(float) * weights).sum() / weight_sum)
+        risk_score = float((summary["Risk_Score"].astype(float) * weights).sum() / weight_sum)
+    else:
+        target_leverage = None
+        risk_score = None
+
+    def _num(value):
+        if pd.isna(value):
+            return None
+        return float(value)
+
+    by_ticker = []
+    for _, row in summary.sort_values("Risk_Score", ascending=False).iterrows():
+        ticker = row["Activo"]
+        extra = detail.loc[ticker] if ticker in detail.index else None
+        by_ticker.append({
+            "ticker": str(ticker),
+            "weight": _num(row["Peso_Inicial"]),
+            "risk_score": _num(row["Risk_Score"]),
+            "leverage": _num(row["Apalancamiento"]),
+            "effective_exposure": _num(row["Exposicion_Efectiva"]),
+            "hv": None if extra is None else _num(extra["HV"]),
+            "cvar": None if extra is None else _num(extra["CVaR"]),
+            "iv": None if extra is None else _num(extra["IV"]),
+            "gex_total": None if extra is None else _num(extra["gex_total"]),
+            "pcr_oi": None if extra is None else _num(extra["pcr_oi"]),
+        })
+
+    portfolio_iv = options_module.get("portfolio_iv")
+    return {
+        "target_leverage": target_leverage,
+        "risk_score": risk_score,
+        "components": {
+            "score_weights": dict(risk_score_weights),
+            "leverage_min": leverage_min,
+            "leverage_max": leverage_max,
+            "portfolio_iv": _num(portfolio_iv),
+            "by_ticker": by_ticker,
+        },
+    }
+
+
 # =============================================================================
 # BLOQUE 8: EJECUCION DEL PIPELINE
 # =============================================================================
@@ -974,6 +1027,12 @@ leverage_results = run_leverage_module(
     leverage_min=leverage_min,
     leverage_max=leverage_max,
     risk_score_weights=risk_score_weights
+)
+
+export_signals(
+    "portfolio_risk_score_leverage",
+    _senal_riesgo(leverage_results, options_module),
+    _PORTFOLIO_META,
 )
 
 plots = run_reporting_module(

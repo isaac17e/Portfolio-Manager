@@ -2,7 +2,7 @@
 
 A set of standalone Python scripts for **managing an existing equity/ETF portfolio**: tactical rebalancing from options market microstructure, staged entry signals, risk scoring with dynamic leverage, a portfolio-level implied volatility index, a 3D gamma "force field" and fundamental screening.
 
-Most scripts take a portfolio as a `ticker: weight` dictionary at the top of the file and use the **Polygon.io** options chain as their main input. Price history and fundamentals come from Polygon or **Yahoo Finance** (`yfinance`).
+Most scripts take a portfolio as a `ticker: weight` dictionary at the top of the file and use the **Polygon.io** options chain as their main input. If `PORTFOLIO_FILE` points at a portfolio JSON file (default `/workspace/pipeline/portfolio/portfolio_latest.json`), that file replaces the hardcoded dictionary; a missing or invalid file keeps the dictionary and prints a warning. Price history and fundamentals come from Polygon or **Yahoo Finance** (`yfinance`).
 
 > Code comments, console output and the HTML reports are in Spanish.
 
@@ -149,6 +149,49 @@ python fundamental_analysis.py
 ```
 
 Several scripts space out their Polygon calls (about 13 seconds apart) to respect the 5 requests/minute limit of the free Stocks tier, so a large portfolio can take a few minutes.
+
+## Pipeline signals
+
+Each script also writes a JSON signal (contract section 4) through `pipeline_io.py`. The hardcoded portfolio dict stays in the script and is the fallback.
+
+| Env | Default |
+|---|---|
+| `PORTFOLIO_FILE` | `/workspace/pipeline/portfolio/portfolio_latest.json` |
+| `SIGNALS_OUT_DIR` | `/workspace/pipeline/signals` |
+
+`load_portfolio` drops weights below `1e-6`, renormalizes the rest so the 6-decimal-place weights sum to 1, and returns those weights plus `portfolio_source`, `portfolio_run_ts` and `portfolio_optimizer`. `export_signals` writes `<script>.json` and `<script>_YYYYMMDDTHHMMSS.json` (America/Bogota). The write is atomic (`*.tmp` then `os.replace`). If the directory cannot be created or written, the script warns and continues. `NaN` / `±Inf` become JSON `null`; numpy and pandas values are converted.
+
+Envelope:
+
+```json
+{
+  "schema_version": 1,
+  "script": "entry_signal_tool",
+  "run_ts": "2026-10-05T16:40:12-05:00",
+  "portfolio_source": "/workspace/pipeline/portfolio/portfolio_latest.json",
+  "portfolio_run_ts": "2026-10-05T16:40:12-05:00",
+  "portfolio_optimizer": "black_litterman",
+  "weights_used": {"GLD": 0.5, "SLV": 0.5},
+  "data": {}
+}
+```
+
+`portfolio_source` is `"hardcoded_fallback"` when the file was not used. `fundamental_analysis` has no weights of its own: the fallback is an equal weight on `PORTFOLIO_TICKERS` (that list's order). A real file replaces the list with the file's tickers, heaviest first.
+
+`data` by script:
+
+- **`entry_signal_tool`** — buys only, highest conviction first. `entries[]`: `order`, `ticker`, `action` (`"BUY"`), `target_weight`, `tranche_weight` (today's slice of the portfolio), `signal` (`high_conviction` ≥ 75, `medium_conviction` 40–75, `low_conviction`, or `cycle_close` on a day-5 buy), `score`, `reason`. Tickers with no buy today are `waiting[]` (`ticker`, `score`, `reason`). Also `cycle_day` and `cycle`.
+- **`active_management`** — `rebalances[]`: `ticker`, `action` (`BUY` / `SELL` / `HOLD` from the sign of `target_weight - current_weight`; `CASH` is included, and `BUY` there means a larger cash reserve), `current_weight`, `target_weight`, `delta_weight`, `reason`, `tactical_action` (`AUMENTAR`, `RECORTAR`, `LIQUIDAR`, `MANTENER`, `RESERVA_TACTICA`). `regime` is `normal`, `insufficient_history`, `stress`, `diversification_collapse`, or `stress+diversification_collapse`. Also `regime_state`, `regime_alerts`, `vol_portfolio`, `diversification_ratio`.
+- **`portfolio_risk_score_leverage`** — `target_leverage` and `risk_score` are the weight-weighted means of the per-asset leverage (2x–5x) and risk score (0–100). `components`: `score_weights` (`hv`, `cvar`, `iv`, `gex_pcr`), `leverage_min`, `leverage_max`, `portfolio_iv`, and `by_ticker[]` (`ticker`, `weight`, `risk_score`, `leverage`, `effective_exposure`, `hv`, `cvar`, `iv`, `gex_total`, `pcr_oi`).
+- **`portfolio_gex_field`** — one file per live refresh. Scalars: `macro_y`, `potential_z`, `grad_x`, `grad_y`, `grad_magnitude`, `n_holdings`. `holdings[]`: `ticker`, `weight`, `price`, `expected_move`, `total_gex`, `regime`, `gamma_flip`, `call_wall`, `put_wall`.
+- **`portfolio_vix`** — `vix_portfolio`, `sigma_portfolio_30d`, `source`, `vol_method`, `corr_method`, `metrics` (the engine scalars: `VIX_portfolio`, `sigma_portfolio_30d`, `VIX_medio_ponderado`, `ratio_diversificacion`, `beneficio_diversificacion_pts`, `correlacion_implicita_media`) and `holdings[]` (`ticker`, `weight`, `vix`, `sigma_30d`, `mcr`, `ctr`, `ctr_vix_pts`, `ctr_pct`). `--tickers` / `--weights` and `EQUAL_WEIGHTS` replace `weights_used`.
+- **`fundamental_analysis`** — `n_tickers`, `n_indicators` (12), `score_green_min` (9), `score_medium_min` (6). `holdings[]`: `ticker`, `score_quality`, `n_green`, `n_indicators`, `rating` (`Luz Verde Global`, `Calidad Media`, `Señal de Alerta Global`), `incomplete`, `metrics` (the scorecard numbers) and `signals` (the traffic-light column for each indicator).
+
+Existing HTML reports, CSV histories, `entry_state.json` and console output are unchanged.
+
+```bash
+python -m unittest discover -s tests -t .
+```
 
 ## Disclaimer
 

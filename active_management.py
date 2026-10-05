@@ -14,6 +14,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from polygon_client import PolygonClient, PolygonError
+from pipeline_io import export_signals, load_portfolio
 
 # ============================================================================
 # BLOQUE 1: PARAMETROS CONFIGURABLES
@@ -27,6 +28,9 @@ portfolio = {"GLD": 0.18,
     "SLV": 0.096,
     "PDBC": 0.0722,
     "CME": 0.0385}
+
+_PORTFOLIO_META = load_portfolio(portfolio)
+portfolio = _PORTFOLIO_META["weights"]
 
 investment_horizon_days = 30
 
@@ -1943,11 +1947,68 @@ def run_active_management_engine(portfolio, horizon_days, api_key, cash_limit):
         "risk_plot": risk_plot,
     }
 
+def _senal_gestion_activa(resultado):
+    tabla = resultado.get("tabla_rebalanceo")
+    regimen = resultado.get("regimen_riesgo") or {}
+    rebalances = []
+    if tabla is not None:
+        for _, row in tabla.iterrows():
+            current = None if pd.isna(row["Peso_Inicial"]) else float(row["Peso_Inicial"])
+            target = None if pd.isna(row["Nuevo_Peso"]) else float(row["Nuevo_Peso"])
+            if current is None or target is None:
+                delta = None
+                action = "HOLD"
+            else:
+                delta = target - current
+                if delta > 1e-6:
+                    action = "BUY"
+                elif delta < -1e-6:
+                    action = "SELL"
+                else:
+                    action = "HOLD"
+            reason = "" if pd.isna(row["Racional"]) else str(row["Racional"])
+            rebalances.append({
+                "ticker": str(row["Ticker"]),
+                "action": action,
+                "current_weight": None if current is None else round(current, 6),
+                "target_weight": None if target is None else round(target, 6),
+                "delta_weight": None if delta is None else round(delta, 6),
+                "reason": reason,
+                "tactical_action": None if pd.isna(row["Accion"]) else str(row["Accion"]),
+            })
+
+    alertas = [str(alerta) for alerta in (regimen.get("alertas") or [])]
+    labels = []
+    for alerta in alertas:
+        if alerta.startswith("REGIMEN DE ESTRES"):
+            labels.append("stress")
+        elif alerta.startswith("DIVERSIFICACION COMPRIMIDA"):
+            labels.append("diversification_collapse")
+    if labels:
+        regime = "+".join(labels)
+    elif regimen.get("estado") == "HISTORIAL_INSUFICIENTE":
+        regime = "insufficient_history"
+    elif regimen.get("estado") == "OK":
+        regime = "normal"
+    else:
+        regime = regimen.get("estado")
+
+    return {
+        "rebalances": rebalances,
+        "regime": regime,
+        "regime_state": regimen.get("estado"),
+        "regime_alerts": alertas,
+        "vol_portfolio": regimen.get("vol_portafolio"),
+        "diversification_ratio": regimen.get("ratio_diversificacion"),
+    }
+
+
 # ============================================================================
 # BLOQUE 9: EJECUCION
 # ============================================================================
 
 resultado = run_active_management_engine(portfolio, investment_horizon_days, polygon_api_key, cash_reserve_limit)
+export_signals("active_management", _senal_gestion_activa(resultado), _PORTFOLIO_META)
 
 if resultado["gamma_plot"] is not None:
     resultado["gamma_plot"].show()
