@@ -15,6 +15,7 @@ from plotly.subplots import make_subplots
 
 from polygon_client import PolygonClient, PolygonError
 from pipeline_io import export_signals, load_portfolio
+from tickers import exclusion_warnings, no_us_options_reason, to_polygon
 
 # ============================================================================
 # BLOQUE 1: PARAMETROS CONFIGURABLES
@@ -190,7 +191,7 @@ def polygon_get(url, params=None, api_key=polygon_api_key):
 
 
 def get_options_snapshot(ticker, exp_date_from, exp_date_to, api_key=polygon_api_key):
-    url = f"{POLYGON_BASE_URL}/v3/snapshot/options/{ticker}"
+    url = f"{POLYGON_BASE_URL}/v3/snapshot/options/{to_polygon(ticker)}"
     params = {
         "expiration_date.gte": str(exp_date_from),
         "expiration_date.lte": str(exp_date_to),
@@ -256,7 +257,7 @@ def get_options_snapshot(ticker, exp_date_from, exp_date_to, api_key=polygon_api
 
 
 def get_spot_price(ticker, api_key=polygon_api_key):
-    url = f"{POLYGON_BASE_URL}/v2/aggs/ticker/{ticker}/prev"
+    url = f"{POLYGON_BASE_URL}/v2/aggs/ticker/{to_polygon(ticker)}/prev"
     resp = polygon_get(url, api_key=api_key)
     if not resp or not resp.get("results"):
         warnings.warn(f"No se pudo obtener precio spot para {ticker}")
@@ -273,7 +274,7 @@ def select_target_expiration(ticker, horizon_days, api_key=polygon_api_key):
     today = date.today()
     target_date = today + timedelta(days=math.ceil(horizon_days * 7 / 5))
     url = f"{POLYGON_BASE_URL}/v3/reference/options/contracts"
-    base = {"underlying_ticker": ticker, "contract_type": "call",
+    base = {"underlying_ticker": to_polygon(ticker), "contract_type": "call",
             "sort": "expiration_date", "limit": 1}
 
     # Si cualquiera de las dos consultas falla se propaga el error: con un solo
@@ -694,7 +695,7 @@ def get_price_history(tickers, lookback_days=corr_lookback_days, api_key=polygon
     series = {}
 
     for tk in tickers:
-        url = (f"{POLYGON_BASE_URL}/v2/aggs/ticker/{tk}/range/1/day/"
+        url = (f"{POLYGON_BASE_URL}/v2/aggs/ticker/{to_polygon(tk)}/range/1/day/"
                f"{start.isoformat()}/{end.isoformat()}")
         resp = polygon_get(url, params={"adjusted": "true", "sort": "asc", "limit": 50000},
                            api_key=api_key)
@@ -1549,6 +1550,8 @@ def registrar_historial_riesgo(risk_report, hist_df):
     hist_actualizado["fecha_dia"] = pd.to_datetime(hist_actualizado["fecha"]).dt.date
     hist_actualizado = hist_actualizado.drop_duplicates(subset=["fecha_dia"], keep="last")
     hist_actualizado = hist_actualizado.drop(columns=["fecha_dia"]).sort_values("fecha")
+    # Observacion de la corrida (vol, diversificacion). No es un libro de
+    # ejecucion: no se ata a fills ni asume que el rebalanceo se opero.
     hist_actualizado.to_csv(risk_history_path, index=False)
     return hist_actualizado
 
@@ -1904,7 +1907,18 @@ def plot_risk_attribution(reporte):
 def run_active_management_engine(portfolio, horizon_days, api_key, cash_limit):
     tickers = list(portfolio.keys())
 
-    analyses = {tk: analyze_ticker_options(tk, horizon_days, api_key) for tk in tickers}
+    analyses = {}
+    excluded = []
+    for tk in tickers:
+        reason = no_us_options_reason(tk)
+        if reason:
+            excluded.append({"ticker": tk, "reason": reason})
+            analyses[tk] = {"ticker": tk, "status": "ERROR", "error_message": reason}
+            warnings.warn(f"{tk}: {reason}. Se omite del modulo de opciones.")
+            continue
+        analyses[tk] = analyze_ticker_options(tk, horizon_days, api_key)
+        if analyses[tk].get("status") != "OK":
+            excluded.append({"ticker": tk, "reason": "no option data returned"})
 
     scores_list = [calculate_tactical_score(analyses[tk]) for tk in tickers]
     scores_df = pd.DataFrame(scores_list)
@@ -1945,6 +1959,7 @@ def run_active_management_engine(portfolio, horizon_days, api_key, cash_limit):
         "gamma_plot": gamma_plot,
         "allocation_plot": allocation_plot,
         "risk_plot": risk_plot,
+        "excluded": excluded,
     }
 
 def _senal_gestion_activa(resultado):
@@ -2000,6 +2015,7 @@ def _senal_gestion_activa(resultado):
         "regime_alerts": alertas,
         "vol_portfolio": regimen.get("vol_portafolio"),
         "diversification_ratio": regimen.get("ratio_diversificacion"),
+        "excluded": list(resultado.get("excluded") or []),
     }
 
 
@@ -2008,7 +2024,11 @@ def _senal_gestion_activa(resultado):
 # ============================================================================
 
 resultado = run_active_management_engine(portfolio, investment_horizon_days, polygon_api_key, cash_reserve_limit)
-export_signals("active_management", _senal_gestion_activa(resultado), _PORTFOLIO_META)
+_senal_activa = _senal_gestion_activa(resultado)
+export_signals(
+    "active_management", _senal_activa, _PORTFOLIO_META,
+    warnings=exclusion_warnings(_senal_activa.get("excluded")),
+)
 
 if resultado["gamma_plot"] is not None:
     resultado["gamma_plot"].show()

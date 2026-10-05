@@ -19,6 +19,7 @@ import numpy as np
 import pandas as pd
 from pipeline_io import export_signals, load_portfolio
 from polygon_client import PolygonClient
+from tickers import exclusion_warnings, no_us_options_reason, to_polygon, to_yahoo
 from scipy.interpolate import CubicSpline
 from scipy.optimize import brentq, least_squares
 from scipy.stats import norm
@@ -1061,6 +1062,7 @@ class PolygonMarketLoader:
         self.max_days = max_days
         self.strike_range_pct = strike_range_pct
         self.verbose = verbose
+        self.excluded: List[Dict[str, str]] = []
 
     # -- transporte ------------------------------------------------------------
     # polygon_client.py: ritmo por ventana de 60s (POLYGON_CALLS_PER_MINUTE en el
@@ -1093,7 +1095,7 @@ class PolygonMarketLoader:
         end = date.today()
         start = end - timedelta(days=self._lookback_days(lookback) + 10)
         payload = self._get(
-            f"{POLYGON_BASE_URL}/v2/aggs/ticker/{ticker}/range/1/day/"
+            f"{POLYGON_BASE_URL}/v2/aggs/ticker/{to_polygon(ticker)}/range/1/day/"
             f"{start.isoformat()}/{end.isoformat()}",
             {"adjusted": "true", "sort": "asc", "limit": 50000},
         )
@@ -1106,7 +1108,7 @@ class PolygonMarketLoader:
     def _history(self, ticker: str, lookback: str) -> pd.Series:
         if _HAS_YF:
             try:
-                hist = yf.Ticker(ticker).history(period=lookback, auto_adjust=True)["Close"]
+                hist = yf.Ticker(to_yahoo(ticker)).history(period=lookback, auto_adjust=True)["Close"]
                 hist = hist.dropna()
                 if not hist.empty:
                     # fechas normalizadas para que casen con el respaldo de Polygon
@@ -1126,7 +1128,7 @@ class PolygonMarketLoader:
             payload = self._get(
                 f"{POLYGON_BASE_URL}/v3/reference/dividends",
                 {
-                    "ticker": ticker,
+                    "ticker": to_polygon(ticker),
                     "limit": 12,
                     "order": "desc",
                     "sort": "ex_dividend_date",
@@ -1185,7 +1187,7 @@ class PolygonMarketLoader:
     def _expirations(self, ticker: str) -> List[str]:
         today = date.today()
         params = {
-            "underlying_ticker": ticker,
+            "underlying_ticker": to_polygon(ticker),
             "contract_type": "call",
             "expired": "false",
             "expiration_date.gte": (today + timedelta(days=int(self.min_days))).isoformat(),
@@ -1210,7 +1212,7 @@ class PolygonMarketLoader:
             "strike_price.lte": round(spot * (1.0 + self.strike_range_pct), 2),
         }
         contracts = self._paginate(
-            f"{POLYGON_BASE_URL}/v3/snapshot/options/{ticker}", params
+            f"{POLYGON_BASE_URL}/v3/snapshot/options/{to_polygon(ticker)}", params
         )
 
         rows: List[Dict[str, object]] = []
@@ -1301,6 +1303,11 @@ class PolygonMarketLoader:
         now = pd.Timestamp.now(tz="UTC")
 
         for tk in tickers:
+            reason = no_us_options_reason(tk)
+            if reason:
+                self.excluded.append({"ticker": str(tk), "reason": reason})
+                warnings.warn(f"[{tk}] {reason}", RuntimeWarning)
+                continue
             try:
                 hist = self._history(tk, lookback)
                 spot = float(hist.iloc[-1])
@@ -1349,10 +1356,15 @@ class PolygonMarketLoader:
                         f"vencimientos = {[s.label for s in slices]}"
                     )
             except Exception as exc:  # noqa: BLE001
+                self.excluded.append({"ticker": str(tk), "reason": "no option data returned"})
                 warnings.warn(f"[{tk}] Excluido de la carga de datos: {exc}", RuntimeWarning)
 
         if not assets:
-            raise RuntimeError("Polygon no devolvió datos utilizables para ningún activo")
+            warnings.warn(
+                "Polygon no devolvió datos utilizables para ningún activo.",
+                RuntimeWarning,
+            )
+            return [], pd.DataFrame()
 
         prices = pd.DataFrame(closes).dropna()
         return assets, prices
@@ -1362,6 +1374,7 @@ class YahooMarketLoader:
     def __init__(self, min_days: float = 7.0, verbose: bool = True) -> None:
         self.min_days = min_days
         self.verbose = verbose
+        self.excluded: List[Dict[str, str]] = []
 
     def _pick_expiries(self, expiries: Sequence[str]) -> List[str]:
         return select_cboe_expiries(expiries, self.min_days)
@@ -1376,42 +1389,61 @@ class YahooMarketLoader:
         now = pd.Timestamp.now(tz="UTC")
 
         for tk in tickers:
-            t = yf.Ticker(tk)
-            hist = t.history(period=lookback, auto_adjust=True)["Close"].dropna()
-            if hist.empty:
-                raise RuntimeError(f"sin histórico para {tk}")
-            hist.index = pd.to_datetime(hist.index).tz_localize(None)
-            closes[tk] = hist
-            spot = float(hist.iloc[-1])
-
+            reason = no_us_options_reason(tk)
+            if reason:
+                self.excluded.append({"ticker": str(tk), "reason": reason})
+                warnings.warn(f"[{tk}] {reason}", RuntimeWarning)
+                continue
             try:
-                dy = t.info.get("dividendYield", 0.0) or 0.0
-                q = float(dy) if float(dy) < 1.0 else float(dy) / 100.0
-            except Exception:  # noqa: BLE001
-                q = 0.0
+                t = yf.Ticker(to_yahoo(tk))
+                hist = t.history(period=lookback, auto_adjust=True)["Close"].dropna()
+                if hist.empty:
+                    raise RuntimeError(f"sin histórico para {tk}")
+                hist.index = pd.to_datetime(hist.index).tz_localize(None)
+                spot = float(hist.iloc[-1])
 
-            exps = self._pick_expiries(list(t.options))
-            if len(exps) < 2:
-                warnings.warn(
-                    f"[{tk}] Menos de 2 vencimientos válidos disponibles en la fuente.",
-                    RuntimeWarning,
-                )
-            slices: List[ExpirySlice] = []
-            for e in exps:
-                oc = t.option_chain(e)
-                calls = oc.calls[["strike", "bid", "ask"]].assign(type="call")
-                puts = oc.puts[["strike", "bid", "ask"]].assign(type="put")
-                slices.append(
-                    ExpirySlice(
-                        T=year_fraction(pd.Timestamp(e), now),
-                        chain=pd.concat([calls, puts], ignore_index=True),
-                        label=e,
+                try:
+                    dy = t.info.get("dividendYield", 0.0) or 0.0
+                    q = float(dy) if float(dy) < 1.0 else float(dy) / 100.0
+                except Exception:  # noqa: BLE001
+                    q = 0.0
+
+                exps = self._pick_expiries(list(t.options or []))
+                if not exps:
+                    raise RuntimeError("sin vencimientos de opciones")
+                if len(exps) < 2:
+                    warnings.warn(
+                        f"[{tk}] Menos de 2 vencimientos válidos disponibles en la fuente.",
+                        RuntimeWarning,
                     )
-                )
-            assets.append(AssetMarketData(ticker=tk, spot=spot, q=q, slices=slices))
-            if self.verbose:
-                print(f"  [yfinance] {tk}: spot = {spot:.2f}, q = {q:.4f}, vencimientos = {exps}")
+                slices: List[ExpirySlice] = []
+                for e in exps:
+                    oc = t.option_chain(e)
+                    calls = oc.calls[["strike", "bid", "ask"]].assign(type="call")
+                    puts = oc.puts[["strike", "bid", "ask"]].assign(type="put")
+                    chain = pd.concat([calls, puts], ignore_index=True)
+                    if chain.empty:
+                        continue
+                    slices.append(
+                        ExpirySlice(
+                            T=year_fraction(pd.Timestamp(e), now),
+                            chain=chain,
+                            label=e,
+                        )
+                    )
+                if not slices:
+                    raise RuntimeError("ninguna cadena utilizable")
+                closes[tk] = hist
+                assets.append(AssetMarketData(ticker=tk, spot=spot, q=q, slices=slices))
+                if self.verbose:
+                    print(f"  [yfinance] {tk}: spot = {spot:.2f}, q = {q:.4f}, vencimientos = {exps}")
+            except Exception as exc:  # noqa: BLE001
+                self.excluded.append({"ticker": str(tk), "reason": "no option data returned"})
+                warnings.warn(f"[{tk}] Excluido de la carga yfinance: {exc}", RuntimeWarning)
 
+        if not assets:
+            warnings.warn("yfinance no devolvió datos utilizables para ningún activo.", RuntimeWarning)
+            return [], pd.DataFrame()
         return assets, pd.DataFrame(closes).dropna()
 
 
@@ -1807,10 +1839,35 @@ class PortfolioVIXCalculator:
         self.corr_est = ImpliedCorrelationEstimator(lam=config.ewma_lambda, verbose=config.verbose)
         self.aggregator = PortfolioVIX(verbose=config.verbose)
         self.source_used: str = config.source
+        self.excluded: List[Dict[str, str]] = []
+
+    def _eligible_tickers(self) -> List[str]:
+        eligible = []
+        seen = {item["ticker"] for item in self.excluded}
+        for ticker in self.cfg.tickers:
+            reason = no_us_options_reason(ticker)
+            key = str(ticker)
+            if reason:
+                if key not in seen:
+                    self.excluded.append({"ticker": key, "reason": reason})
+                    seen.add(key)
+                continue
+            eligible.append(ticker)
+        return eligible
+
+    def _remember_loader_exclusions(self, loader) -> None:
+        seen = {item["ticker"] for item in self.excluded}
+        for item in getattr(loader, "excluded", []):
+            if item["ticker"] not in seen:
+                self.excluded.append(item)
+                seen.add(item["ticker"])
 
     # -- datos -----------------------------------------------------------------
     def _load(self) -> Tuple[List[AssetMarketData], pd.DataFrame]:
         src = self.cfg.source
+        tickers = self._eligible_tickers()
+        if not tickers and src != "synthetic":
+            return [], pd.DataFrame()
 
         if src == "polygon":
             try:
@@ -1819,15 +1876,21 @@ class PortfolioVIXCalculator:
                     engine=self.cfg.american_engine,
                     verbose=self.cfg.verbose,
                 )
-                data = loader.load(self.cfg.tickers, self.cfg.lookback)
-                self.source_used = "polygon"
-                return data
+                data = loader.load(tickers, self.cfg.lookback)
+                if data[0]:
+                    self._remember_loader_exclusions(loader)
+                    self.source_used = "polygon"
+                    return data
+                warnings.warn(
+                    "Polygon no devolvió activos utilizables; se prueba con yfinance.",
+                    RuntimeWarning,
+                )
             except Exception as exc:  # noqa: BLE001
                 warnings.warn(
                     f"Fallo al descargar opciones de Polygon ({exc}); se prueba con yfinance.",
                     RuntimeWarning,
                 )
-                src = "yahoo"
+            src = "yahoo"
 
         if src == "yahoo":
             # Los datos sinteticos solo se usan si se piden explicitamente
@@ -1839,21 +1902,41 @@ class PortfolioVIXCalculator:
                     "instalado (`pip install yfinance`). Usa --synthetic solo para pruebas."
                 )
             try:
-                data = YahooMarketLoader(verbose=self.cfg.verbose).load(
-                    self.cfg.tickers, self.cfg.lookback
-                )
+                loader = YahooMarketLoader(verbose=self.cfg.verbose)
+                data = loader.load(tickers, self.cfg.lookback)
             except Exception as exc:  # noqa: BLE001
                 raise RuntimeError(
                     f"No hay datos reales disponibles: Polygon y yfinance fallaron ({exc}). "
                     "Usa --synthetic solo para pruebas."
                 ) from exc
-            self.source_used = "yahoo"
-            return data
+            self._remember_loader_exclusions(loader)
+            if data[0]:
+                self.source_used = "yahoo"
+                return data
+            return [], pd.DataFrame()
 
         self.source_used = "synthetic"
         return SyntheticMarketGenerator(r=self.cfg.r, verbose=self.cfg.verbose).generate(
-            self.cfg.tickers
+            tickers or list(self.cfg.tickers)
         )
+
+    def _empty_results(self) -> Dict[str, object]:
+        columns = [
+            "ticker", "peso", "VIX_individual", "sigma_30d",
+            "MCR", "CTR", "CTR_VIX_pts", "CTR_%",
+        ]
+        return {
+            "vix": None,
+            "breakdown": pd.DataFrame(columns=columns),
+            "metrics": {},
+            "covariance": pd.DataFrame(),
+            "correlation": pd.DataFrame(),
+            "fits": {},
+            "figure": None,
+            "plot": None,
+            "source": self.source_used,
+            "excluded": list(self.excluded),
+        }
 
     # -- ejecución -------------------------------------------------------------
     def run(self) -> Dict[str, object]:
@@ -1869,10 +1952,15 @@ class PortfolioVIXCalculator:
                 used.append(a.ticker)
                 fits_by_asset[a.ticker] = fits
             except Exception as exc:  # noqa: BLE001
+                self.excluded.append({"ticker": a.ticker, "reason": "no option data returned"})
                 warnings.warn(f"[{a.ticker}] Excluido del portafolio: {exc}", RuntimeWarning)
 
         if not used:
-            raise RuntimeError("ningún activo pudo ser valorado; revise los datos de entrada")
+            warnings.warn(
+                "ningún activo pudo ser valorado; se exporta la señal con las exclusiones.",
+                RuntimeWarning,
+            )
+            return self._empty_results()
 
         # pesos alineados con los activos efectivamente valorados
         if self.cfg.weights is None:
@@ -1917,6 +2005,7 @@ class PortfolioVIXCalculator:
             "figure": figure,
             "plot": plot,
             "source": self.source_used,
+            "excluded": list(self.excluded),
         }
 
     @staticmethod
@@ -1974,6 +2063,7 @@ def _senal_vix(results: Dict[str, object], cfg: "VIXConfig") -> Dict[str, object
         "corr_method": cfg.corr_method,
         "metrics": metrics,
         "holdings": holdings,
+        "excluded": list(results.get("excluded") or []),
     }
 
 
@@ -2057,4 +2147,8 @@ if __name__ == "__main__":
         f"  Fuente opciones : {cfg.source}"
     )
     results = PortfolioVIXCalculator(cfg).run()
-    export_signals("portfolio_vix", _senal_vix(results, cfg), _vix_portfolio_meta(cfg))
+    senal = _senal_vix(results, cfg)
+    export_signals(
+        "portfolio_vix", senal, _vix_portfolio_meta(cfg),
+        warnings=exclusion_warnings(senal.get("excluded")),
+    )

@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 from pipeline_io import export_signals, load_portfolio
+from tickers import to_yahoo
 
 try:
     import yfinance as yf
@@ -708,7 +709,7 @@ def analizar_cartera(tickers_list: Sequence[str]) -> pd.DataFrame:
         print(f"Procesando {ticker_str}...")
         res = ResultadoTicker(ticker=ticker_str)
         try:
-            tk = yf.Ticker(ticker_str)
+            tk = yf.Ticker(to_yahoo(ticker_str))
             info = obtener_info(tk)
             if not info:
                 res.datos_incompletos = True

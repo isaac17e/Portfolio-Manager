@@ -3,6 +3,7 @@
 # ============================================================
 
 import os
+import sys
 import time
 import json
 import functools
@@ -19,6 +20,7 @@ from scipy.ndimage import gaussian_filter1d
 from datetime import datetime, timedelta
 from pipeline_io import export_signals, load_portfolio
 from polygon_client import PolygonClient, PolygonError
+from tickers import exclusion_warnings, no_us_options_reason, to_polygon, to_yahoo
 import plotly.graph_objects as go
 import plotly.io as pio
 import yfinance as yf
@@ -105,6 +107,8 @@ OUTPUT_HTML_PATH = "portfolio_gex_field.html"
 DATA_JSON_FILENAME = "portfolio_gex_field_data.json"
 LOCAL_SERVER_PORT = 8765
 OPEN_BROWSER_ON_START = True
+_HEADLESS_TRUTHY = {"1", "true", "yes", "y", "on"}
+_LAST_EXCLUDED = []
 
 MIN_SIGMA_COVERAGE = 2.0
 MAX_STRIKE_RANGE_PCT = 0.35
@@ -145,7 +149,7 @@ def clamp_iv(iv):
 @functools.lru_cache(maxsize=None)
 def get_dividend_yield(ticker):
     try:
-        raw = yf.Ticker(ticker).info.get("dividendYield")
+        raw = yf.Ticker(to_yahoo(ticker)).info.get("dividendYield")
     except Exception as e:
         print(f"⚠️  [{ticker}] No se pudo leer el dividend yield ({e}). Se asume {DIVIDEND_YIELD_FALLBACK:.2%}.")
         return DIVIDEND_YIELD_FALLBACK
@@ -249,8 +253,9 @@ def american_delta_gamma(S, K, T, r, q, sigma, option_type="call"):
 # ============================================================
 
 def get_current_price(ticker):
+    yahoo = to_yahoo(ticker)
     try:
-        t = yf.Ticker(ticker)
+        t = yf.Ticker(yahoo)
         price = t.fast_info.get("last_price")
         if price:
             return float(price)
@@ -258,14 +263,14 @@ def get_current_price(ticker):
     except Exception as e:
         print(f"⚠️  [{ticker}] yfinance fast_info falló ({e}). Intentando history()...")
         try:
-            hist = yf.Ticker(ticker).history(period="1d")
+            hist = yf.Ticker(yahoo).history(period="1d")
             if not hist.empty:
                 return float(hist["Close"].iloc[-1])
             raise ValueError("history() devolvió DataFrame vacío")
         except Exception as e2:
             print(f"⚠️  [{ticker}] yfinance history() también falló ({e2}). Usando Polygon /prev...")
             try:
-                payload = polygon().get(f"{BASE_URL}/v2/aggs/ticker/{ticker}/prev")
+                payload = polygon().get(f"{BASE_URL}/v2/aggs/ticker/{to_polygon(ticker)}/prev")
                 return float(payload["results"][0]["c"])
             except Exception as e3:
                 print(f"❌ [{ticker}] ERROR CRÍTICO: no se pudo obtener el precio spot por ninguna fuente: {e3}")
@@ -284,7 +289,7 @@ def get_polygon_options_data(ticker, current_price, horizon_months=TIME_HORIZON_
     today = datetime.utcnow().date()
     cutoff_date = today + timedelta(days=int(horizon_months * 30.44))
 
-    url = f"{BASE_URL}/v3/snapshot/options/{ticker}"
+    url = f"{BASE_URL}/v3/snapshot/options/{to_polygon(ticker)}"
     params = {
         "limit": 250,
         "strike_price.gte": round(current_price * (1 - strike_range_pct), 2),
@@ -633,45 +638,72 @@ def _reusar_ultimo_dato(ticker, motivo, max_age_seconds=STALE_DATA_MAX_SECONDS):
 
 
 def get_portfolio_chains(holdings, horizon_months=TIME_HORIZON_MONTHS):
+    global _LAST_EXCLUDED
     portfolio_data = {}
     failed = []
+    excluded = []
+    _LAST_EXCLUDED = excluded
+
+    def note(ticker, reason):
+        excluded.append({"ticker": ticker, "reason": reason})
+        failed.append(ticker)
+        print(f"❌ {ticker}: {reason}; se excluye.")
 
     for ticker, weight in holdings.items():
         print(f"\n{'='*60}\nProcesando {ticker} (peso original: {weight:.2%})\n{'='*60}")
-
-        price = get_current_price(ticker)
+        reason = no_us_options_reason(ticker)
+        if reason:
+            note(ticker, reason)
+            continue
+        try:
+            price = get_current_price(ticker)
+        except Exception as exc:
+            note(ticker, "no option data returned")
+            print(f"   ({exc})")
+            continue
         if price is None:
             reutilizado = _reusar_ultimo_dato(ticker, "sin precio spot")
             if reutilizado is not None:
                 portfolio_data[ticker] = reutilizado
                 continue
-            print(f"❌ {ticker}: sin precio spot, se excluye del portafolio.")
-            failed.append(ticker)
+            note(ticker, "no option data returned")
             continue
 
-        df_opts = get_polygon_options_data(ticker, price, horizon_months=horizon_months)
+        try:
+            df_opts = get_polygon_options_data(ticker, price, horizon_months=horizon_months)
+        except Exception as exc:
+            note(ticker, "no option data returned")
+            print(f"   ({exc})")
+            continue
         if df_opts.empty:
             reutilizado = _reusar_ultimo_dato(ticker, "sin cadena de opciones en esta iteración")
             if reutilizado is not None:
                 portfolio_data[ticker] = reutilizado
                 continue
-            print(f"❌ {ticker}: sin cadena de opciones válida, se excluye.")
-            failed.append(ticker)
+            note(ticker, "no option data returned")
             continue
 
-        split = calculate_gex_split(df_opts, price)
+        try:
+            split = calculate_gex_split(df_opts, price)
+        except Exception as exc:
+            note(ticker, "no usable gamma field")
+            print(f"   ({exc})")
+            continue
         df_gex_structural = split.get("structural", {}).get("df_gex")
         metrics_structural = split.get("structural", {}).get("metrics")
 
         if df_gex_structural is None or df_gex_structural.empty:
-            print(f"❌ {ticker}: sin GEX estructural (>{NEAR_TERM_DAYS_CUTOFF}d), se excluye.")
-            failed.append(ticker)
+            note(ticker, "no usable gamma field")
             continue
 
-        expected_move = calculate_expected_move(df_opts, price, horizon_months=horizon_months)
+        try:
+            expected_move = calculate_expected_move(df_opts, price, horizon_months=horizon_months)
+        except Exception as exc:
+            note(ticker, "no usable gamma field")
+            print(f"   ({exc})")
+            continue
         if expected_move is None or np.isnan(expected_move) or expected_move <= 0:
-            print(f"❌ {ticker}: no se pudo estimar el movimiento esperado (1σ), se excluye.")
-            failed.append(ticker)
+            note(ticker, "no usable gamma field")
             continue
 
         current_range_pct = get_dynamic_strike_range(horizon_months)
@@ -683,13 +715,22 @@ def get_portfolio_chains(holdings, horizon_months=TIME_HORIZON_MONTHS):
                   f"(mov. esperado ±{expected_move*100:.1f}%). Re-descargando con ventana "
                   f"±{required_range_pct*100:.1f}% (antes ±{current_range_pct*100:.1f}%)...")
 
-            df_opts_wide = get_polygon_options_data(ticker, price, horizon_months=horizon_months,
-                                                      strike_range_pct=required_range_pct)
+            try:
+                df_opts_wide = get_polygon_options_data(ticker, price, horizon_months=horizon_months,
+                                                          strike_range_pct=required_range_pct)
+            except Exception as exc:
+                print(f"⚠️  [{ticker}] El re-fetch ampliado falló ({exc}); se conserva la ventana original.")
+                df_opts_wide = pd.DataFrame()
             if not df_opts_wide.empty:
-                split_wide = calculate_gex_split(df_opts_wide, price)
-                df_gex_structural_wide = split_wide.get("structural", {}).get("df_gex")
-                metrics_structural_wide = split_wide.get("structural", {}).get("metrics")
-                expected_move_wide = calculate_expected_move(df_opts_wide, price, horizon_months=horizon_months)
+                try:
+                    split_wide = calculate_gex_split(df_opts_wide, price)
+                    df_gex_structural_wide = split_wide.get("structural", {}).get("df_gex")
+                    metrics_structural_wide = split_wide.get("structural", {}).get("metrics")
+                    expected_move_wide = calculate_expected_move(df_opts_wide, price, horizon_months=horizon_months)
+                except Exception as exc:
+                    print(f"⚠️  [{ticker}] El re-fetch ampliado falló ({exc}); se conserva la ventana original.")
+                    df_gex_structural_wide = None
+                    expected_move_wide = None
 
                 if (df_gex_structural_wide is not None and not df_gex_structural_wide.empty
                         and expected_move_wide and not np.isnan(expected_move_wide) and expected_move_wide > 0):
@@ -1205,7 +1246,21 @@ def start_local_file_server(directory, preferred_port=LOCAL_SERVER_PORT, attempt
 # BLOQUE 10: EJECUCIÓN
 # ============================================================
 
-def _senal_gex(result):
+def gex_headless_requested(argv=None, env=None):
+    """Pipeline mode: one shot, no browser. ``--once`` or HEADLESS=1 or GEX_ONCE=1."""
+    if argv is None:
+        argv = sys.argv[1:]
+    if env is None:
+        env = os.environ
+    if "--once" in list(argv):
+        return True
+    for key in ("HEADLESS", "GEX_ONCE"):
+        if str(env.get(key, "")).strip().lower() in _HEADLESS_TRUTHY:
+            return True
+    return False
+
+
+def _senal_gex(result, excluded=None):
     state = result.get("current_state") or {}
     portfolio_data = result.get("portfolio_data") or {}
     holdings = []
@@ -1230,6 +1285,7 @@ def _senal_gex(result):
         "grad_magnitude": state.get("grad_magnitude"),
         "n_holdings": len(holdings),
         "holdings": holdings,
+        "excluded": list(_LAST_EXCLUDED if excluded is None else excluded),
     }
 
 
@@ -1273,8 +1329,13 @@ def run_live(refresh_seconds=REFRESH_SECONDS, max_iterations=MAX_ITERATIONS,
         inicio_iteracion = time.time()
         result = run_once()
 
+        excluded = list(_LAST_EXCLUDED)
+        data = _senal_gex(result or {}, excluded)
+        export_signals(
+            "portfolio_gex_field", data, _PORTFOLIO_META,
+            warnings=exclusion_warnings(excluded),
+        )
         if result is not None:
-            export_signals("portfolio_gex_field", _senal_gex(result), _PORTFOLIO_META)
             current_state = result["current_state"]
             if current_state is not None:
                 state_history.append({"y": current_state["y"], "z": current_state["z"]})
@@ -1314,4 +1375,44 @@ def run_live(refresh_seconds=REFRESH_SECONDS, max_iterations=MAX_ITERATIONS,
     print("\n✅ Loop finalizado.")
 
 
-run_live()
+def run_headless(output_path=OUTPUT_HTML_PATH):
+    """Un calculo, HTML + JSON, sin navegador ni servidor. Modo pipeline."""
+    print("Modo pipeline (--once): un calculo, sin navegador.")
+    result = run_once()
+    excluded = list(_LAST_EXCLUDED)
+    data = _senal_gex(result or {}, excluded)
+    export_signals(
+        "portfolio_gex_field", data, _PORTFOLIO_META,
+        warnings=exclusion_warnings(excluded),
+    )
+    if result is None:
+        print("❌ No se escribió el HTML: ningún holding tiene datos válidos.")
+        return
+
+    output_dir = os.path.dirname(os.path.abspath(output_path)) or "."
+    output_filename = os.path.basename(output_path)
+    fig = plot_3d_portfolio_field(
+        result["X"], result["Y"], result["Z"],
+        result["current_state"], result["reference_lines"],
+        result["portfolio_data"], surface_data=result["surface_data"],
+    )
+    if fig is None:
+        print("⚠️  No se generó la figura; la señal JSON sí quedó escrita.")
+        return
+    write_portfolio_data_json(fig, output_dir, DATA_JSON_FILENAME)
+    write_portfolio_html_shell(
+        output_dir, output_filename, DATA_JSON_FILENAME,
+        refresh_seconds=REFRESH_SECONDS, rotate_camera=False,
+    )
+    print(f"💾 JSON: {os.path.join(output_dir, DATA_JSON_FILENAME)}")
+
+
+def main(argv=None):
+    if gex_headless_requested(argv):
+        run_headless()
+    else:
+        run_live()
+
+
+if __name__ == "__main__":
+    main()

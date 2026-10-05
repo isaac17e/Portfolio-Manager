@@ -6,6 +6,7 @@ import pandas as pd
 from datetime import date
 
 from pipeline_io import export_signals, load_portfolio
+from tickers import exclusion_warnings, no_us_options_reason, to_polygon, to_yahoo
 
 portfolio = {
     "XLU": 0.12,
@@ -106,17 +107,20 @@ def pct(x, digits=2):
 import yfinance as yf
 
 def get_price_data(tickers, start, end):
+    yahoo = [to_yahoo(ticker) for ticker in tickers]
     log_info(f"Descargando precios historicos para: {', '.join(tickers)}")
 
-    data = yf.download(tickers, start=start, end=end, auto_adjust=False, progress=False)
+    data = yf.download(yahoo, start=start, end=end, auto_adjust=False, progress=False)
     if data.empty:
         raise ValueError("No se pudo descargar ningun precio. Revisa los tickers/conexion.")
 
+    rename = {to_yahoo(ticker): ticker for ticker in tickers}
     if isinstance(data.columns, pd.MultiIndex):
-        prices = data["Adj Close"][tickers]
+        prices = data["Adj Close"].rename(columns=rename)
+        prices = prices.reindex(columns=list(tickers))
     else:
-        prices = data[["Adj Close"]]
-        prices.columns = tickers
+        prices = data[["Adj Close"]].copy()
+        prices.columns = list(tickers[:1])
 
     prices = prices.ffill().dropna()
     return prices
@@ -410,7 +414,7 @@ def get_target_expiration(ticker, horizon_days, api_key):
     # sola pagina de 1000 contratos sin filtro de fecha: en activos con
     # vencimientos semanales esa pagina cubria apenas los proximos dias y el
     # vencimiento "mas cercano al objetivo" salia de ahi.
-    base = {"underlying_ticker": ticker, "contract_type": "call",
+    base = {"underlying_ticker": to_polygon(ticker), "contract_type": "call",
             "sort": "expiration_date", "limit": 1}
     respuestas = [
         polygon_get("/v3/reference/options/contracts",
@@ -443,7 +447,7 @@ def get_option_chain_snapshot(ticker, expiration_date, api_key):
     # Una pagina fallida o el tope de paginas lanzan PolygonError: antes se
     # cortaba en silencio y el GEX / max pain se calculaban sobre media cadena.
     all_results = polygon_client(api_key).paginate(
-        f"/v3/snapshot/options/{ticker}",
+        f"/v3/snapshot/options/{to_polygon(ticker)}",
         params={"expiration_date": expiration_date.strftime("%Y-%m-%d"), "limit": 250},
         max_pages=polygon_max_pages_snapshot,
     )
@@ -648,7 +652,13 @@ def run_options_module_for_ticker(ticker, hv_annual, horizon_days, api_key,
 def run_options_module(tickers, hv_by_asset, weights, horizon_days, api_key,
                         spot_by_asset=None, rf_annual=0):
     results = {}
+    excluded = []
     for tk in tickers:
+        reason = no_us_options_reason(tk)
+        if reason:
+            excluded.append({"ticker": tk, "reason": reason})
+            log_warn(f"{tk}: {reason}. Se omite del modulo de opciones.")
+            continue
         spot_fb = spot_by_asset.get(tk, np.nan) if spot_by_asset else np.nan
         r = run_options_module_for_ticker(
             tk, hv_by_asset.get(tk), horizon_days, api_key,
@@ -656,10 +666,12 @@ def run_options_module(tickers, hv_by_asset, weights, horizon_days, api_key,
         )
         if r is not None:
             results[tk] = r
+        else:
+            excluded.append({"ticker": tk, "reason": "no option data returned"})
 
     if len(results) == 0:
         log_warn("MODULO 2: ningun activo tuvo datos de opciones disponibles.")
-        return {"by_asset": {}, "summary": pd.DataFrame(), "portfolio_iv": np.nan}
+        return {"by_asset": {}, "summary": pd.DataFrame(), "portfolio_iv": np.nan, "excluded": excluded}
 
     summary_rows = []
     for r in results.values():
@@ -687,7 +699,12 @@ def run_options_module(tickers, hv_by_asset, weights, horizon_days, api_key,
     else:
         portfolio_iv = float((summary_tbl["IV_ATM"].values * available_w.values).sum())
 
-    return {"by_asset": results, "summary": summary_tbl, "portfolio_iv": portfolio_iv}
+    return {
+        "by_asset": results,
+        "summary": summary_tbl,
+        "portfolio_iv": portfolio_iv,
+        "excluded": excluded,
+    }
 
 # =============================================================================
 # BLOQUE 6: APALANCAMIENTO DINAMICO POR ACTIVO
@@ -980,6 +997,7 @@ def _senal_riesgo(leverage_results, options_module):
             "portfolio_iv": _num(portfolio_iv),
             "by_ticker": by_ticker,
         },
+        "excluded": list(options_module.get("excluded") or []),
     }
 
 
@@ -1008,7 +1026,12 @@ spot_by_asset = dict(zip(tickers, prices.iloc[-1][tickers].values))
 
 if not polygon_api_key:
     log_warn("polygon_api_key no configurada. Se omite el MODULO 2 (Ex-Ante).")
-    options_module = {"by_asset": {}, "summary": pd.DataFrame(), "portfolio_iv": np.nan}
+    options_module = {
+        "by_asset": {},
+        "summary": pd.DataFrame(),
+        "portfolio_iv": np.nan,
+        "excluded": [{"ticker": tk, "reason": "no option data returned"} for tk in tickers],
+    }
 else:
     options_module = run_options_module(
         tickers=tickers,
@@ -1029,10 +1052,12 @@ leverage_results = run_leverage_module(
     risk_score_weights=risk_score_weights
 )
 
+_senal_riesgo_data = _senal_riesgo(leverage_results, options_module)
 export_signals(
     "portfolio_risk_score_leverage",
-    _senal_riesgo(leverage_results, options_module),
+    _senal_riesgo_data,
     _PORTFOLIO_META,
+    warnings=exclusion_warnings(_senal_riesgo_data.get("excluded")),
 )
 
 plots = run_reporting_module(

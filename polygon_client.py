@@ -7,20 +7,22 @@
 # ==============================================================================
 
 import os
+import random
 import threading
 import time
 import warnings
 from collections import deque
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 import requests
 
 POLYGON_BASE_URL = "https://api.polygon.io"
 
-# El plan basico limita ~5 llamadas por minuto por API key, en TODOS los
-# endpoints. Al subir de plan basta con fijar POLYGON_CALLS_PER_MINUTE en el
-# .env (p. ej. 100); todos los scripts lo toman de ahi. Se lee al crear el
-# cliente, no al importar, para que load_dotenv() de cada script ya haya corrido.
-DEFAULT_CALLS_PER_MINUTE = 5
+# Cupo por defecto del pipeline. El plan gratuito de Polygon ronda las 5
+# llamadas por minuto; POLYGON_CALLS_PER_MINUTE lo baja si hace falta. Se lee
+# al crear el cliente, no al importar, para que load_dotenv() ya haya corrido.
+DEFAULT_CALLS_PER_MINUTE = 100
 
 
 def calls_per_minute_configurado():
@@ -76,6 +78,54 @@ def _limiter_for(api_key, calls_per_minute):
         return _LIMITERS[api_key]
 
 
+def retry_after_seconds(response, now=None):
+    """Parse a Retry-After header as seconds, or None when it is absent/invalid."""
+    if response is None:
+        return None
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+    raw = headers.get("Retry-After")
+    if raw is None or str(raw).strip() == "":
+        return None
+    text = str(raw).strip()
+    try:
+        return max(float(text), 0.0)
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    if now is None:
+        now = datetime.now(timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return max((when - now).total_seconds(), 0.0)
+
+
+def retry_backoff_seconds(attempt, base, response=None, jitter=None, now=None):
+    """Wait before retry ``attempt`` (1 = first failure).
+
+    HTTP 429 and 5xx honor Retry-After when the header is present. Otherwise
+    the wait is exponential (``base * 2**(attempt-1)``) plus equal jitter in
+    ``[0, delay]``.
+    """
+    status = getattr(response, "status_code", None) if response is not None else None
+    if status == 429 or (status is not None and status >= 500):
+        honored = retry_after_seconds(response, now=now)
+        if honored is not None:
+            return honored
+    delay = float(base) * (2 ** (max(int(attempt), 1) - 1))
+    if jitter is None:
+        jitter = random.random()
+    return delay + float(jitter) * delay
+
+
 class PolygonClient:
     def __init__(self, api_key=None, calls_per_minute=None,
                  timeout=20, max_retries=4, retry_wait=15.0,
@@ -109,6 +159,7 @@ class PolygonClient:
         ultimo_error = None
         for intento in range(1, self.max_retries + 2):
             self.limiter.wait()
+            resp = None
             try:
                 resp = self.session.get(url, params=params, timeout=self.timeout)
             except requests.RequestException as exc:
@@ -128,10 +179,10 @@ class PolygonClient:
 
             if intento > self.max_retries:
                 break
-            espera = self.retry_wait * intento
+            espera = retry_backoff_seconds(intento, self.retry_wait, resp)
             if self.verbose:
                 print(f"    [polygon] {ultimo_error} en {url_log}; reintento "
-                      f"{intento}/{self.max_retries} en {espera:.0f}s...")
+                      f"{intento}/{self.max_retries} en {espera:.1f}s...")
             time.sleep(espera)
 
         raise PolygonError(f"{ultimo_error} en {url_log} tras {self.max_retries} reintentos")

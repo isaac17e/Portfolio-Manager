@@ -61,7 +61,7 @@ For building new positions gradually. Each day it computes, per ticker, a **0–
 
 The score sets what fraction of the target weight to buy that day: high conviction (≥ 75) buys all of it, medium (40–75) scales between 40% and 80%, and low buys at most 30%.
 
-The script runs as an interactive **5-business-day cycle**. It asks for the cycle day and current weights, and keeps state between runs in `entry_state.json` and `entry_signal_history.csv`. On day 5 it decides the unfilled fraction: it buys the remaining 100% if the accumulated options flow is favorable (smart money and distance to zero gamma), or leaves it in cash.
+The script runs a **5-business-day cycle** with no interactive prompts. The cycle day comes from `--cycle-day` or `ENTRY_CYCLE_DAY`, otherwise from the last executed day in `entry_state.json` (next day, or day 1 when the cycle is closed or the file is new). Percent already invested comes from `--invested-pct` or `ENTRY_INVESTED_PCT`, otherwise from that same file. Generating a signal does **not** mark the book as invested. `entry_state.json` advances only when a fills file confirms that signal (see [Pipeline signals](#pipeline-signals)). Indicator history still appends to `entry_signal_history.csv`. On day 5 the signal decides the unfilled fraction: buy the rest if the accumulated options flow is favorable (smart money and distance to zero gamma), or leave it in cash — that cash decision is stored as pending and applied only with the matching fills.
 
 **Output**: a console summary and a Plotly chart.
 
@@ -100,7 +100,15 @@ A live visualization of where the portfolio sits in terms of dealer positioning 
 - **Y axis**: macro/liquidity/volatility stress, built from the 1-year percentile ranks of VIX (50%), the 10-year yield (25%) and the dollar index (25%).
 - **Z**: a potential surface in which macro stress amplifies negative-gamma (risk) zones more than it deepens positive-gamma (stable) zones. The script marks the portfolio's current state, the gradient and reference lines for each holding.
 
-It runs in a loop, refreshing every 60 seconds. It serves the page from a local HTTP server (`portfolio_gex_field.html` + JSON data), updating the chart without a full reload and keeping the camera position.
+**Pipeline mode is headless:** one calculation, then exit. It writes `portfolio_gex_field.html` and `portfolio_gex_field_data.json` and does not open a browser or start the local server.
+
+```bash
+python portfolio_gex_field.py --once
+HEADLESS=1 python portfolio_gex_field.py
+GEX_ONCE=1 python portfolio_gex_field.py
+```
+
+Without `--once` / `HEADLESS=1` / `GEX_ONCE=1` it still loops, refreshing every 60 seconds, and serves the page from a local HTTP server so the chart updates without a full reload.
 
 ## `fundamental_analysis.py` — Fundamental scorecard
 
@@ -141,14 +149,14 @@ Edit the portfolio dictionary and parameters in the configuration block at the t
 
 ```bash
 python active_management.py
-python entry_signal_tool.py
+python entry_signal_tool.py --cycle-day 2 --invested-pct 'GLD=40,KO=10'
 python portfolio_risk_score_leverage.py
 python portfolio_vix.py
-python portfolio_gex_field.py         # stop with Ctrl+C
+python portfolio_gex_field.py --once   # pipeline mode
 python fundamental_analysis.py
 ```
 
-Several scripts space out their Polygon calls (about 13 seconds apart) to respect the 5 requests/minute limit of the free Stocks tier, so a large portfolio can take a few minutes.
+`POLYGON_CALLS_PER_MINUTE` defaults to **100** (sliding window). Set it to `5` on the free Stocks tier. HTTP 429 and 5xx are retried with exponential backoff and jitter; a `Retry-After` header is honored.
 
 ## Pipeline signals
 
@@ -158,6 +166,31 @@ Each script also writes a JSON signal (contract section 4) through `pipeline_io.
 |---|---|
 | `PORTFOLIO_FILE` | `/workspace/pipeline/portfolio/portfolio_latest.json` |
 | `SIGNALS_OUT_DIR` | `/workspace/pipeline/signals` |
+| `EXECUTIONS_DIR` | `/workspace/pipeline/executions` |
+| `POLYGON_CALLS_PER_MINUTE` | `100` |
+| `ENTRY_CYCLE_DAY` | next day from `entry_state.json` |
+| `ENTRY_INVESTED_PCT` | percents already stored in `entry_state.json` |
+| `HEADLESS` or `GEX_ONCE` | unset (set to `1` for the GEX pipeline run) |
+
+CLI equivalents: `entry_signal_tool.py --cycle-day` and `--invested-pct` (env is used when the flag is omitted). `portfolio_gex_field.py --once` is the same switch as `HEADLESS=1` or `GEX_ONCE=1`.
+
+### Ticker symbols
+
+`tickers.py` maps the canonical portfolio symbol:
+
+| Canonical | Yahoo | Polygon | Capital.com epic (unverified) | US options |
+|---|---|---|---|---|
+| `BRK-B` or `BRK.B` | `BRK-B` | `BRK.B` | `BRK.B` | yes |
+| `RY.TO` | `RY.TO` | `RY.TO` | `RY` | no (suffix `.TO`) |
+
+Polygon and Yahoo calls use those forms. Capital.com epics are a best-effort guess (class shares keep the Polygon dot; the exchange suffix is stripped) and **must be verified** against the broker catalogue before any order.
+
+Options scripts (`active_management`, `entry_signal_tool`, `portfolio_risk_score_leverage`, `portfolio_vix`, `portfolio_gex_field`) skip a ticker that has no US-listed options, or that returns no option chain, instead of aborting the run. Those scripts add:
+
+- top-level `warnings`: an array of `"TICKER: reason"` strings (possibly empty);
+- `data.excluded`: `[{ "ticker", "reason" }]`, with the portfolio ticker unchanged.
+
+Typical reasons: `no US-listed options (exchange suffix .TO)`, `no option data returned`, and for the gamma field `no usable gamma field`. Other scripts omit `warnings` when they have nothing to flag. Existing envelope fields are unchanged.
 
 `load_portfolio` drops weights below `1e-6`, renormalizes the rest so the 6-decimal-place weights sum to 1, and returns those weights plus `portfolio_source`, `portfolio_run_ts` and `portfolio_optimizer`. `export_signals` writes `<script>.json` and `<script>_YYYYMMDDTHHMMSS.json` (America/Bogota). The write is atomic (`*.tmp` then `os.replace`). If the directory cannot be created or written, the script warns and continues. `NaN` / `±Inf` become JSON `null`; numpy and pandas values are converted.
 
@@ -180,14 +213,42 @@ Envelope:
 
 `data` by script:
 
-- **`entry_signal_tool`** — buys only, highest conviction first. `entries[]`: `order`, `ticker`, `action` (`"BUY"`), `target_weight`, `tranche_weight` (today's slice of the portfolio), `signal` (`high_conviction` ≥ 75, `medium_conviction` 40–75, `low_conviction`, or `cycle_close` on a day-5 buy), `score`, `reason`. Tickers with no buy today are `waiting[]` (`ticker`, `score`, `reason`). Also `cycle_day` and `cycle`.
-- **`active_management`** — `rebalances[]`: `ticker`, `action` (`BUY` / `SELL` / `HOLD` from the sign of `target_weight - current_weight`; `CASH` is included, and `BUY` there means a larger cash reserve), `current_weight`, `target_weight`, `delta_weight`, `reason`, `tactical_action` (`AUMENTAR`, `RECORTAR`, `LIQUIDAR`, `MANTENER`, `RESERVA_TACTICA`). `regime` is `normal`, `insufficient_history`, `stress`, `diversification_collapse`, or `stress+diversification_collapse`. Also `regime_state`, `regime_alerts`, `vol_portfolio`, `diversification_ratio`.
-- **`portfolio_risk_score_leverage`** — `target_leverage` and `risk_score` are the weight-weighted means of the per-asset leverage (2x–5x) and risk score (0–100). `components`: `score_weights` (`hv`, `cvar`, `iv`, `gex_pcr`), `leverage_min`, `leverage_max`, `portfolio_iv`, and `by_ticker[]` (`ticker`, `weight`, `risk_score`, `leverage`, `effective_exposure`, `hv`, `cvar`, `iv`, `gex_total`, `pcr_oi`).
-- **`portfolio_gex_field`** — one file per live refresh. Scalars: `macro_y`, `potential_z`, `grad_x`, `grad_y`, `grad_magnitude`, `n_holdings`. `holdings[]`: `ticker`, `weight`, `price`, `expected_move`, `total_gex`, `regime`, `gamma_flip`, `call_wall`, `put_wall`.
-- **`portfolio_vix`** — `vix_portfolio`, `sigma_portfolio_30d`, `source`, `vol_method`, `corr_method`, `metrics` (the engine scalars: `VIX_portfolio`, `sigma_portfolio_30d`, `VIX_medio_ponderado`, `ratio_diversificacion`, `beneficio_diversificacion_pts`, `correlacion_implicita_media`) and `holdings[]` (`ticker`, `weight`, `vix`, `sigma_30d`, `mcr`, `ctr`, `ctr_vix_pts`, `ctr_pct`). `--tickers` / `--weights` and `EQUAL_WEIGHTS` replace `weights_used`.
+- **`entry_signal_tool`** — buys only, highest conviction first. `entries[]`: `order`, `ticker`, `action` (`"BUY"`), `target_weight`, `tranche_weight` (today's slice of the portfolio), `signal` (`high_conviction` ≥ 75, `medium_conviction` 40–75, `low_conviction`, or `cycle_close` on a day-5 buy), `score`, `reason`. Tickers with no buy today are `waiting[]` (`ticker`, `score`, `reason`). Also `cycle_day`, `cycle`, and `excluded`.
+- **`active_management`** — `rebalances[]`: `ticker`, `action` (`BUY` / `SELL` / `HOLD` from the sign of `target_weight - current_weight`; `CASH` is included, and `BUY` there means a larger cash reserve), `current_weight`, `target_weight`, `delta_weight`, `reason`, `tactical_action` (`AUMENTAR`, `RECORTAR`, `LIQUIDAR`, `MANTENER`, `RESERVA_TACTICA`). `regime` is `normal`, `insufficient_history`, `stress`, `diversification_collapse`, or `stress+diversification_collapse`. Also `regime_state`, `regime_alerts`, `vol_portfolio`, `diversification_ratio`, and `excluded`. `portfolio_risk_history.csv` stays an observation log of volatility and diversification. It is not an execution ledger and is not gated on fills.
+- **`portfolio_risk_score_leverage`** — `target_leverage` and `risk_score` are the weight-weighted means of the per-asset leverage (2x–5x) and risk score (0–100). `components`: `score_weights` (`hv`, `cvar`, `iv`, `gex_pcr`), `leverage_min`, `leverage_max`, `portfolio_iv`, and `by_ticker[]` (`ticker`, `weight`, `risk_score`, `leverage`, `effective_exposure`, `hv`, `cvar`, `iv`, `gex_total`, `pcr_oi`). Also `excluded`.
+- **`portfolio_gex_field`** — one file per refresh, including the single `--once` run. Scalars: `macro_y`, `potential_z`, `grad_x`, `grad_y`, `grad_magnitude`, `n_holdings`. `holdings[]`: `ticker`, `weight`, `price`, `expected_move`, `total_gex`, `regime`, `gamma_flip`, `call_wall`, `put_wall`. Also `excluded`.
+- **`portfolio_vix`** — `vix_portfolio`, `sigma_portfolio_30d`, `source`, `vol_method`, `corr_method`, `metrics` (the engine scalars: `VIX_portfolio`, `sigma_portfolio_30d`, `VIX_medio_ponderado`, `ratio_diversificacion`, `beneficio_diversificacion_pts`, `correlacion_implicita_media`) and `holdings[]` (`ticker`, `weight`, `vix`, `sigma_30d`, `mcr`, `ctr`, `ctr_vix_pts`, `ctr_pct`). Also `excluded`. `--tickers` / `--weights` and `EQUAL_WEIGHTS` replace `weights_used`. When nothing can be valued, `vix_portfolio` is null and `holdings` is empty; the process still writes the signal.
+
 - **`fundamental_analysis`** — `n_tickers`, `n_indicators` (12), `score_green_min` (9), `score_medium_min` (6). `holdings[]`: `ticker`, `score_quality`, `n_green`, `n_indicators`, `rating` (`Luz Verde Global`, `Calidad Media`, `Señal de Alerta Global`), `incomplete`, `metrics` (the scorecard numbers) and `signals` (the traffic-light column for each indicator).
 
-Existing HTML reports, CSV histories, `entry_state.json` and console output are unchanged.
+### Entry state and fills
+
+`entry_state.json` keeps the last **executed** book (`pct_ya_invertido`, cycle day, cycle). A signal run only records a pending block: `pending_signal_run_ts`, `pending_cycle_day`, `pending_cycle`, `pending_targets` (portfolio `target_weight` per buy), `pending_cash` (fraction of the target left in cash on a day-5 cash decision), `pending_decisions`.
+
+The executor writes fills under `EXECUTIONS_DIR`. The reader uses `entry_signal_tool_fills.json` when that file exists, otherwise the newest `fills_*.json`. Only a document whose `signal_run_ts` equals `pending_signal_run_ts` advances the state. `filled_weight` is a portfolio weight, same units as `tranche_weight`; the invested fraction increases by `filled_weight / target_weight` (capped at 1) for `action: "BUY"` and `status` of `filled`, `partial`, or `partially_filled`. The fills `ticker` is the canonical portfolio ticker.
+
+```json
+{
+  "schema_version": 1,
+  "signal_run_ts": "2026-10-05T16:40:12-05:00",
+  "executed_ts": "2026-10-05T16:55:00-05:00",
+  "fills": [
+    {
+      "ticker": "GLD",
+      "action": "BUY",
+      "filled_weight": 0.06,
+      "filled_qty": 10,
+      "price": 180.0,
+      "deal_id": "abc",
+      "status": "filled"
+    }
+  ]
+}
+```
+
+`ENTRY_INVESTED_PCT` / `--invested-pct` overrides the in-memory baseline for that run only (it is not written as an execution). A bare number is a percent 0–100 for every ticker. `GLD=40,KO=0.25` or a JSON object is per ticker: values above 1, or written with `%`, are percents; values in `[0, 1]` are fractions of that ticker's target.
+
+HTML reports and the risk-history CSV are unchanged aside from the headless GEX path, which writes the same HTML shell and JSON once and does not open a browser. `entry_state.json` gains the pending-signal fields above; older files still load.
 
 ```bash
 python -m unittest discover -s tests -t .

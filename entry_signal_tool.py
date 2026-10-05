@@ -5,12 +5,24 @@
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
+import argparse
+import copy
 import os
 import json
 import plotly.graph_objects as go
 
 from polygon_client import PolygonClient
-from pipeline_io import export_signals, load_portfolio
+from pipeline_io import (
+    apply_entry_fills,
+    export_signals,
+    load_fills,
+    load_portfolio,
+    parse_invested_overrides,
+    resolve_cycle_day,
+    signal_cycle_number,
+    stage_pending_entry,
+)
+from tickers import exclusion_warnings, no_us_options_reason, to_polygon
 
 # ---------------- CONFIGURACION ----------------
 from dotenv import load_dotenv
@@ -73,6 +85,12 @@ def _estado_vacio():
         "dia_ciclo": 1,
         "ciclo_cerrado": False,
         "ultima_actualizacion": None,
+        "pending_signal_run_ts": None,
+        "pending_cycle_day": None,
+        "pending_cycle": None,
+        "pending_targets": {},
+        "pending_cash": {},
+        "pending_decisions": {},
         "activos": {ticker: _activo_vacio() for ticker in TICKERS},
     }
 
@@ -102,89 +120,18 @@ def guardar_estado(estado):
     with open(STATE_PATH, "w") as f:
         json.dump(estado, f, indent=2)
 
-# ---------------- FLUJO INTERACTIVO DE INICIO ----------------
+class NoOptionData(RuntimeError):
+    """El ticker no tiene cadena de opciones utilizable en esta corrida."""
 
-def pedir_pct(mensaje, default=0.0):
-    while True:
-        crudo = input(mensaje).strip().replace("%", "")
-        if crudo == "":
-            return default
-        try:
-            valor = float(crudo)
-        except ValueError:
-            print("  Ingresa un numero valido (ej: 40 para 40%).")
-            continue
-        if valor < 0 or valor > 100:
-            print("  El porcentaje debe estar entre 0 y 100.")
-            continue
-        return valor / 100
 
-def pedir_dia_ciclo(sugerido):
-    while True:
-        crudo = input(
-            f"\n¿En que dia del ciclo de {DIAS_CICLO} dias habiles se encuentra la estrategia? "
-            f"[1-{DIAS_CICLO}] (Enter = {sugerido}): "
-        ).strip()
-        if crudo == "":
-            return sugerido
-        try:
-            dia = int(crudo)
-        except ValueError:
-            print(f"  Ingresa un entero entre 1 y {DIAS_CICLO}.")
-            continue
-        if not 1 <= dia <= DIAS_CICLO:
-            print(f"  El dia debe estar entre 1 y {DIAS_CICLO}.")
-            continue
-        return dia
-
-def pedir_pesos_actuales(estado):
-    print(
-        "\n% YA INVERTIDO en cada activo respecto a SU peso objetivo (0-100)."
-        "\nEnter = mantener el valor guardado que se muestra entre parentesis.\n"
-    )
-    for ticker in TICKERS:
-        activo = estado["activos"][ticker]
-        peso = PESOS_OBJETIVO.get(ticker, np.nan)
-        actual = activo["pct_ya_invertido"]
-        activo["pct_ya_invertido"] = pedir_pct(
-            f"  {ticker} (peso objetivo {peso*100:.2f}% del portafolio | guardado {actual*100:.0f}%): ",
-            default=actual,
-        )
-    return estado
-
-def flujo_inicio(estado):
-    hoy = datetime.now(timezone.utc).date().isoformat()
-
-    if estado["ultima_actualizacion"] is None or estado["ciclo_cerrado"]:
-        sugerido = 1
-    else:
-        sugerido = min(estado["dia_ciclo"] + 1, DIAS_CICLO)
-
-    dia = pedir_dia_ciclo(sugerido)
-
-    # Retroceder en el numero de dia significa que arranco un ciclo nuevo:
-    # se limpian las decisiones de cierre y el cash consolidado del anterior.
-    if estado["ultima_actualizacion"] is not None and dia < estado["dia_ciclo"]:
-        estado["ciclo"] += 1
-        estado["ciclo_cerrado"] = False
-        for activo in estado["activos"].values():
-            activo["pct_cash_consolidado"] = 0.0
-            activo["decision_final"] = None
-        print(f"\nArranca el ciclo {estado['ciclo']}: se limpian las decisiones del ciclo anterior.")
-
-    estado["dia_ciclo"] = dia
-    estado["ultima_actualizacion"] = hoy
-
-    pedir_pesos_actuales(estado)
-
-    if dia >= DIAS_CICLO:
-        print(
-            f"\nDIA {DIAS_CICLO} (ultimo del ciclo): hoy se decide en firme la fraccion no invertida."
-            "\nSegun el flujo de opciones acumulado se compra el 100% restante o se consolida en cash.\n"
-        )
-    else:
-        print(f"\nDia {dia} de {DIAS_CICLO}: entrada por goteo segun el score de conviccion de hoy.\n")
-    return estado
+def parse_entry_args(argv=None):
+    parser = argparse.ArgumentParser(description="Score de conviccion para entrada en portafolio")
+    parser.add_argument("--cycle-day", type=int, default=None,
+                        help=f"dia del ciclo 1..{DIAS_CICLO} (si no, ENTRY_CYCLE_DAY o entry_state.json)")
+    parser.add_argument("--invested-pct", default=None,
+                        help="%% ya invertido: '40', 'GLD=40,KO=0.25' o JSON. "
+                             "Por defecto, entry_state.json. No marca la posicion como ejecutada.")
+    return parser.parse_known_args(argv)[0]
 
 # ---------------- DECISION DE CIERRE (DIA 5) ----------------
 
@@ -236,7 +183,7 @@ def polygon():
 def get_daily_history(ticker, dias=40):
     fecha_fin = datetime.now(timezone.utc).date()
     fecha_inicio = fecha_fin - timedelta(days=dias * 2)  # buffer por fines de semana
-    url = f"{BASE_URL}/v2/aggs/ticker/{ticker}/range/1/day/{fecha_inicio}/{fecha_fin}"
+    url = f"{BASE_URL}/v2/aggs/ticker/{to_polygon(ticker)}/range/1/day/{fecha_inicio}/{fecha_fin}"
     params = {"adjusted": "true", "sort": "asc", "limit": 5000}
     r = polygon().get(url, params)
     if r.get("status") not in ("OK", "DELAYED") or "results" not in r:
@@ -265,7 +212,7 @@ def seleccionar_vencimiento_objetivo(ticker, horizon_days):
     hoy = datetime.now(timezone.utc).date()
     fecha_objetivo = hoy + timedelta(days=horizon_days)
     url = f"{BASE_URL}/v3/reference/options/contracts"
-    base = {"underlying_ticker": ticker, "contract_type": "call",
+    base = {"underlying_ticker": to_polygon(ticker), "contract_type": "call",
             "sort": "expiration_date", "limit": 1}
     consultas = [
         {**base, "order": "asc",
@@ -288,7 +235,7 @@ def seleccionar_vencimiento_objetivo(ticker, horizon_days):
     return min(sorted(vencimientos), key=lambda d: abs((d - fecha_objetivo).days))
 
 def get_options_chain(ticker, spot, vencimiento):
-    url = f"{BASE_URL}/v3/snapshot/options/{ticker}"
+    url = f"{BASE_URL}/v3/snapshot/options/{to_polygon(ticker)}"
     params = {
         "strike_price.gte": round(spot * 0.85, 2),
         "strike_price.lte": round(spot * 1.15, 2),
@@ -449,12 +396,16 @@ def percentile_historico(hist_df, ticker, columna, valor_actual):
     return (serie < valor_actual).mean() * 100
 
 def calcular_indicadores_ticker(ticker, hist_df):
+    reason = no_us_options_reason(ticker)
+    if reason:
+        raise NoOptionData(reason)
     spot, vol_relativo = get_spot_y_volumen_relativo(ticker)
     vencimiento = seleccionar_vencimiento_objetivo(ticker, HORIZON_DIAS_OBJETIVO)
     if vencimiento is None:
-        chain = pd.DataFrame()
-    else:
-        chain = parse_chain(get_options_chain(ticker, spot, vencimiento))
+        raise NoOptionData("no option data returned")
+    chain = parse_chain(get_options_chain(ticker, spot, vencimiento))
+    if chain.empty:
+        raise NoOptionData("no option data returned")
 
     gex_total, dist_zero_gamma = calcular_gex_y_zero_gamma(chain, spot)
     call_wall, put_wall = calcular_walls(chain)
@@ -608,26 +559,94 @@ def graficar_resumen(resumen):
 
 # ---------------- EJECUCION PRINCIPAL ----------------
 
-def correr_entry_signal():
-    hist_df = cargar_historial()
+def _contexto(estado, warnings, excluded, dia_ciclo, ciclo, pending_cash=None, pending_decisions=None):
+    return {
+        "estado": estado,
+        "warnings": warnings,
+        "excluded": excluded,
+        "cycle_day": dia_ciclo,
+        "cycle": ciclo,
+        "pending_cash": pending_cash or {},
+        "pending_decisions": pending_decisions or {},
+    }
 
-    estado = flujo_inicio(cargar_estado())
-    dia_ciclo = estado["dia_ciclo"]
-    ciclo = estado["ciclo"]
+
+def correr_entry_signal(cycle_day=None, invested_pct=None):
+    """Calcula la senal del dia. No marca entry_state.json como invertido.
+
+    Los porcentajes ya invertidos solo cambian si hay un fills file cuyo
+    signal_run_ts coincide con la senal pendiente. El dia y el % invertido de
+    esta corrida salen de los argumentos (CLI / env) o, si faltan, del estado.
+    """
+    hist_df = cargar_historial()
+    warnings = []
+    excluded = []
+
+    estado = cargar_estado()
+    fills_payload = load_fills("entry_signal_tool")
+    estado, fills_applied = apply_entry_fills(estado, fills_payload, cycle_length=DIAS_CICLO)
+    if fills_applied:
+        guardar_estado(estado)
+        print("Fills confirmados: entry_state.json avanza con la ejecucion.")
+    elif fills_payload and estado.get("pending_signal_run_ts"):
+        warnings.append(
+            "fills ignored: signal_run_ts "
+            f"{fills_payload.get('signal_run_ts')!r} does not match pending "
+            f"{estado.get('pending_signal_run_ts')!r}"
+        )
+
+    dia_ciclo, day_warn = resolve_cycle_day(cycle_day, estado, DIAS_CICLO)
+    if day_warn:
+        warnings.append(day_warn)
+        print(f"  {day_warn}")
+    ciclo = signal_cycle_number(estado, dia_ciclo, DIAS_CICLO)
+    if estado.get("ciclo_cerrado"):
+        print(f"\nEl ciclo {estado.get('ciclo')} esta cerrado. Esta senal abre el ciclo {ciclo}.")
+    elif estado.get("ultima_actualizacion") and dia_ciclo < int(estado.get("dia_ciclo") or 1):
+        print(f"\nDia {dia_ciclo} anterior al guardado: la senal usa el ciclo {ciclo}.")
+
+    overrides, override_warns = parse_invested_overrides(invested_pct, TICKERS)
+    warnings.extend(override_warns)
+    for message in override_warns:
+        print(f"  {message}")
+
+    # Copia solo para el calculo. El archivo no recibe estos porcentajes.
+    scoring = copy.deepcopy(estado)
+    if overrides:
+        for ticker, frac in overrides.items():
+            scoring["activos"].setdefault(ticker, _activo_vacio())
+            scoring["activos"][ticker]["pct_ya_invertido"] = frac
+
     es_ultimo_dia = dia_ciclo >= DIAS_CICLO
+    if es_ultimo_dia:
+        print(
+            f"\nDIA {DIAS_CICLO} (ultimo del ciclo): la senal decide la fraccion no invertida."
+            "\nEl estado no cambia hasta que el ejecutor confirme los fills.\n"
+        )
+    else:
+        print(f"\nDia {dia_ciclo} de {DIAS_CICLO}: entrada por goteo segun el score de hoy.\n")
 
     filas_nuevas = []
     for ticker in TICKERS:
+        reason = no_us_options_reason(ticker)
+        if reason:
+            excluded.append({"ticker": ticker, "reason": reason})
+            print(f"{ticker}: {reason}; se omite.")
+            continue
         try:
             fila = calcular_indicadores_ticker(ticker, hist_df)
             filas_nuevas.append(fila)
-        except Exception as e:
-            print(f"Error con {ticker}: {e}")
+        except NoOptionData as exc:
+            excluded.append({"ticker": ticker, "reason": "no option data returned"})
+            print(f"{ticker}: {exc}; se omite.")
+        except Exception as exc:
+            excluded.append({"ticker": ticker, "reason": "no option data returned"})
+            print(f"Error con {ticker}: {exc}; se omite.")
 
+    warnings.extend(exclusion_warnings(excluded))
     df_nuevo = pd.DataFrame(filas_nuevas)
     if df_nuevo.empty:
-        guardar_estado(estado)
-        return pd.DataFrame(), hist_df
+        return pd.DataFrame(), hist_df, _contexto(estado, warnings, excluded, dia_ciclo, ciclo)
 
     hist_actualizado = pd.concat([hist_df, df_nuevo], ignore_index=True)
     # Si el mismo ticker ya tiene una fila con la fecha de hoy, se queda solo la mas reciente
@@ -640,7 +659,7 @@ def correr_entry_signal():
     filas_estado = []
     for _, fila in df_nuevo.iterrows():
         ticker = fila["ticker"]
-        activo = estado["activos"].setdefault(ticker, _activo_vacio())
+        activo = scoring["activos"].setdefault(ticker, _activo_vacio())
         pct_previo = activo["pct_ya_invertido"]
         pct_objetivo_hoy = fila["pct_entrada_sugerido"]
         peso_objetivo = PESOS_OBJETIVO.get(ticker, np.nan)
@@ -650,7 +669,6 @@ def correr_entry_signal():
             delta = 0.0
             accion = "COMPLETO"
             recomendacion = "COMPLETO (100% del peso objetivo)"
-            activo["decision_final"] = "ENTRAR" if es_ultimo_dia else activo["decision_final"]
         elif es_ultimo_dia:
             # Dia 5: no hay goteo adicional, se cierra el ciclo en firme.
             decision, motivo = evaluar_flujo_opciones(ticker, hist_actualizado)
@@ -663,7 +681,6 @@ def correr_entry_signal():
                 pct_cash = 1.0 - pct_previo
                 accion = "CIERRE: CASH"
                 recomendacion = f"CIERRE DIA {DIAS_CICLO} -> DEJAR {pct_cash*100:.1f}% EN CASH ({motivo})"
-            activo["decision_final"] = decision
         else:
             delta = max(0.0, pct_objetivo_hoy - pct_previo)
             if delta > 0:
@@ -674,8 +691,6 @@ def correr_entry_signal():
                 recomendacion = "MANTENER (ya en el nivel objetivo de hoy)"
 
         pct_final = min(1.0, pct_previo + delta)
-        activo["pct_ya_invertido"] = pct_final
-        activo["pct_cash_consolidado"] = pct_cash
 
         filas_estado.append({
             "ciclo": ciclo,
@@ -694,15 +709,23 @@ def correr_entry_signal():
             "recomendacion": recomendacion,
         })
 
-    estado["ciclo_cerrado"] = es_ultimo_dia
-    guardar_estado(estado)
+    pending_cash = {}
+    pending_decisions = {}
+    for fila in filas_estado:
+        if fila["accion"] == "CIERRE: CASH":
+            pending_cash[fila["ticker"]] = fila["cash_definitivo_pct"] / 100.0
+            pending_decisions[fila["ticker"]] = "CASH"
+        elif fila["accion"] == "CIERRE: ENTRAR":
+            pending_decisions[fila["ticker"]] = "ENTRAR"
 
     df_estado = pd.DataFrame(filas_estado)
     resumen = df_nuevo[["ticker", "spot", "score_conviccion", "pct_entrada_sugerido"]].merge(
         df_estado, on="ticker"
     ).sort_values("score_conviccion", ascending=False)
 
-    return resumen, hist_actualizado
+    return resumen, hist_actualizado, _contexto(
+        estado, warnings, excluded, dia_ciclo, ciclo, pending_cash, pending_decisions
+    )
 
 def imprimir_resumen(resumen):
     if resumen.empty:
@@ -782,10 +805,40 @@ def construir_senal_entrada(resumen):
     }
 
 
-resumen, historial = correr_entry_signal()
-imprimir_resumen(resumen)
-export_signals("entry_signal_tool", construir_senal_entrada(resumen), _PORTFOLIO_META)
+def main(argv=None):
+    args = parse_entry_args(argv)
+    cycle_day = args.cycle_day if args.cycle_day is not None else os.environ.get("ENTRY_CYCLE_DAY")
+    invested = args.invested_pct if args.invested_pct is not None else os.environ.get("ENTRY_INVESTED_PCT")
+    resumen, _historial, ctx = correr_entry_signal(cycle_day, invested)
+    imprimir_resumen(resumen)
+    data = construir_senal_entrada(resumen)
+    if data.get("cycle_day") is None:
+        data["cycle_day"] = ctx["cycle_day"]
+        data["cycle"] = ctx["cycle"]
+    data["excluded"] = ctx["excluded"]
+    path = export_signals(
+        "entry_signal_tool", data, _PORTFOLIO_META, warnings=ctx["warnings"],
+    )
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                run_ts = json.load(handle).get("run_ts")
+        except (OSError, json.JSONDecodeError):
+            run_ts = None
+        if run_ts:
+            targets = {
+                entry["ticker"]: entry["target_weight"]
+                for entry in data["entries"]
+                if entry.get("target_weight")
+            }
+            guardar_estado(stage_pending_entry(
+                ctx["estado"], run_ts, data.get("cycle_day"), data.get("cycle"),
+                targets, ctx["pending_cash"], ctx["pending_decisions"],
+            ))
+    fig_resumen = graficar_resumen(resumen)
+    if fig_resumen is not None:
+        fig_resumen.show()
 
-fig_resumen = graficar_resumen(resumen)
-if fig_resumen is not None:
-    fig_resumen.show()
+
+if __name__ == "__main__":
+    main()
