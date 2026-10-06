@@ -14,6 +14,7 @@ import polygon_client
 from polygon_client import PolygonClient, PolygonError, retry_backoff_seconds
 from portfolio_gex_field import gex_headless_requested
 from tickers import (
+    _CAPITAL_VERIFIED,
     has_us_options,
     mapping,
     no_us_options_reason,
@@ -76,19 +77,23 @@ class TickerMappingTests(unittest.TestCase):
             forms = mapping(canonical)
             self.assertEqual(forms["yahoo"], "BRK-B")
             self.assertEqual(forms["polygon"], "BRK.B")
-            self.assertEqual(forms["capital_epic"], "BRK.B")
-            self.assertFalse(forms["capital_epic_verified"])
+            self.assertEqual(forms["capital_epic"], "BRKB")
+            self.assertTrue(forms["capital_epic_verified"])
             self.assertTrue(forms["has_us_options"])
             self.assertIsNone(forms["us_options_reason"])
         self.assertEqual(to_yahoo("BRK.B"), "BRK-B")
         self.assertEqual(to_polygon("BRK-B"), "BRK.B")
-        self.assertEqual(to_capital_epic("BRK-B"), "BRK.B")
+        for variant in ("BRK-B", "BRK.B", "brk-b"):
+            self.assertEqual(to_capital_epic(variant), "BRKB")
 
     def test_toronto_suffix_has_no_us_options(self):
         forms = mapping("RY.TO")
         self.assertEqual(forms["yahoo"], "RY.TO")
         self.assertEqual(forms["polygon"], "RY.TO")
         self.assertEqual(to_capital_epic("RY.TO"), "RY")
+        self.assertTrue(forms["capital_epic_verified"])
+        self.assertEqual(_CAPITAL_VERIFIED["RY.TO"]["currency"], "USD")
+        self.assertEqual(_CAPITAL_VERIFIED["RY.TO"]["listing"], "NYSE")
         self.assertFalse(has_us_options("RY.TO"))
         self.assertIn(".TO", no_us_options_reason("ry.to"))
         self.assertEqual(to_yahoo("BRK.B.TO"), "BRK-B.TO")

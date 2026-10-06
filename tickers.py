@@ -6,9 +6,10 @@ may use a hyphen (``BRK-B``) or a dot (``BRK.B``).
 - Yahoo Finance uses the hyphen and keeps exchange suffixes: ``BRK-B``, ``RY.TO``.
 - Polygon uses the dot: ``BRK.B``. Listings with an exchange suffix such as
   ``.TO`` have no US-listed options, so options scripts must skip them.
-- Capital.com epics are a best-effort guess (class shares keep the Polygon
-  dot; an exchange suffix is stripped). They are **not** verified against the
-  broker catalogue and must be checked before any order.
+- Capital.com epics listed in ``_CAPITAL_VERIFIED`` were checked against the
+  Capital.com API (``BRK-B`` -> ``BRKB``, ``RY.TO`` -> ``RY``). Any other epic
+  is a best-effort guess (class shares keep the Polygon dot; an exchange
+  suffix is stripped), is **not** verified and must be checked before any order.
 
 ``to_yahoo`` / ``to_polygon`` / ``to_capital_epic`` are idempotent for the
 forms above.
@@ -28,6 +29,15 @@ _EXCHANGE_SUFFIXES = (
     ".HE", ".IR", ".PR", ".IL", ".TA",
     ".V", ".L", ".F", ".T",
 )
+
+# Capital.com epics verified against the Capital.com API on 2026-10-06, keyed by
+# the Yahoo form of the ticker. ``RY`` is the NYSE listing quoted in USD:
+# Capital.com has no TSX/CAD line for Royal Bank of Canada.
+_CAPITAL_VERIFIED_ON = "2026-10-06"
+_CAPITAL_VERIFIED = {
+    "BRK-B": {"epic": "BRKB"},  # "BRK.B" does not exist; "BRKb" -> error.not-found.epic
+    "RY.TO": {"epic": "RY", "currency": "USD", "listing": "NYSE"},
+}
 
 _CLASS = re.compile(r"^([A-Z0-9]{1,6})[.-]([A-Z])$")
 
@@ -83,13 +93,22 @@ def to_polygon(ticker) -> str:
 
 
 def to_capital_epic(ticker) -> str:
-    """Best-effort Capital.com epic. Unverified — confirm with the broker.
+    """Capital.com epic: verified (see ``_CAPITAL_VERIFIED``) or a best guess.
 
-    Class shares keep the Polygon dot (``BRK.B``). An exchange suffix is
-    stripped (``RY.TO`` -> ``RY``), which is only a guess.
+    ``BRK-B`` -> ``BRKB``; ``RY.TO`` -> ``RY`` (NYSE listing in USD, not TSX).
+    Otherwise class shares keep the Polygon dot and an exchange suffix is
+    stripped, which is only a guess — confirm with the broker.
     """
+    verified = _CAPITAL_VERIFIED.get(to_yahoo(ticker))
+    if verified:
+        return verified["epic"]
     base, _suffix = _split_listing(ticker)
     return _format_class(base, ".")
+
+
+def capital_epic_verified(ticker) -> bool:
+    """True if the epic was checked against Capital.com (``_CAPITAL_VERIFIED``)."""
+    return to_yahoo(ticker) in _CAPITAL_VERIFIED
 
 
 def no_us_options_reason(ticker) -> str | None:
@@ -136,7 +155,7 @@ def mapping(ticker) -> dict:
         "yahoo": to_yahoo(ticker),
         "polygon": to_polygon(ticker),
         "capital_epic": to_capital_epic(ticker),
-        "capital_epic_verified": False,
+        "capital_epic_verified": capital_epic_verified(ticker),
         "has_us_options": has_us_options(ticker),
         "us_options_reason": no_us_options_reason(ticker),
     }
