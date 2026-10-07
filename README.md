@@ -19,7 +19,7 @@ Most scripts take a portfolio as a `ticker: weight` dictionary at the top of the
 
 ## `active_management.py` — Tactical active management engine
 
-1. **Options data** (Polygon v3): spot price, the expiration closest to the investment horizon (30 days by default) and the full chain snapshot.
+1. **Options data** (Polygon v3): spot price, the expiration closest to the investment horizon (30 trading days by default, about 42 calendar days) and the full chain snapshot.
 2. **Microstructure metrics** per ticker:
    - **GEX**: total gamma exposure, regime and gamma flip level;
    - **order flow**: unusual options activity (volume/OI above a threshold), call vs. put sweep dominance, put/call ratio;
@@ -34,12 +34,14 @@ Most scripts take a portfolio as a `ticker: weight` dictionary at the top of the
    | −50 to 0 | Trim 25–50% (`RECORTAR`) |
    | < −50 | Liquidate (`LIQUIDAR`) |
 
+   A ticker without usable gamma or open interest gets no GEX points (missing data is not a signal), and the rest of its score is dampened like a low-liquidity name.
+
 4. **Portfolio risk layer**:
    - volatility from ATM implied volatility (historical as fallback);
    - **implied correlation** solved from the dispersion equation against a benchmark ETF (SPY globally, DBC for the commodities block), keeping the shape of the historical correlation (sample, EWMA or random-matrix filtered);
    - **Euler risk attribution** (contribution to total risk per asset);
    - a **concentration guardrail** that shifts weight away from any asset whose risk contribution exceeds 1.5× the equal-share level.
-5. **Rebalancing**: freed capital goes to cash up to a 30% cap, and the rest is distributed among "Increase" names in proportion to their score.
+5. **Rebalancing**: freed capital goes to cash up to a 30% cap, and the rest is distributed among "Increase" names in proportion to their score. Portfolio weights do not have to add up to 1: whatever is missing is existing cash and becomes the starting weight of the `CASH` row, so current and suggested cash are compared on the same basis. Weights above 1 are normalized with a warning.
 6. **Risk regime history**: each run is appended to `portfolio_risk_history.csv`. After 20 runs, portfolio volatility and the diversification ratio are compared with their own percentiles to flag stress or diversification collapse.
 
 **Output**: an executive summary with the rationale per asset, gamma profile charts, current vs. suggested allocation and a risk attribution chart.
@@ -83,7 +85,7 @@ Extends the **CBOE VIX methodology** from one index to a portfolio of N stocks/E
 3. **CBOE model-free variance** per asset: implied forward from put-call parity, strike strip weighted by ΔK·Q(K)/K², interpolated to a constant 30-day horizon.
 4. **Portfolio aggregation**: correlation matrix (EWMA, sample or random-matrix filtered) combined with the 30-day implied volatilities to get the portfolio VIX, plus **Euler risk attribution** per asset.
 
-Data comes from Polygon, with Yahoo Finance or synthetic data as fallbacks. It has a CLI:
+Data comes from Polygon, with Yahoo Finance as the fallback. Synthetic data is used only when asked for (`--synthetic` or `--source synthetic`), never as a silent fallback. `--weights` must give one non-negative value per ticker, in the same order. It has a CLI:
 
 ```bash
 python portfolio_vix.py --tickers SPY QQQ GLD --weights 0.5 0.3 0.2 \
@@ -123,6 +125,20 @@ Uses Yahoo Finance financial statements to grade each ticker as green / neutral 
 The number of green signals gives a global rating: **Global Green Light** (≥ 9), **Medium Quality** (≥ 6) or **Global Alert**. All thresholds are editable in the `UMBRALES` dictionary.
 
 **Output**: `reporte_fundamental.html`, with summary cards, a signal matrix and charts of the last 4 fiscal years and 5 quarters.
+
+## Options horizon per script
+
+Each options script reads a different part of the curve on purpose, so their numbers are not interchangeable:
+
+| Script | Expirations used |
+|---|---|
+| `active_management` | the one closest to 30 trading days (about 42 calendar days) |
+| `entry_signal_tool` | the one closest to 30 calendar days |
+| `portfolio_risk_score_leverage` | the one closest to 1 month (21 trading days, about 29 calendar days) |
+| `portfolio_vix` | the two that bracket 30 days (CBOE rule), interpolated to 30 days |
+| `portfolio_gex_field` | every expiration within 2 months; GEX from those beyond 7 days |
+
+The gamma flip (zero-gamma level) is computed once, in `gex_utils.py`, and shared by all four GEX scripts: strikes without exposure are ignored so they cannot create a false flip at the edge of the strike window.
 
 ---
 
@@ -190,7 +206,7 @@ Options scripts (`active_management`, `entry_signal_tool`, `portfolio_risk_score
 - top-level `warnings`: an array of `"TICKER: reason"` strings (possibly empty);
 - `data.excluded`: `[{ "ticker", "reason" }]`, with the portfolio ticker unchanged.
 
-Typical reasons: `no US-listed options (exchange suffix .TO)`, `no option data returned`, and for the gamma field `no usable gamma field`. Other scripts omit `warnings` when they have nothing to flag. Existing envelope fields are unchanged.
+Typical reasons: `no US-listed options (exchange suffix .TO)`, `no option data returned` (sometimes with a detail in parentheses), and for the gamma field `no usable gamma field` or `no spot price returned`. A ticker that failed for another cause says so: `api error: ...` (Polygon still failing after the retries, e.g. HTTP 429 or 5xx) or `error: <Exception>: ...` (a code error), so it is not mistaken for a ticker without options. `portfolio_risk_score_leverage` also reports `no price history returned` (that ticker leaves the whole analysis) and `no polygon api key`. Other scripts omit `warnings` when they have nothing to flag. Existing envelope fields are unchanged.
 
 `load_portfolio` drops weights below `1e-6`, renormalizes the rest so the 6-decimal-place weights sum to 1, and returns those weights plus `portfolio_source`, `portfolio_run_ts` and `portfolio_optimizer`. `export_signals` writes `<script>.json` and `<script>_YYYYMMDDTHHMMSS.json` (America/Bogota). The write is atomic (`*.tmp` then `os.replace`). If the directory cannot be created or written, the script warns and continues. `NaN` / `±Inf` become JSON `null`; numpy and pandas values are converted.
 

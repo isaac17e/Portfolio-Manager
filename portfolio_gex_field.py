@@ -19,8 +19,11 @@ from scipy.interpolate import interp1d
 from scipy.ndimage import gaussian_filter1d
 from datetime import datetime, timedelta
 from pipeline_io import export_signals, load_portfolio
-from polygon_client import PolygonClient, PolygonError
-from tickers import exclusion_warnings, no_us_options_reason, to_polygon, to_yahoo
+from gex_utils import gamma_flip_level
+from polygon_client import NO_OPTION_DATA, PolygonClient, PolygonError, failure_reason
+from tickers import (
+    dividend_yield_from_info, exclusion_warnings, no_us_options_reason, to_polygon, to_yahoo,
+)
 import plotly.graph_objects as go
 import plotly.io as pio
 import yfinance as yf
@@ -120,6 +123,9 @@ if not POLYGON_API_KEY or POLYGON_API_KEY == "TU_API_KEY":
 
 
 _cliente_polygon = None
+# Motivo del ultimo fallo de API al pedir la cadena de un ticker (para el JSON
+# de senales: un 429 no es lo mismo que un activo sin opciones).
+_ULTIMO_FALLO_CADENA = {}
 
 
 def polygon():
@@ -149,18 +155,14 @@ def clamp_iv(iv):
 @functools.lru_cache(maxsize=None)
 def get_dividend_yield(ticker):
     try:
-        raw = yf.Ticker(to_yahoo(ticker)).info.get("dividendYield")
+        info = yf.Ticker(to_yahoo(ticker)).info
     except Exception as e:
         print(f"⚠️  [{ticker}] No se pudo leer el dividend yield ({e}). Se asume {DIVIDEND_YIELD_FALLBACK:.2%}.")
         return DIVIDEND_YIELD_FALLBACK
-    if raw is None:
-        return DIVIDEND_YIELD_FALLBACK
-    q = float(raw)
-    # yfinance alterna entre fracción (0.0072) y porcentaje (0.72) según versión. Ninguna acción
-    # rinde más de 25% en forma fraccionaria, así que por encima de ese corte es porcentaje.
-    if q > MAX_DIVIDEND_YIELD:
-        q /= 100.0
-    return q if 0.0 <= q <= MAX_DIVIDEND_YIELD else DIVIDEND_YIELD_FALLBACK
+    # tickers.py lee primero los campos que Yahoo entrega como fraccion y trata
+    # dividendYield como porcentaje (antes un 0.20% se leia como 20%).
+    q = dividend_yield_from_info(info, MAX_DIVIDEND_YIELD)
+    return DIVIDEND_YIELD_FALLBACK if q is None else q
 
 
 def bs_price(S, K, T, r, q, sigma, option_type="call"):
@@ -304,7 +306,9 @@ def get_polygon_options_data(ticker, current_price, horizon_months=TIME_HORIZON_
         all_contracts = polygon().paginate(url, params, max_pages=POLYGON_MAX_PAGES)
     except PolygonError as e:
         print(f"❌ [{ticker}] ERROR con Polygon API: {e}")
+        _ULTIMO_FALLO_CADENA[ticker] = failure_reason(e)
         return pd.DataFrame()
+    _ULTIMO_FALLO_CADENA.pop(ticker, None)
 
     if not all_contracts:
         print(f"⚠️  [{ticker}] Polygon no devolvió contratos para horizonte={horizon_months}m "
@@ -454,14 +458,13 @@ def calculate_gex_and_surface_forces(df_options, current_price, label=""):
     df_gex.rename(columns={"gex_signed": "net_gex"}, inplace=True)
     df_gex["cumulative_gex"] = df_gex["net_gex"].cumsum()
 
+    # Cruce de signo del GEX acumulado (gex_utils.py). Antes esta copia no
+    # ignoraba los strikes sin exposicion y marcaba un flip falso en el borde.
     gamma_flip = None
     try:
-        sign_changes = np.where(np.diff(np.sign(df_gex["cumulative_gex"])) != 0)[0]
-        if len(sign_changes) > 0:
-            idx = sign_changes[0]
-            x0, x1 = df_gex["strike"].iloc[idx], df_gex["strike"].iloc[idx + 1]
-            y0, y1 = df_gex["cumulative_gex"].iloc[idx], df_gex["cumulative_gex"].iloc[idx + 1]
-            gamma_flip = x0 + (0 - y0) * (x1 - x0) / (y1 - y0) if (y1 - y0) != 0 else x0
+        flip = gamma_flip_level(df_gex["strike"], df_gex["net_gex"])
+        if np.isfinite(flip):
+            gamma_flip = float(flip)
         else:
             print(f"ℹ️  [{label}] No se detectó cruce de signo en el GEX acumulado en esta ventana.")
     except Exception as e:
@@ -483,7 +486,7 @@ def calculate_gex_and_surface_forces(df_options, current_price, label=""):
     }
 
     print(f"📐 [{label}] GEX Total: {metrics['total_gex']:,.0f} | "
-          f"Gamma Flip: {gamma_flip:.2f}" if gamma_flip else f"📐 [{label}] GEX Total: {metrics['total_gex']:,.0f} | Gamma Flip: no detectado")
+          f"Gamma Flip: {gamma_flip:.2f}" if gamma_flip is not None else f"📐 [{label}] GEX Total: {metrics['total_gex']:,.0f} | Gamma Flip: no detectado")
     print(f"🧱 [{label}] Call Wall: {call_wall} | Put Wall: {put_wall} | Régimen: {metrics['regime']}")
 
     return df_gex, gamma_flip, metrics
@@ -658,7 +661,7 @@ def get_portfolio_chains(holdings, horizon_months=TIME_HORIZON_MONTHS):
         try:
             price = get_current_price(ticker)
         except Exception as exc:
-            note(ticker, "no option data returned")
+            note(ticker, failure_reason(exc))
             print(f"   ({exc})")
             continue
         if price is None:
@@ -666,13 +669,13 @@ def get_portfolio_chains(holdings, horizon_months=TIME_HORIZON_MONTHS):
             if reutilizado is not None:
                 portfolio_data[ticker] = reutilizado
                 continue
-            note(ticker, "no option data returned")
+            note(ticker, "no spot price returned")
             continue
 
         try:
             df_opts = get_polygon_options_data(ticker, price, horizon_months=horizon_months)
         except Exception as exc:
-            note(ticker, "no option data returned")
+            note(ticker, failure_reason(exc))
             print(f"   ({exc})")
             continue
         if df_opts.empty:
@@ -680,13 +683,13 @@ def get_portfolio_chains(holdings, horizon_months=TIME_HORIZON_MONTHS):
             if reutilizado is not None:
                 portfolio_data[ticker] = reutilizado
                 continue
-            note(ticker, "no option data returned")
+            note(ticker, _ULTIMO_FALLO_CADENA.pop(ticker, NO_OPTION_DATA))
             continue
 
         try:
             split = calculate_gex_split(df_opts, price)
         except Exception as exc:
-            note(ticker, "no usable gamma field")
+            note(ticker, failure_reason(exc))
             print(f"   ({exc})")
             continue
         df_gex_structural = split.get("structural", {}).get("df_gex")
@@ -699,7 +702,7 @@ def get_portfolio_chains(holdings, horizon_months=TIME_HORIZON_MONTHS):
         try:
             expected_move = calculate_expected_move(df_opts, price, horizon_months=horizon_months)
         except Exception as exc:
-            note(ticker, "no usable gamma field")
+            note(ticker, failure_reason(exc))
             print(f"   ({exc})")
             continue
         if expected_move is None or np.isnan(expected_move) or expected_move <= 0:
@@ -1316,6 +1319,7 @@ def run_live(refresh_seconds=REFRESH_SECONDS, max_iterations=MAX_ITERATIONS,
              open_browser=OPEN_BROWSER_ON_START):
     iteration = 0
     state_history = []
+    shell_escrito = False
 
     output_dir = os.path.dirname(os.path.abspath(output_path)) or "."
     output_filename = os.path.basename(output_path)
@@ -1351,9 +1355,12 @@ def run_live(refresh_seconds=REFRESH_SECONDS, max_iterations=MAX_ITERATIONS,
             if fig is not None:
                 write_portfolio_data_json(fig, output_dir, DATA_JSON_FILENAME)
                 print(f"💾 Datos actualizados: {os.path.join(output_dir, DATA_JSON_FILENAME)}")
-                if iteration == 0:
+                # La pagina se escribe en la primera iteracion CON figura, no en la
+                # iteracion 0: si esa fallaba (p. ej. limite de Polygon) nunca se creaba.
+                if not shell_escrito:
                     write_portfolio_html_shell(output_dir, output_filename, DATA_JSON_FILENAME,
                                                 refresh_seconds, rotate_camera)
+                    shell_escrito = True
                     if open_browser:
                         webbrowser.open(page_url)
         else:

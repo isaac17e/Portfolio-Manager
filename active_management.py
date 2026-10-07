@@ -13,7 +13,8 @@ from scipy.stats import norm
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from polygon_client import PolygonClient, PolygonError
+from gex_utils import gamma_flip_level
+from polygon_client import NoOptionData, PolygonClient, PolygonError, failure_reason
 from pipeline_io import export_signals, load_portfolio
 from tickers import exclusion_warnings, no_us_options_reason, to_polygon
 
@@ -311,6 +312,10 @@ def calculate_gex(chain, spot_price):
         return None
 
     df = chain.dropna(subset=["gamma", "open_interest"]).copy()
+    # Sin gamma ni OI utilizable no hay GEX que medir: se devuelve None para que
+    # el score lo trate como "sin datos" y no como un GEX neutro o negativo.
+    if df.empty or not ((df["gamma"] != 0) & (df["open_interest"] > 0)).any():
+        return None
     df["dealer_gex"] = np.where(
         df["type"] == "call",
         df["gamma"] * df["open_interest"] * 100 * spot_price**2 * 0.01,
@@ -325,22 +330,9 @@ def calculate_gex(chain, spot_price):
     )
     gex_by_strike["cum_gex"] = gex_by_strike["net_gex"].cumsum()
 
-    flip_level = np.nan
-    # Se excluyen strikes sin exposicion real (net_gex == 0, tipicamente OI=0)
-    # de la busqueda del cruce de signo. Sin este filtro, el cumsum se queda
-    # en signo 0 durante los strikes sin OI y np.sign() detecta un "cambio"
-    # espurio justo donde empiezan los primeros datos reales de la ventana
-    # (comun en tickers de poca liquidez de opciones), en vez de un nivel
-    # de flip genuino. Los valores de cum_gex usados si son los reales.
-    gex_sig = gex_by_strike[gex_by_strike["net_gex"] != 0].reset_index(drop=True)
-    if len(gex_sig) >= 2:
-        signs = np.sign(gex_sig["cum_gex"].values)
-        change_idx = np.where(np.diff(signs) != 0)[0]
-        if len(change_idx) > 0:
-            i = change_idx[0]
-            x0, y0 = gex_sig["strike"].iloc[i], gex_sig["cum_gex"].iloc[i]
-            x1, y1 = gex_sig["strike"].iloc[i + 1], gex_sig["cum_gex"].iloc[i + 1]
-            flip_level = x0 - y0 * (x1 - x0) / (y1 - y0)
+    # Cruce de signo del GEX acumulado (gex_utils.py ignora los strikes sin
+    # exposicion, que generaban un flip espurio en el borde de la ventana).
+    flip_level = gamma_flip_level(gex_by_strike["strike"], gex_by_strike["net_gex"])
 
     total_gex = gex_by_strike["net_gex"].sum()
     total_abs_gex = gex_by_strike["net_gex"].abs().sum()
@@ -527,16 +519,14 @@ def analyze_ticker_options(ticker, horizon_days, api_key=polygon_api_key):
         spot = get_spot_price(ticker, api_key)
         target_exp = select_target_expiration(ticker, horizon_days, api_key)
         if pd.isna(spot) or target_exp is None:
-            raise ValueError("Datos insuficientes de spot o expiracion.")
+            raise NoOptionData("no option data returned (sin spot o sin vencimiento)")
 
         chain = get_options_snapshot(ticker, exp_date_from=target_exp, exp_date_to=target_exp, api_key=api_key)
         if chain is None or chain.empty:
-            raise ValueError("Cadena de opciones vacia para la expiracion objetivo.")
+            raise NoOptionData("no option data returned (cadena vacia para el vencimiento objetivo)")
 
         if chain["underlying_price"].isna().any():
             chain["underlying_price"] = chain["underlying_price"].fillna(spot)
-        if pd.isna(spot):
-            spot = chain["underlying_price"].mean()
 
         chain_windowed = chain[
             (chain["strike"] >= spot * (1 - strike_window_pct))
@@ -562,11 +552,19 @@ def analyze_ticker_options(ticker, horizon_days, api_key=polygon_api_key):
         }
     except Exception as e:
         warnings.warn(f"Fallo el analisis de {ticker}: {e}")
-        return {"ticker": ticker, "status": "ERROR", "error_message": str(e)}
+        return {"ticker": ticker, "status": "ERROR", "error_message": str(e),
+                "exclusion_reason": failure_reason(e)}
 
 # ============================================================================
 # BLOQUE 4: ALGORITMO DE DECISION Y SCORING TACTICO
 # ============================================================================
+
+SCORE_COLUMNS = [
+    "ticker", "spot_price", "score", "action", "recorte_pct", "gex_flip_level", "total_gex",
+    "liquidity_confidence", "sweep_bias", "expected_move_lower", "expected_move_upper",
+    "expected_move_pct", "rationale",
+]
+
 
 def calculate_tactical_score(analysis):
     if analysis is None or analysis.get("status") != "OK":
@@ -630,12 +628,20 @@ def calculate_tactical_score(analysis):
         score += charm_points
         reasons.append(f"Charm: {vc['charm_regime']} ({vc['net_charm_exposure']/1e6:.2f}MM)")
 
-    liquidity_confidence = gex["liquidity_confidence"] if gex is not None else "NORMAL"
+    liquidity_confidence = gex["liquidity_confidence"] if gex is not None else "SIN_DATOS"
     if liquidity_confidence == "BAJA":
         score = score * score_low_liquidity_damping
         reasons.append(
             f"Confianza BAJA: notional GEX ${gex['total_abs_gex']:,.0f} < umbral "
             f"${gex_liquidity_min_notional:,.0f} (poca liquidez de opciones) - score amortiguado x{score_low_liquidity_damping}"
+        )
+    elif liquidity_confidence == "SIN_DATOS":
+        # La falta de gamma no es una senal: el GEX no suma ni resta puntos y el
+        # resto del score se amortigua igual que con liquidez baja.
+        score = score * score_low_liquidity_damping
+        reasons.append(
+            "Sin datos de gamma/OI en la ventana: GEX fuera del score - "
+            f"score amortiguado x{score_low_liquidity_damping}"
         )
 
     score = max(min(score, 100), -100)
@@ -1579,6 +1585,17 @@ def print_risk_regime(regimen):
 # ============================================================================
 
 def rebalance_portfolio(portfolio, scores_df, cash_reserve_limit):
+    # El portafolio de origen no obliga a que los pesos sumen 1: lo que falta es
+    # caja ya existente y entra como Peso_Inicial de la fila CASH. Asi la caja
+    # actual y la sugerida se comparan en la misma base (antes se renormalizaba
+    # solo el peso nuevo y cada activo sin cambios salia como compra).
+    peso_activos = float(sum(float(v) for v in portfolio.values()))
+    if peso_activos > 1.0 + 1e-6:
+        warnings.warn(f"Los pesos del portafolio suman {peso_activos:.4f} > 1: se normalizan a 1.")
+        portfolio = {tk: float(v) / peso_activos for tk, v in portfolio.items()}
+        peso_activos = 1.0
+    cash_inicial = max(0.0, 1.0 - peso_activos)
+
     base = scores_df.copy()
     base["peso_inicial"] = base["ticker"].map(portfolio)
 
@@ -1620,16 +1637,19 @@ def rebalance_portfolio(portfolio, scores_df, cash_reserve_limit):
     })[["Ticker", "Peso_Inicial", "Score_Tactico", "Accion", "Nuevo_Peso",
         "Rango_Bajo_USD", "Rango_Alto_USD", "Movimiento_Esperado_Pct", "Racional"]]
 
+    racional_cash = f"Limite configurado: {cash_reserve_limit*100:.0f}%"
+    if cash_inicial > 0:
+        racional_cash += f" | caja inicial {cash_inicial*100:.2f}% (pesos del portafolio < 100%)"
     fila_cash = pd.DataFrame([{
         "Ticker": "CASH",
-        "Peso_Inicial": 0,
+        "Peso_Inicial": cash_inicial,
         "Score_Tactico": np.nan,
         "Accion": "RESERVA_TACTICA",
-        "Nuevo_Peso": cash_asignado,
+        "Nuevo_Peso": cash_inicial + cash_asignado,
         "Rango_Bajo_USD": np.nan,
         "Rango_Alto_USD": np.nan,
         "Movimiento_Esperado_Pct": np.nan,
-        "Racional": f"Limite configurado: {cash_reserve_limit*100:.0f}%",
+        "Racional": racional_cash,
     }])
 
     tabla_final = pd.concat([tabla_rebalanceo, fila_cash], ignore_index=True)
@@ -1918,10 +1938,13 @@ def run_active_management_engine(portfolio, horizon_days, api_key, cash_limit):
             continue
         analyses[tk] = analyze_ticker_options(tk, horizon_days, api_key)
         if analyses[tk].get("status") != "OK":
-            excluded.append({"ticker": tk, "reason": "no option data returned"})
+            excluded.append({"ticker": tk,
+                             "reason": analyses[tk].get("exclusion_reason") or failure_reason(None)})
 
     scores_list = [calculate_tactical_score(analyses[tk]) for tk in tickers]
-    scores_df = pd.DataFrame(scores_list)
+    # Columnas fijas: si todos los tickers quedan SIN_DATOS, sus dicts no traen
+    # las columnas de rango esperado y el rebalanceo fallaba con KeyError.
+    scores_df = pd.DataFrame(scores_list, columns=SCORE_COLUMNS)
 
     tabla_tactica = rebalance_portfolio(portfolio, scores_df, cash_limit)
 

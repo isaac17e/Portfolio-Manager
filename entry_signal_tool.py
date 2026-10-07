@@ -11,7 +11,8 @@ import os
 import json
 import plotly.graph_objects as go
 
-from polygon_client import PolygonClient
+from gex_utils import gamma_flip_level
+from polygon_client import NO_OPTION_DATA, NoOptionData, PolygonClient, failure_reason
 from pipeline_io import (
     apply_entry_fills,
     export_signals,
@@ -119,10 +120,6 @@ def cargar_estado():
 def guardar_estado(estado):
     with open(STATE_PATH, "w") as f:
         json.dump(estado, f, indent=2)
-
-class NoOptionData(RuntimeError):
-    """El ticker no tiene cadena de opciones utilizable en esta corrida."""
-
 
 def parse_entry_args(argv=None):
     parser = argparse.ArgumentParser(description="Score de conviccion para entrada en portafolio")
@@ -277,20 +274,9 @@ def calcular_gex_y_zero_gamma(df_chain, spot):
     gex_por_strike = df.groupby("strike")["gex_strike"].sum().sort_index()
     gex_total = gex_por_strike.sum()
 
-    # Se excluyen strikes sin exposicion real (gex_strike == 0, tipicamente sin
-    # OI) de la busqueda del cruce, y se detecta el cruce en cualquier
-    # direccion (no solo negativo->positivo) para no perder flips genuinos.
-    gex_sig = gex_por_strike[gex_por_strike != 0]
-    acumulado_sig = gex_sig.cumsum()
-    zero_gamma = np.nan
-    if len(acumulado_sig) >= 2:
-        signs = np.sign(acumulado_sig.values)
-        change_idx = np.where(np.diff(signs) != 0)[0]
-        if len(change_idx) > 0:
-            i = change_idx[0]
-            x0, y0 = acumulado_sig.index[i], acumulado_sig.values[i]
-            x1, y1 = acumulado_sig.index[i + 1], acumulado_sig.values[i + 1]
-            zero_gamma = x0 - y0 * (x1 - x0) / (y1 - y0)
+    # Cruce de signo del GEX acumulado (gex_utils.py: ignora strikes sin
+    # exposicion y detecta el cruce en cualquier direccion).
+    zero_gamma = gamma_flip_level(gex_por_strike.index, gex_por_strike.values)
 
     if pd.isna(zero_gamma):
         # Sin cruce de signo real dentro de la ventana: no hay nivel de
@@ -387,12 +373,18 @@ def calcular_vanna_charm_factor():
 
 # ---------------- NORMALIZACION Y SCORE ----------------
 
-def percentile_historico(hist_df, ticker, columna, valor_actual):
+def percentile_historico(hist_df, ticker, columna, valor_actual, absoluto=False):
+    # absoluto=True compara magnitudes: |valor_actual| contra |historial|. El
+    # historial guarda el valor con signo (evaluar_flujo_opciones lo usa asi),
+    # y comparar un valor absoluto contra una serie con signo sesga el percentil.
     if hist_df.empty or valor_actual is None or pd.isna(valor_actual):
         return 50.0
     serie = hist_df[hist_df["ticker"] == ticker][columna].dropna()
     if len(serie) < 5:
         return 50.0
+    if absoluto:
+        serie = serie.abs()
+        valor_actual = abs(valor_actual)
     return (serie < valor_actual).mean() * 100
 
 def calcular_indicadores_ticker(ticker, hist_df):
@@ -402,10 +394,10 @@ def calcular_indicadores_ticker(ticker, hist_df):
     spot, vol_relativo = get_spot_y_volumen_relativo(ticker)
     vencimiento = seleccionar_vencimiento_objetivo(ticker, HORIZON_DIAS_OBJETIVO)
     if vencimiento is None:
-        raise NoOptionData("no option data returned")
+        raise NoOptionData(NO_OPTION_DATA)
     chain = parse_chain(get_options_chain(ticker, spot, vencimiento))
     if chain.empty:
-        raise NoOptionData("no option data returned")
+        raise NoOptionData(NO_OPTION_DATA)
 
     gex_total, dist_zero_gamma = calcular_gex_y_zero_gamma(chain, spot)
     call_wall, put_wall = calcular_walls(chain)
@@ -435,12 +427,11 @@ def calcular_indicadores_ticker(ticker, hist_df):
     normalizados = {
         "gex_regime": 100 - abs(percentile_historico(hist_df, ticker, "gex_total", gex_total) - 50) * 2,
         "zero_gamma_dist": percentile_historico(
-            hist_df, ticker, "dist_zero_gamma",
-            abs(dist_zero_gamma) if not pd.isna(dist_zero_gamma) else np.nan
+            hist_df, ticker, "dist_zero_gamma", dist_zero_gamma, absoluto=True
         ),
         "wall_space": (espacio_walls * 100) if not pd.isna(espacio_walls) else 50.0,
         "iv_rank": percentile_historico(hist_df, ticker, "iv_atm", iv_atm),
-        "skew": 100 - percentile_historico(hist_df, ticker, "skew", abs(skew) if not pd.isna(skew) else np.nan),
+        "skew": 100 - percentile_historico(hist_df, ticker, "skew", skew, absoluto=True),
         "expected_move": 100 - percentile_historico(hist_df, ticker, "expected_move", expected_move),
         "smart_money": percentile_historico(hist_df, ticker, "smart_money", smart_money),
         "volumen_relativo": (min(vol_relativo, 2.0) / 2.0 * 100) if not pd.isna(vol_relativo) else 50.0,
@@ -637,10 +628,10 @@ def correr_entry_signal(cycle_day=None, invested_pct=None):
             fila = calcular_indicadores_ticker(ticker, hist_df)
             filas_nuevas.append(fila)
         except NoOptionData as exc:
-            excluded.append({"ticker": ticker, "reason": "no option data returned"})
+            excluded.append({"ticker": ticker, "reason": str(exc) or NO_OPTION_DATA})
             print(f"{ticker}: {exc}; se omite.")
         except Exception as exc:
-            excluded.append({"ticker": ticker, "reason": "no option data returned"})
+            excluded.append({"ticker": ticker, "reason": failure_reason(exc)})
             print(f"Error con {ticker}: {exc}; se omite.")
 
     warnings.extend(exclusion_warnings(excluded))

@@ -70,7 +70,10 @@ print(
 # =============================================================================
 # BLOQUE 2: UTILIDADES Y CONEXION A LA API
 # =============================================================================
-from polygon_client import PolygonClient, PolygonError, PolygonNotFound
+from gex_utils import gamma_flip_level
+from polygon_client import (
+    NO_OPTION_DATA, NoOptionData, PolygonClient, PolygonError, PolygonNotFound, failure_reason,
+)
 
 def log_info(msg):
     print(f"[INFO]  {msg}")
@@ -122,8 +125,18 @@ def get_price_data(tickers, start, end):
         prices = data[["Adj Close"]].copy()
         prices.columns = list(tickers[:1])
 
+    # Un ticker sin ningun precio dejaba una columna vacia y el dropna() de abajo
+    # borraba TODAS las filas. Se excluye ese ticker y el resto sigue.
+    sin_precios = [tk for tk in prices.columns if prices[tk].isna().all()]
+    for tk in sin_precios:
+        log_warn(f"{tk}: Yahoo no devolvio precios; se excluye del analisis.")
+    prices = prices.drop(columns=sin_precios)
+    if prices.empty or prices.shape[1] == 0:
+        raise ValueError("Ningun ticker tiene precios historicos. Revisa los tickers/conexion.")
+
     prices = prices.ffill().dropna()
-    return prices
+    excluded = [{"ticker": tk, "reason": "no price history returned"} for tk in sin_precios]
+    return prices, excluded
 
 def get_log_returns(prices):
     rets = np.log(prices / prices.shift(1)).dropna()
@@ -546,29 +559,11 @@ def compute_gex_profile(chain):
     return pivot.sort_values("strike").reset_index(drop=True)
 
 def compute_zero_gamma_level(gex_profile):
+    # Cruce de signo del GEX acumulado (gex_utils.py ignora los strikes sin
+    # exposicion, que generaban un cruce espurio en el borde de la ventana).
     if len(gex_profile) < 2:
         return np.nan
-    gp = gex_profile.sort_values("strike").reset_index(drop=True)
-    gp["cum_gex"] = gp["GEX_neto"].cumsum()
-
-    # Se excluyen strikes sin exposicion real (GEX_neto == 0, tipicamente sin
-    # OI en ese vencimiento) de la busqueda del cruce de signo. Sin este filtro,
-    # el cumsum se queda en signo 0 durante esos strikes y np.sign() detecta un
-    # "cambio" espurio en el borde de la ventana de datos en vez de un nivel
-    # de zero-gamma genuino. Los valores de cum_gex usados si son los reales.
-    gp_sig = gp[gp["GEX_neto"] != 0].reset_index(drop=True)
-    if len(gp_sig) < 2:
-        return np.nan
-
-    signs = np.sign(gp_sig["cum_gex"].values)
-    diffs = np.diff(signs)
-    sign_change_idx = np.where(diffs != 0)[0]
-    if len(sign_change_idx) == 0:
-        return np.nan
-    i = sign_change_idx[0]
-    x1, x2 = gp_sig["strike"].iloc[i], gp_sig["strike"].iloc[i + 1]
-    y1, y2 = gp_sig["cum_gex"].iloc[i], gp_sig["cum_gex"].iloc[i + 1]
-    return x1 + (0 - y1) * (x2 - x1) / (y2 - y1)
+    return gamma_flip_level(gex_profile["strike"], gex_profile["GEX_neto"])
 
 def compute_max_pain(chain):
     strikes = sorted(chain["strike"].unique())
@@ -600,23 +595,25 @@ def run_options_module_for_ticker(ticker, hv_annual, horizon_days, api_key,
                                    spot_fallback=np.nan, rf_annual=0):
     log_info(f"MODULO 2: procesando cadena de opciones de {ticker}...")
 
+    # Si el ticker no se puede valorar se lanza la excepcion (NoOptionData o
+    # PolygonError) y run_options_module la convierte en el motivo de exclusion.
     try:
         exp_info = get_target_expiration(ticker, horizon_days, api_key)
         if exp_info["expiration"] is None:
             log_warn(f"{ticker}: sin expiracion valida encontrada. Se omite del modulo de opciones.")
-            return None
+            raise NoOptionData(NO_OPTION_DATA)
         chain = get_option_chain_snapshot(ticker, exp_info["expiration"], api_key)
     except PolygonNotFound:
         log_warn(f"{ticker}: recurso no encontrado (404), posible activo sin mercado de opciones. "
                  "Se omite del modulo de opciones.")
-        return None
+        raise
     except PolygonError as e:
         log_error(f"{ticker}: {e}. Se omite del modulo de opciones.")
-        return None
+        raise
 
     if chain is None:
         log_warn(f"{ticker}: cadena de opciones no disponible. Se omite del modulo de opciones.")
-        return None
+        raise NoOptionData(NO_OPTION_DATA)
 
     chain = fill_missing_iv_greeks(chain, exp_info["days_to_expiry"], rf_annual, spot_fallback)
 
@@ -660,14 +657,15 @@ def run_options_module(tickers, hv_by_asset, weights, horizon_days, api_key,
             log_warn(f"{tk}: {reason}. Se omite del modulo de opciones.")
             continue
         spot_fb = spot_by_asset.get(tk, np.nan) if spot_by_asset else np.nan
-        r = run_options_module_for_ticker(
-            tk, hv_by_asset.get(tk), horizon_days, api_key,
-            spot_fallback=spot_fb, rf_annual=rf_annual
-        )
-        if r is not None:
-            results[tk] = r
-        else:
-            excluded.append({"ticker": tk, "reason": "no option data returned"})
+        try:
+            results[tk] = run_options_module_for_ticker(
+                tk, hv_by_asset.get(tk), horizon_days, api_key,
+                spot_fallback=spot_fb, rf_annual=rf_annual
+            )
+        except Exception as exc:
+            if not isinstance(exc, (NoOptionData, PolygonError)):
+                log_error(f"{tk}: error procesando la cadena ({exc}). Se omite del modulo de opciones.")
+            excluded.append({"ticker": tk, "reason": failure_reason(exc)})
 
     if len(results) == 0:
         log_warn("MODULO 2: ningun activo tuvo datos de opciones disponibles.")
@@ -1004,16 +1002,18 @@ def _senal_riesgo(leverage_results, options_module):
 # =============================================================================
 # BLOQUE 8: EJECUCION DEL PIPELINE
 # =============================================================================
-tickers = list(portfolio.keys())
-
-prices = get_price_data(tickers, start_date, end_date)
+prices, price_excluded = get_price_data(list(portfolio.keys()), start_date, end_date)
+tickers = list(prices.columns)
+# Los tickers sin precios quedan fuera de todos los modulos; el resto conserva
+# su peso tal cual (misma regla que el resto del script: no se renormaliza).
+portfolio_priced = {tk: portfolio[tk] for tk in tickers}
 asset_returns = get_log_returns(prices)
-portfolio_returns = get_portfolio_returns(asset_returns, portfolio)
+portfolio_returns = get_portfolio_returns(asset_returns, portfolio_priced)
 
 expost_results = run_expost_risk_module(
     asset_returns=asset_returns,
     portfolio_returns=portfolio_returns,
-    weights=portfolio,
+    weights=portfolio_priced,
     horizon_days=horizon_days,
     confidence_levels=confidence_levels,
     rf_annual=risk_free_rate_annual,
@@ -1030,13 +1030,13 @@ if not polygon_api_key:
         "by_asset": {},
         "summary": pd.DataFrame(),
         "portfolio_iv": np.nan,
-        "excluded": [{"ticker": tk, "reason": "no option data returned"} for tk in tickers],
+        "excluded": [{"ticker": tk, "reason": "no polygon api key"} for tk in tickers],
     }
 else:
     options_module = run_options_module(
         tickers=tickers,
         hv_by_asset=hv_by_asset,
-        weights=portfolio,
+        weights=portfolio_priced,
         horizon_days=horizon_days,
         api_key=polygon_api_key,
         spot_by_asset=spot_by_asset,
@@ -1046,12 +1046,13 @@ else:
 leverage_results = run_leverage_module(
     expost_results=expost_results,
     options_module=options_module,
-    weights=portfolio,
+    weights=portfolio_priced,
     leverage_min=leverage_min,
     leverage_max=leverage_max,
     risk_score_weights=risk_score_weights
 )
 
+options_module["excluded"] = price_excluded + list(options_module.get("excluded") or [])
 _senal_riesgo_data = _senal_riesgo(leverage_results, options_module)
 export_signals(
     "portfolio_risk_score_leverage",

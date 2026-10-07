@@ -159,3 +159,32 @@ def mapping(ticker) -> dict:
         "has_us_options": has_us_options(ticker),
         "us_options_reason": no_us_options_reason(ticker),
     }
+
+
+def dividend_yield_from_info(info, max_yield=0.25):
+    """Dividend yield as a fraction (0.0045 = 0.45%) from a yfinance ``.info``.
+
+    ``trailingAnnualDividendYield`` and ``yield`` (ETFs) come as fractions.
+    ``dividendYield`` comes as a percent since Yahoo changed the field in 2025
+    (0.45 = 0.45%), so guessing by size misreads yields below 1% (or 0.25%) as
+    fractions. Returns None when no field gives a usable value.
+    """
+    info = info or {}
+    candidates = (
+        ("trailingAnnualDividendYield", 1.0),
+        ("yield", 1.0),
+        ("dividendYield", 100.0),
+    )
+    for key, scale in candidates:
+        raw = info.get(key)
+        if raw is None or isinstance(raw, bool):
+            continue
+        try:
+            value = float(raw) / scale
+        except (TypeError, ValueError):
+            continue
+        if value != value or value < 0:  # NaN o negativo
+            continue
+        if value <= max_yield:
+            return value
+    return None

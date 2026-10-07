@@ -44,6 +44,30 @@ class PolygonTruncated(PolygonError):
     """La paginacion alcanzo el tope de paginas y quedaban resultados por pedir."""
 
 
+NO_OPTION_DATA = "no option data returned"
+
+
+class NoOptionData(RuntimeError):
+    """El ticker no tiene cadena de opciones utilizable en esta corrida."""
+
+
+def failure_reason(exc, default=NO_OPTION_DATA):
+    """Motivo de exclusion para el JSON de senales a partir de una excepcion.
+
+    Un 404 o una cadena vacia significan que no hay datos de opciones; un fallo
+    de la API (429 agotado, 5xx, red) o un error de codigo no lo son, y se
+    reportan como tales para que no se confundan con un activo sin opciones.
+    """
+    if exc is None or isinstance(exc, PolygonNotFound):
+        return default
+    if isinstance(exc, NoOptionData):
+        return str(exc).strip() or default
+    if isinstance(exc, PolygonError):
+        return f"api error: {exc}"
+    texto = str(exc).strip()
+    return f"error: {type(exc).__name__}" + (f": {texto}" if texto else "")
+
+
 class _RateLimiter:
     # Ventana deslizante: como mucho `calls` llamadas en cualquier intervalo de
     # `period` segundos. Permite rafagas de hasta `calls` llamadas y solo

@@ -18,8 +18,10 @@ from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 from pipeline_io import export_signals, load_portfolio
-from polygon_client import PolygonClient
-from tickers import exclusion_warnings, no_us_options_reason, to_polygon, to_yahoo
+from polygon_client import NoOptionData, PolygonClient, failure_reason
+from tickers import (
+    dividend_yield_from_info, exclusion_warnings, no_us_options_reason, to_polygon, to_yahoo,
+)
 from scipy.interpolate import CubicSpline
 from scipy.optimize import brentq, least_squares
 from scipy.stats import norm
@@ -88,7 +90,8 @@ POLYGON_BASE_URL: str = "https://api.polygon.io"
 
 if not POLYGON_API_KEY:
     print("ADVERTENCIA: No hay POLYGON_API_KEY configurada. Las cadenas de opciones no")
-    print("             se podran descargar y el motor caera a yfinance / datos sinteticos.")
+    print("             se podran descargar de Polygon y el motor caera a yfinance")
+    print("             (los datos sinteticos solo se usan con --synthetic).")
 
 OPT_MIN_DTE: float = 7.0                 # días mínimos a vencimiento admitidos
 OPT_MAX_DTE: float = 90.0                # horizonte máximo al buscar vencimientos
@@ -825,7 +828,7 @@ class SingleAssetVIX:
                 warnings.warn(f"[{tag}] Vencimiento descartado: {exc}", RuntimeWarning)
 
         if not fits:
-            raise ValueError("ningún vencimiento utilizable")
+            raise NoOptionData("no option data returned (ningún vencimiento utilizable)")
 
         fits.sort(key=lambda f: f.T)
         near, nxt = fits[0], (fits[1] if len(fits) > 1 else None)
@@ -1315,7 +1318,7 @@ class PolygonMarketLoader:
 
                 exps = select_cboe_expiries(self._expirations(tk), self.min_days)
                 if not exps:
-                    raise RuntimeError("sin vencimientos dentro de la ventana configurada")
+                    raise NoOptionData("no option data returned (sin vencimientos en la ventana)")
                 if len(exps) < 2:
                     warnings.warn(
                         f"[{tk}] Sólo {len(exps)} vencimiento válido; la interpolación a 30 "
@@ -1337,7 +1340,7 @@ class PolygonMarketLoader:
                     slices.append(ExpirySlice(T=T, chain=chain, label=e))
 
                 if not slices:
-                    raise RuntimeError("ninguna cadena utilizable")
+                    raise NoOptionData("no option data returned (ninguna cadena utilizable)")
 
                 closes[tk] = hist
                 assets.append(
@@ -1356,7 +1359,7 @@ class PolygonMarketLoader:
                         f"vencimientos = {[s.label for s in slices]}"
                     )
             except Exception as exc:  # noqa: BLE001
-                self.excluded.append({"ticker": str(tk), "reason": "no option data returned"})
+                self.excluded.append({"ticker": str(tk), "reason": failure_reason(exc)})
                 warnings.warn(f"[{tk}] Excluido de la carga de datos: {exc}", RuntimeWarning)
 
         if not assets:
@@ -1403,14 +1406,15 @@ class YahooMarketLoader:
                 spot = float(hist.iloc[-1])
 
                 try:
-                    dy = t.info.get("dividendYield", 0.0) or 0.0
-                    q = float(dy) if float(dy) < 1.0 else float(dy) / 100.0
+                    # tickers.py: campos en fraccion primero; dividendYield es porcentaje
+                    # (antes un 0.45% se leia como 45%).
+                    q = dividend_yield_from_info(t.info) or 0.0
                 except Exception:  # noqa: BLE001
                     q = 0.0
 
                 exps = self._pick_expiries(list(t.options or []))
                 if not exps:
-                    raise RuntimeError("sin vencimientos de opciones")
+                    raise NoOptionData("no option data returned (sin vencimientos de opciones)")
                 if len(exps) < 2:
                     warnings.warn(
                         f"[{tk}] Menos de 2 vencimientos válidos disponibles en la fuente.",
@@ -1432,13 +1436,13 @@ class YahooMarketLoader:
                         )
                     )
                 if not slices:
-                    raise RuntimeError("ninguna cadena utilizable")
+                    raise NoOptionData("no option data returned (ninguna cadena utilizable)")
                 closes[tk] = hist
                 assets.append(AssetMarketData(ticker=tk, spot=spot, q=q, slices=slices))
                 if self.verbose:
                     print(f"  [yfinance] {tk}: spot = {spot:.2f}, q = {q:.4f}, vencimientos = {exps}")
             except Exception as exc:  # noqa: BLE001
-                self.excluded.append({"ticker": str(tk), "reason": "no option data returned"})
+                self.excluded.append({"ticker": str(tk), "reason": failure_reason(exc)})
                 warnings.warn(f"[{tk}] Excluido de la carga yfinance: {exc}", RuntimeWarning)
 
         if not assets:
@@ -1952,7 +1956,7 @@ class PortfolioVIXCalculator:
                 used.append(a.ticker)
                 fits_by_asset[a.ticker] = fits
             except Exception as exc:  # noqa: BLE001
-                self.excluded.append({"ticker": a.ticker, "reason": "no option data returned"})
+                self.excluded.append({"ticker": a.ticker, "reason": failure_reason(exc)})
                 warnings.warn(f"[{a.ticker}] Excluido del portafolio: {exc}", RuntimeWarning)
 
         if not used:
@@ -2105,6 +2109,12 @@ def _parse_args() -> VIXConfig:
 
     tickers = a.tickers if a.tickers else portfolio_tickers()
     if a.weights is not None:
+        # Antes zip() truncaba en silencio y los tickers sobrantes quedaban con peso 0.
+        if len(a.weights) != len(tickers):
+            p.error(f"--weights tiene {len(a.weights)} valores y hay {len(tickers)} tickers; "
+                    "deben coincidir (uno por ticker, en el mismo orden).")
+        if any(not math.isfinite(w) or w < 0 for w in a.weights) or sum(a.weights) <= 0:
+            p.error("--weights debe tener valores finitos >= 0 con suma positiva.")
         weights: Optional[List[float]] = list(a.weights)
     elif a.tickers:
         weights = None  # portafolio ad hoc por CLI: equiponderado salvo --weights
