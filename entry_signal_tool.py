@@ -15,10 +15,13 @@ from gex_utils import gamma_flip_level
 from polygon_client import NO_OPTION_DATA, NoOptionData, PolygonClient, failure_reason
 from pipeline_io import (
     apply_entry_fills,
+    entry_state_path,
     export_signals,
     load_fills,
     load_portfolio,
+    load_portfolio_fills,
     parse_invested_overrides,
+    portfolio_key,
     resolve_cycle_day,
     signal_cycle_number,
     stage_pending_entry,
@@ -94,7 +97,19 @@ VENTANA_BUSQUEDA_VENCIMIENTO_DIAS = 20
 MAX_PAGINAS_CADENA = 40
 
 HIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "entry_signal_history.csv")
-STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "entry_state.json")
+# Estado y fills van por portafolio (optimizer + run_ts del JSON del portafolio):
+# dos portafolios corriendo a la vez (p. ej. MV y QU) ya no comparten archivo.
+# El entry_state.json junto al script es el formato heredado; nunca se borra.
+LEGACY_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "entry_state.json")
+
+def ruta_estado():
+    return entry_state_path(_PORTFOLIO_META)
+
+def _portafolio_del_estado():
+    return {
+        "optimizer": _PORTFOLIO_META.get("portfolio_optimizer"),
+        "run_ts": _PORTFOLIO_META.get("portfolio_run_ts"),
+    }
 
 # Si ya corriste el script hoy con el mismo portafolio, se reemplaza esa fila en vez de duplicarla
 def cargar_historial():
@@ -139,22 +154,51 @@ def normalizar_estado(estado):
     return estado
 
 def cargar_estado():
-    if not os.path.exists(STATE_PATH):
-        return _estado_vacio()
-    with open(STATE_PATH, "r") as f:
-        return normalizar_estado(json.load(f))
+    ruta = ruta_estado()
+    if os.path.exists(ruta):
+        with open(ruta, "r") as f:
+            return normalizar_estado(json.load(f))
+    # Migracion: el entry_state.json heredado se lee una sola vez y solo si
+    # registra este mismo portafolio; si no, se empieza de cero.
+    if os.path.exists(LEGACY_STATE_PATH) and portfolio_key(_PORTFOLIO_META) is not None:
+        try:
+            with open(LEGACY_STATE_PATH, "r") as f:
+                heredado = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"  entry_state.json heredado ilegible ({exc}); se empieza de cero.")
+            return _estado_vacio()
+        if isinstance(heredado, dict) and heredado.get("portfolio") == _portafolio_del_estado():
+            print(f"  Estado migrado desde {LEGACY_STATE_PATH} (mismo portafolio).")
+            return normalizar_estado(heredado)
+        print(f"  {LEGACY_STATE_PATH} no registra este portafolio; se empieza de cero (no se borra).")
+    return _estado_vacio()
 
 def guardar_estado(estado):
-    with open(STATE_PATH, "w") as f:
+    ruta = ruta_estado()
+    estado = dict(estado, portfolio=_portafolio_del_estado())
+    os.makedirs(os.path.dirname(os.path.abspath(ruta)), exist_ok=True)
+    temporal = ruta + ".tmp"
+    with open(temporal, "w") as f:
         json.dump(estado, f, indent=2)
+    os.replace(temporal, ruta)
+
+def cargar_fills():
+    """Fills del portafolio actual (fills_<optimizer>_<run_ts>.json en EXECUTIONS_DIR).
+
+    Sin optimizer / run_ts (portafolio de respaldo del script) se usa la
+    busqueda heredada de pipeline_io.load_fills.
+    """
+    if portfolio_key(_PORTFOLIO_META) is None:
+        return load_fills("entry_signal_tool")
+    return load_portfolio_fills(_PORTFOLIO_META)
 
 def parse_entry_args(argv=None):
     parser = argparse.ArgumentParser(description="Score de conviccion para entrada en portafolio")
     parser.add_argument("--cycle-day", type=int, default=None,
-                        help=f"dia del ciclo 1..{DIAS_CICLO} (si no, ENTRY_CYCLE_DAY o entry_state.json)")
+                        help=f"dia del ciclo 1..{DIAS_CICLO} (si no, ENTRY_CYCLE_DAY o el estado del portafolio)")
     parser.add_argument("--invested-pct", default=None,
                         help="%% ya invertido: '40', 'GLD=40,KO=0.25' o JSON. "
-                             "Por defecto, entry_state.json. No marca la posicion como ejecutada.")
+                             "Por defecto, el estado del portafolio. No marca la posicion como ejecutada.")
     return parser.parse_known_args(argv)[0]
 
 # ---------------- DECISION DE CIERRE (DIA 5) ----------------
@@ -817,7 +861,7 @@ def construir_fila_estado(fila, pct_previo, peso_original, dia_ciclo, ciclo, his
 
 
 def correr_entry_signal(cycle_day=None, invested_pct=None):
-    """Calcula la senal del dia. No marca entry_state.json como invertido.
+    """Calcula la senal del dia. No marca el estado del portafolio como invertido.
 
     Los porcentajes ya invertidos solo cambian si hay un fills file cuyo
     signal_run_ts coincide con la senal pendiente. El dia y el % invertido de
@@ -828,11 +872,11 @@ def correr_entry_signal(cycle_day=None, invested_pct=None):
     excluded = []
 
     estado = cargar_estado()
-    fills_payload = load_fills("entry_signal_tool")
+    fills_payload = cargar_fills()
     estado, fills_applied = apply_entry_fills(estado, fills_payload, cycle_length=DIAS_CICLO)
     if fills_applied:
         guardar_estado(estado)
-        print("Fills confirmados: entry_state.json avanza con la ejecucion.")
+        print(f"Fills confirmados: {ruta_estado()} avanza con la ejecucion.")
     elif fills_payload and estado.get("pending_signal_run_ts"):
         warnings.append(
             "fills ignored: signal_run_ts "

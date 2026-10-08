@@ -6,7 +6,7 @@ import pandas as pd
 from datetime import date
 
 from pipeline_io import export_signals, load_portfolio
-from price_signals import price_indicators
+from price_signals import price_indicators, yahoo_closes
 from tickers import (
     adr_warnings, exclusion_warnings, no_options_weight_cap, resolve_instrument, to_polygon, to_yahoo,
 )
@@ -594,6 +594,46 @@ def compute_max_pain(chain):
 
     return {"max_pain_strike": max_pain_strike, "payout_curve": notional_tbl, "notional_concentration": notional_conc}
 
+def spot_paridad_put_call(chain, days_to_expiry, rf_annual):
+    """Spot implicito en la propia cadena de Polygon (sin endpoints de acciones).
+
+    Reusa el forward por paridad put-call de portfolio_vix
+    (CBOEVarianceEngine.implied_forward) y lo descuenta: S = F * exp(-r T).
+    Ignora dividendos; solo es el ultimo respaldo. Devuelve NaN si no hay un
+    strike con call y put cotizadas.
+    """
+    from portfolio_vix import CBOEVarianceEngine
+
+    Tt = days_to_expiry / 365
+    precios = chain.assign(
+        type=chain["contract_type"],
+        price_eu=chain["last_quote_mid"].combine_first(chain["day_close"]),
+    ).dropna(subset=["price_eu"])
+    try:
+        forward, _ = CBOEVarianceEngine(rf_annual, verbose=False).implied_forward(precios, Tt)
+    except (ValueError, KeyError):
+        return np.nan
+    return float(forward * np.exp(-rf_annual * Tt))
+
+def spot_listado_us(ticker, chain, days_to_expiry, rf_annual):
+    """Spot del simbolo US analizado (ADR o ETF proxy) cuando Polygon no lo trae.
+
+    El plan de Polygon es solo de opciones (sin snapshot de acciones), asi que
+    nunca se usan endpoints de acciones. Orden: ultimo cierre de yfinance del
+    propio simbolo US (RY, no RY.TO), luego paridad put-call de la cadena.
+    Devuelve (spot, fuente) o (NaN, None).
+    """
+    try:
+        spot = float(yahoo_closes(ticker, period="5d").iloc[-1])
+        if np.isfinite(spot) and spot > 0:
+            return spot, f"yfinance {ticker} (ultimo cierre)"
+    except Exception as exc:
+        log_warn(f"{ticker}: yfinance no devolvio precio ({exc}).")
+    spot = spot_paridad_put_call(chain, days_to_expiry, rf_annual)
+    if np.isfinite(spot) and spot > 0:
+        return spot, "paridad put-call de la cadena Polygon"
+    return np.nan, None
+
 def run_options_module_for_ticker(ticker, hv_annual, horizon_days, api_key,
                                    spot_fallback=np.nan, rf_annual=0):
     log_info(f"MODULO 2: procesando cadena de opciones de {ticker}...")
@@ -618,6 +658,20 @@ def run_options_module_for_ticker(ticker, hv_annual, horizon_days, api_key,
         log_warn(f"{ticker}: cadena de opciones no disponible. Se omite del modulo de opciones.")
         raise NoOptionData(NO_OPTION_DATA)
 
+    # Fuente del spot: Polygon (underlying_asset.price), el precio local (solo
+    # tier native, via spot_fallback) o, si faltan ambos, el simbolo US mismo.
+    if chain["spot"].notna().any():
+        spot_source = "polygon underlying_asset.price"
+    elif not pd.isna(spot_fallback):
+        spot_source = "precio local (Yahoo)"
+    else:
+        spot_fallback, spot_source = spot_listado_us(
+            ticker, chain, exp_info["days_to_expiry"], rf_annual)
+    if spot_source is None:
+        log_warn(f"{ticker}: sin spot (Polygon, yfinance ni paridad put-call); IV_ATM quedara NaN.")
+    else:
+        log_info(f"{ticker}: spot de {spot_source}.")
+
     chain = fill_missing_iv_greeks(chain, exp_info["days_to_expiry"], rf_annual, spot_fallback)
 
     exp_move = compute_expected_move(chain, exp_info["days_to_expiry"])
@@ -636,6 +690,7 @@ def run_options_module_for_ticker(ticker, hv_annual, horizon_days, api_key,
         "expiration": exp_info["expiration"],
         "days_to_expiry": exp_info["days_to_expiry"],
         "spot": exp_move["spot"],
+        "spot_source": spot_source,
         "atm_iv": exp_move["atm_iv"],
         "hv_annual": hv_annual,
         "iv_hv_ratio": iv_hv_ratio,
@@ -724,17 +779,34 @@ def run_options_module(tickers, hv_by_asset, weights, horizon_days, api_key,
         })
     summary_tbl = pd.DataFrame(summary_rows)
 
-    available_w = pd.Series(weights)[summary_tbl["Activo"]]
-    available_w = available_w / available_w.sum()
-    if summary_tbl["IV_ATM"].isna().all():
+    # Un solo ticker con IV NaN anulaba portfolio_iv para todo el portafolio:
+    # se agrega solo sobre los que tienen IV valida, renormalizando sus pesos.
+    iv_valida = summary_tbl["IV_ATM"].notna().values
+    iv_coverage = {
+        "tickers_with_iv": [str(tk) for tk in summary_tbl.loc[iv_valida, "Activo"]],
+        "tickers_without_iv": [str(tk) for tk in summary_tbl.loc[~iv_valida, "Activo"]],
+        "weight_coverage": None,
+    }
+    if not iv_valida.any():
         portfolio_iv = np.nan
     else:
-        portfolio_iv = float((summary_tbl["IV_ATM"].values * available_w.values).sum())
+        all_w = pd.Series(weights, dtype=float)
+        valid_w = all_w[summary_tbl.loc[iv_valida, "Activo"]]
+        portfolio_iv = float((summary_tbl.loc[iv_valida, "IV_ATM"].values * valid_w.values).sum()
+                             / valid_w.sum())
+        iv_coverage["weight_coverage"] = float(valid_w.sum() / all_w.sum())
+    if iv_coverage["tickers_without_iv"]:
+        log_warn(
+            "portfolio_iv calculada sin IV de "
+            f"{', '.join(iv_coverage['tickers_without_iv'])} (pesos renormalizados; cobertura "
+            f"{'n/a' if iv_coverage['weight_coverage'] is None else pct(iv_coverage['weight_coverage'])})."
+        )
 
     return {
         "by_asset": results,
         "summary": summary_tbl,
         "portfolio_iv": portfolio_iv,
+        "iv_coverage": iv_coverage,
         "excluded": excluded,
         "instruments": instruments,
     }
@@ -1068,6 +1140,7 @@ def _senal_riesgo(leverage_results, options_module):
             "leverage_min": leverage_min,
             "leverage_max": leverage_max,
             "portfolio_iv": _num(portfolio_iv),
+            "portfolio_iv_coverage": options_module.get("iv_coverage"),
             "by_ticker": by_ticker,
         },
         "excluded": list(options_module.get("excluded") or []),
@@ -1075,8 +1148,16 @@ def _senal_riesgo(leverage_results, options_module):
 
 
 def _fallback_warnings(data):
-    """Avisos de tier proxy / none para la seccion warnings del JSON."""
+    """Avisos de tier proxy / none y de cobertura de portfolio_iv para el JSON."""
     out = []
+    coverage = (data.get("components") or {}).get("portfolio_iv_coverage") or {}
+    if coverage.get("tickers_without_iv"):
+        share = coverage.get("weight_coverage")
+        out.append(
+            f"portfolio_iv excludes {', '.join(coverage['tickers_without_iv'])} (no ATM IV); "
+            "weights renormalised over tickers with IV"
+            + ("" if share is None else f" ({share:.1%} of portfolio weight covered)")
+        )
     for item in (data.get("components") or {}).get("by_ticker") or []:
         tier = item.get("tier")
         if tier == "proxy":

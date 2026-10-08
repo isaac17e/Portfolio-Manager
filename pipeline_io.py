@@ -11,6 +11,7 @@ import copy
 import json
 import math
 import os
+import re
 from datetime import date, datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
@@ -307,11 +308,82 @@ def locate_fills_file(script: str = "entry_signal_tool", directory: str | None =
     return matches[-1]
 
 
+def _file_token(value) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]+", "_", str(value).strip()).strip("_")
+
+
+def run_ts_stamp(run_ts) -> str:
+    """Portfolio ``run_ts`` as a file stamp, ``YYYYMMDDTHHMMSS``.
+
+    Same stamp the portfolio writer uses for ``portfolio_<optimizer>_<stamp>.json``
+    (local wall time of the ISO ``run_ts``, offset dropped). A value that is not
+    ISO-8601 is reduced to ``[A-Za-z0-9_-]``.
+    """
+    text = str(run_ts).strip()
+    try:
+        return datetime.fromisoformat(re.sub(r"Z$", "+00:00", text)).strftime("%Y%m%dT%H%M%S")
+    except ValueError:
+        return _file_token(text)
+
+
+def portfolio_key(portfolio_meta) -> str | None:
+    """``<optimizer>_<run_ts stamp>`` for the portfolio, or None without both."""
+    meta = portfolio_meta or {}
+    optimizer = meta.get("portfolio_optimizer")
+    run_ts = meta.get("portfolio_run_ts")
+    if not optimizer or not run_ts:
+        return None
+    optimizer, stamp = _file_token(optimizer), run_ts_stamp(run_ts)
+    if not optimizer or not stamp:
+        return None
+    return f"{optimizer}_{stamp}"
+
+
+def portfolio_fills_path(portfolio_meta, directory: str | None = None) -> str | None:
+    """``<EXECUTIONS_DIR>/fills_<optimizer>_<run_ts stamp>.json``, or None."""
+    key = portfolio_key(portfolio_meta)
+    if key is None:
+        return None
+    directory = executions_dir() if directory is None else directory
+    return os.path.join(directory, f"fills_{key}.json")
+
+
+def load_portfolio_fills(portfolio_meta, directory: str | None = None):
+    """Read only the fills file of this portfolio, or return None. Never raises."""
+    path = portfolio_fills_path(portfolio_meta, directory)
+    if not path or not os.path.isfile(path):
+        return None
+    return _read_fills(path)
+
+
+def pipeline_dir() -> str:
+    """``PIPELINE_DIR``, else the parent of ``SIGNALS_OUT_DIR``."""
+    explicit = os.environ.get("PIPELINE_DIR")
+    if explicit:
+        return explicit
+    signals = os.environ.get("SIGNALS_OUT_DIR", DEFAULT_SIGNALS_DIR)
+    return os.path.dirname(os.path.abspath(signals))
+
+
+def entry_state_path(portfolio_meta) -> str:
+    """Entry state of this portfolio: ``ENTRY_STATE_FILE``, else
+    ``<pipeline dir>/state/entry_state_<optimizer>_<run_ts stamp>.json``."""
+    explicit = os.environ.get("ENTRY_STATE_FILE")
+    if explicit:
+        return explicit
+    key = portfolio_key(portfolio_meta) or "hardcoded_fallback"
+    return os.path.join(pipeline_dir(), "state", f"entry_state_{key}.json")
+
+
 def load_fills(script: str = "entry_signal_tool", directory: str | None = None):
     """Read a fills document or return None. Never raises."""
     path = locate_fills_file(script, directory)
     if not path:
         return None
+    return _read_fills(path)
+
+
+def _read_fills(path: str):
     try:
         with open(path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
