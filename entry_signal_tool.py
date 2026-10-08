@@ -15,6 +15,7 @@ from gex_utils import gamma_flip_level
 from polygon_client import NO_OPTION_DATA, NoOptionData, PolygonClient, failure_reason
 from pipeline_io import (
     apply_entry_fills,
+    cycle_today,
     entry_state_path,
     export_signals,
     load_fills,
@@ -25,6 +26,7 @@ from pipeline_io import (
     resolve_cycle_day,
     signal_cycle_number,
     stage_pending_entry,
+    tranche_lock,
 )
 from price_signals import price_indicators, price_scores, yahoo_closes
 from tickers import exclusion_warnings, no_options_weight_cap, resolve_instrument, to_polygon
@@ -134,6 +136,8 @@ def _estado_vacio():
         "pending_targets": {},
         "pending_cash": {},
         "pending_decisions": {},
+        "last_tranche_date": None,
+        "last_tranche": None,
         "activos": {ticker: _activo_vacio() for ticker in TICKERS},
     }
 
@@ -195,7 +199,11 @@ def cargar_fills():
 def parse_entry_args(argv=None):
     parser = argparse.ArgumentParser(description="Score de conviccion para entrada en portafolio")
     parser.add_argument("--cycle-day", type=int, default=None,
-                        help=f"dia del ciclo 1..{DIAS_CICLO} (si no, ENTRY_CYCLE_DAY o el estado del portafolio)")
+                        help=f"dia del ciclo 1..{DIAS_CICLO} (si no, ENTRY_CYCLE_DAY o el estado del portafolio). "
+                             "Un dia explicito valido salta el bloqueo del mismo dia.")
+    parser.add_argument("--force-new-tranche", action="store_true",
+                        help="prepara un tramo nuevo aunque ya exista uno de hoy (America/Bogota); "
+                             "env ENTRY_FORCE_NEW_TRANCHE=1")
     parser.add_argument("--invested-pct", default=None,
                         help="%% ya invertido: '40', 'GLD=40,KO=0.25' o JSON. "
                              "Por defecto, el estado del portafolio. No marca la posicion como ejecutada.")
@@ -760,8 +768,10 @@ def graficar_resumen(resumen):
 
 # ---------------- EJECUCION PRINCIPAL ----------------
 
-def _contexto(estado, warnings, excluded, dia_ciclo, ciclo, pending_cash=None, pending_decisions=None):
+def _contexto(estado, warnings, excluded, dia_ciclo, ciclo, pending_cash=None, pending_decisions=None,
+              locked=None):
     return {
+        "locked": locked,
         "estado": estado,
         "warnings": warnings,
         "excluded": excluded,
@@ -860,8 +870,13 @@ def construir_fila_estado(fila, pct_previo, peso_original, dia_ciclo, ciclo, his
     }
 
 
-def correr_entry_signal(cycle_day=None, invested_pct=None):
+def correr_entry_signal(cycle_day=None, invested_pct=None, force_new_tranche=False):
     """Calcula la senal del dia. No marca el estado del portafolio como invertido.
+
+    Bloqueo del mismo dia: si el estado ya registra un tramo preparado hoy
+    (America/Bogota, pendiente o ejecutado) no se prepara otro y ctx["locked"]
+    describe ese tramo. force_new_tranche o un dia de ciclo explicito valido
+    lo saltan.
 
     Los porcentajes ya invertidos solo cambian si hay un fills file cuyo
     signal_run_ts coincide con la senal pendiente. El dia y el % invertido de
@@ -873,7 +888,10 @@ def correr_entry_signal(cycle_day=None, invested_pct=None):
 
     estado = cargar_estado()
     fills_payload = cargar_fills()
-    estado, fills_applied = apply_entry_fills(estado, fills_payload, cycle_length=DIAS_CICLO)
+    hoy = cycle_today()
+    estado, fills_applied = apply_entry_fills(
+        estado, fills_payload, cycle_length=DIAS_CICLO, today=hoy.isoformat(),
+    )
     if fills_applied:
         guardar_estado(estado)
         print(f"Fills confirmados: {ruta_estado()} avanza con la ejecucion.")
@@ -885,6 +903,21 @@ def correr_entry_signal(cycle_day=None, invested_pct=None):
         )
 
     dia_ciclo, day_warn = resolve_cycle_day(cycle_day, estado, DIAS_CICLO)
+    dia_explicito = cycle_day is not None and str(cycle_day).strip() != "" and not day_warn
+    bloqueo = None if (force_new_tranche or dia_explicito) else tranche_lock(estado, hoy)
+    if bloqueo:
+        aviso = (
+            f"already_prepared_today: el tramo del {bloqueo['prepared_date']} "
+            f"({bloqueo['status']}) ya existe; no se prepara otro. "
+            "Use --force-new-tranche o un dia de ciclo explicito para saltar el bloqueo."
+        )
+        if day_warn:
+            warnings.append(day_warn)
+        warnings.append(aviso)
+        print(f"\n{aviso}")
+        return pd.DataFrame(), hist_df, _contexto(
+            estado, warnings, excluded, dia_ciclo, estado.get("ciclo"), locked=bloqueo,
+        )
     if day_warn:
         warnings.append(day_warn)
         print(f"  {day_warn}")
@@ -1059,13 +1092,52 @@ def construir_senal_entrada(resumen):
     }
 
 
+def construir_senal_bloqueada(bloqueo):
+    """Senal de un dia con tramo ya preparado: sin entries nuevas.
+
+    ``entries`` queda vacio para que ningun ejecutor repita el tramo; el tramo
+    existente va en ``existing_tranche`` con su signal_run_ts original, que es
+    el que debe llevar su fills file.
+    """
+    tramo = bloqueo.get("tranche") or {}
+    return {
+        "signal": "already_prepared_today",
+        "tranche_status": bloqueo["status"],
+        "prepared_date": bloqueo["prepared_date"],
+        "existing_signal_run_ts": bloqueo.get("signal_run_ts"),
+        "entries": [],
+        "waiting": [],
+        "existing_tranche": {
+            "entries": tramo.get("entries") or [],
+            "waiting": tramo.get("waiting") or [],
+        },
+        "cycle_day": tramo.get("cycle_day"),
+        "cycle": tramo.get("cycle"),
+        "excluded": [],
+    }
+
+
+def _truthy(valor):
+    return str(valor or "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def main(argv=None):
     args = parse_entry_args(argv)
     cycle_day = args.cycle_day if args.cycle_day is not None else os.environ.get("ENTRY_CYCLE_DAY")
     invested = args.invested_pct if args.invested_pct is not None else os.environ.get("ENTRY_INVESTED_PCT")
-    resumen, _historial, ctx = correr_entry_signal(cycle_day, invested)
+    force_new = args.force_new_tranche or _truthy(os.environ.get("ENTRY_FORCE_NEW_TRANCHE"))
+    resumen, _historial, ctx = correr_entry_signal(cycle_day, invested, force_new_tranche=force_new)
+    if ctx.get("locked"):
+        # Nada que preparar: se escribe la senal con el estado y no se toca el
+        # estado del portafolio (el tramo pendiente conserva su signal_run_ts).
+        export_signals(
+            "entry_signal_tool", construir_senal_bloqueada(ctx["locked"]), _PORTFOLIO_META,
+            warnings=ctx["warnings"],
+        )
+        return
     imprimir_resumen(resumen)
     data = construir_senal_entrada(resumen)
+    data["signal"] = "new_tranche"
     if data.get("cycle_day") is None:
         data["cycle_day"] = ctx["cycle_day"]
         data["cycle"] = ctx["cycle"]
@@ -1085,9 +1157,13 @@ def main(argv=None):
                 for entry in data["entries"]
                 if entry.get("target_weight")
             }
+            # Sin datos de ningun ticker no hubo tramo real: no se bloquea el dia.
+            produjo_tramo = len(resumen) > 0
             guardar_estado(stage_pending_entry(
                 ctx["estado"], run_ts, data.get("cycle_day"), data.get("cycle"),
                 targets, ctx["pending_cash"], ctx["pending_decisions"],
+                prepared_date=cycle_today().isoformat() if produjo_tramo else None,
+                tranche={key: data[key] for key in ("entries", "waiting", "cycle_day", "cycle")},
             ))
     fig_resumen = graficar_resumen(resumen)
     if fig_resumen is not None:

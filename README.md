@@ -180,9 +180,13 @@ One command validates the portfolio file, runs each script as a subprocess of th
 
 Daily mode is the default. The steps run in this order: `fundamental_analysis`, `portfolio_risk_score_leverage`, `portfolio_gex_field` (`--once` and `HEADLESS=1`), `portfolio_vix` (`--no-show`, so the cycle does not open the report window), `entry_signal_tool`. The entry tool is not passed a cycle day: it uses `ENTRY_CYCLE_DAY` / `ENTRY_INVESTED_PCT` when those are set, otherwise the portfolio's entry state (see [Entry state and fills](#entry-state-and-fills)), and it does not call `input()`.
 
+Daily mode only runs on an NYSE session. The date is the America/Bogota date (override with `--date`); if it is a weekend or an NYSE holiday the run exits 0 with status `not_due` and reason `non_trading_day`, and the summary is written as in weekly mode. `--force` skips this check. There is no time-of-day rule: a run after the close still counts as that session's day, but the summary gets a warning (`run after NYSE close (16:00 ET on <date>); it counts as that session's day`). The close comes from the calendar, so early closes (13:00 ET) are honoured, with 16:00 ET as the fallback. The warning only applies when the date is today, not on a `--date` replay.
+
 ```bash
 python run_cycle.py --portfolio /workspace/pipeline/portfolio/portfolio_latest.json
 ```
+
+Idempotent entry tranches: `entry_signal_tool` prepares at most one tranche per America/Bogota day (see [Same-day lock](#same-day-lock)), so a second daily run the same day does not open the next cycle day. `run_cycle` exports its date to every step as `CYCLE_DATE` and otherwise passes the environment through unchanged (`RISK_FREE_RATE`, `ENTRY_CYCLE_DAY`, ...).
 
 Weekly mode runs only `active_management`. Schedule that command every day; the script decides whether today is the session to run. Today is the America/Bogota date (override with `--date YYYY-MM-DD`). It runs when that date is an NYSE session, it is the first NYSE session of its ISO week, and the weekly cycle has not already succeeded in that week. A Monday holiday (Labor Day, Memorial Day) therefore runs on the next session of that week, which is Tuesday. Columbus Day does not close the NYSE, so that week stays on Monday. The last success is stored in `/workspace/pipeline/state/weekly_last_run.json` and is updated only after every weekly step succeeds.
 
@@ -200,10 +204,11 @@ python run_cycle.py --weekly --portfolio /workspace/pipeline/portfolio/portfolio
 | `--weekly-state` / `WEEKLY_STATE_FILE` | `/workspace/pipeline/state/weekly_last_run.json` | Last successful weekly run date. |
 | `--timeout` / `CYCLE_STEP_TIMEOUT` | `1800` | Seconds allowed for each step. |
 | `--weekly` | off | Only `active_management`, plus the calendar and horizon checks. |
-| `--date YYYY-MM-DD` | today in America/Bogota | Date used for the horizon and the weekly due check. |
-| `--force` | off | Bypass the weekly due check. |
+| `--date YYYY-MM-DD` | today in America/Bogota | Date used for the horizon, the NYSE session check and the weekly due check. Also exported to the steps as `CYCLE_DATE`. |
+| `--force` | off | Bypass the weekly due check, or the daily NYSE session check. `horizon_end` still applies to weekly. |
+| `--force-new-tranche` | off | Sets `ENTRY_FORCE_NEW_TRANCHE=1` for `entry_signal_tool`, so it prepares a new tranche even if one was already prepared today. |
 | `--dry-run` | off | Print the plan, or the skip reason, and write nothing. |
-| `--steps a,b` | the mode's full list | Subset of the known scripts, always in canonical order. |
+| `--steps a,b` | the mode's full list | Subset of the known scripts, always in canonical order. Aliases: `fundamental`, `risk` (`portfolio_risk_score_leverage`), `gex`, `vix`, `entry`. |
 
 The portfolio file must be schema version 1, with `run_ts`, `optimizer`, weights that sum to about 1 (absolute tolerance `0.0001`), and the same names in `tickers` and `weights`. `horizon_end` is `YYYY-MM-DD` or null.
 
@@ -213,9 +218,9 @@ The summary's `scalars` include `target_leverage`, `risk_score`, `vix_portfolio`
 
 Exit codes: `0` success, not due, skipped after the horizon, or dry-run; `1` invalid portfolio, step failure, stale or mismatched signal, timeout, missing NYSE calendar, or a summary/state write error; `2` bad arguments.
 
-The weekly calendar is `pandas_market_calendars` (NYSE), or `exchange_calendars` (`XNYS`) if only that package is installed. Import is lazy. If neither is installed the weekly run exits 1 and names the missing library. The calendars are local; the check does not use the network. `--force` does not need the calendar.
+The calendar (weekly due check, daily session check, early-close lookup) is `pandas_market_calendars` (NYSE), or `exchange_calendars` (`XNYS`) if only that package is installed. Import is lazy. If neither is installed a weekly run, or a daily run without `--force`, exits 1 and names the missing library. The calendars are local; the check does not use the network. `--force` does not need the calendar.
 
-Not-due reasons, printed as `not_due: <reason> (YYYY-MM-DD)`: `non_trading_day`, `not_first_trading_day_of_week`, `already_ran_this_week`.
+Not-due reasons, printed as `not_due: <reason> (YYYY-MM-DD)`: `non_trading_day` (daily and weekly), `not_first_trading_day_of_week`, `already_ran_this_week`.
 
 ## Pipeline signals
 
@@ -231,12 +236,19 @@ Each script also writes a JSON signal (contract section 4) through `pipeline_io.
 | `ENTRY_STATE_FILE` | `<PIPELINE_DIR>/state/entry_state_<optimizer>_<run_ts>.json` |
 | `ENTRY_CYCLE_DAY` | next day from the entry state |
 | `ENTRY_INVESTED_PCT` | percents already stored in the entry state |
+| `ENTRY_FORCE_NEW_TRANCHE` | unset (`1` = same as `--force-new-tranche`) |
+| `CYCLE_DATE` | unset = today in America/Bogota (`YYYY-MM-DD`; `run_cycle` sets it from `--date`) |
+| `RISK_FREE_RATE` | unset = each script's own default (see [Risk-free rate](#risk-free-rate)) |
 | `HEADLESS` or `GEX_ONCE` | unset (set to `1` for the GEX pipeline run) |
 | `ENTRY_STAGGER_PCT` | `0.20` (tier `none`: share of the target bought per cycle day) |
 | `NO_OPTIONS_WEIGHT_CAP_FACTOR` | `0.5` (tier `none`: target weight x factor) |
 | `NO_OPTIONS_WEIGHT_CAP` | unset (tier `none`: optional absolute weight cap) |
 
-CLI equivalents: `entry_signal_tool.py --cycle-day` and `--invested-pct` (env is used when the flag is omitted). `portfolio_gex_field.py --once` is the same switch as `HEADLESS=1` or `GEX_ONCE=1`.
+CLI equivalents: `entry_signal_tool.py --cycle-day`, `--invested-pct` and `--force-new-tranche` (env is used when the flag is omitted). `portfolio_gex_field.py --once` is the same switch as `HEADLESS=1` or `GEX_ONCE=1`.
+
+### Risk-free rate
+
+`RISK_FREE_RATE` (annual decimal, `0 <= rf < 0.5`, e.g. `0.052`) overrides the scalar risk-free rate of `active_management` (default `0.046`), `portfolio_risk_score_leverage` (`0.046`), `portfolio_gex_field` (`0.05`) and `portfolio_vix` (`0.045`; its `--r` flag still wins over the env). Unset or blank keeps each script's default, so behaviour is unchanged without it. A value that is not a number or is out of range stops the script with a clear error (`pipeline_io.resolve_risk_free_rate`, the same helper as AM-PM-Architecture). Each of those scripts records the rate it used as `data.risk_free_rate` in its signal. `entry_signal_tool` and `fundamental_analysis` use no risk-free rate.
 
 ### Ticker symbols
 
@@ -285,13 +297,36 @@ Envelope:
 
 `data` by script:
 
-- **`entry_signal_tool`** — buys only, highest conviction first. `entries[]`: `order`, `ticker`, `action` (`"BUY"`), `target_weight`, `tranche_weight` (today's slice of the portfolio), `signal` (`high_conviction` ≥ 75, `medium_conviction` 40–75, `low_conviction`, or `cycle_close` on a day-5 buy), `score`, `reason`. Tickers with no buy today are `waiting[]` (`ticker`, `score`, `reason`). Also `cycle_day`, `cycle`, and `excluded`.
-- **`active_management`** — `rebalances[]`: `ticker`, `action` (`BUY` / `SELL` / `HOLD` from the sign of `target_weight - current_weight`; `CASH` is included, and `BUY` there means a larger cash reserve), `current_weight`, `target_weight`, `delta_weight`, `reason`, `tactical_action` (`AUMENTAR`, `RECORTAR`, `LIQUIDAR`, `MANTENER`, `RESERVA_TACTICA`). `regime` is `normal`, `insufficient_history`, `stress`, `diversification_collapse`, or `stress+diversification_collapse`. Also `regime_state`, `regime_alerts`, `vol_portfolio`, `diversification_ratio`, and `excluded`. `portfolio_risk_history.csv` stays an observation log of volatility and diversification. It is not an execution ledger and is not gated on fills.
-- **`portfolio_risk_score_leverage`** — `target_leverage` and `risk_score` are the weight-weighted means of the per-asset leverage (2x–5x) and risk score (0–100). `components`: `score_weights` (`hv`, `cvar`, `iv`, `gex_pcr`), `leverage_min`, `leverage_max`, `portfolio_iv`, `portfolio_iv_coverage` (`tickers_with_iv`, `tickers_without_iv`, `weight_coverage`), and `by_ticker[]` (`ticker`, `weight`, `risk_score`, `leverage`, `effective_exposure`, `hv`, `cvar`, `iv`, `gex_total`, `pcr_oi`). Also `excluded`. `portfolio_iv` is the weighted ATM IV over the tickers that have one (weights renormalised); a ticker without IV is listed in `portfolio_iv_coverage` and in `warnings` instead of turning `portfolio_iv` into null. The chain's spot is Polygon's `underlying_asset.price`; the local price is a fallback only for tier `native`. For an `adr` / `proxy` symbol with no Polygon spot (options-only plan, no stock snapshots) the spot is the yfinance last close of the US symbol itself (`RY`, never `RY.TO` in CAD), then the put-call-parity forward of the same chain (`portfolio_vix.CBOEVarianceEngine.implied_forward`, discounted). Polygon stock endpoints are never called. The log names the source used.
-- **`portfolio_gex_field`** — one file per refresh, including the single `--once` run. Scalars: `macro_y`, `potential_z`, `grad_x`, `grad_y`, `grad_magnitude`, `n_holdings`. `holdings[]`: `ticker`, `weight`, `price`, `expected_move`, `total_gex`, `regime`, `gamma_flip`, `call_wall`, `put_wall`. Also `excluded`.
-- **`portfolio_vix`** — `vix_portfolio`, `sigma_portfolio_30d`, `source`, `vol_method`, `corr_method`, `metrics` (the engine scalars: `VIX_portfolio`, `sigma_portfolio_30d`, `VIX_medio_ponderado`, `ratio_diversificacion`, `beneficio_diversificacion_pts`, `correlacion_implicita_media`) and `holdings[]` (`ticker`, `weight`, `vix`, `sigma_30d`, `mcr`, `ctr`, `ctr_vix_pts`, `ctr_pct`). Also `excluded`. `--tickers` / `--weights` and `EQUAL_WEIGHTS` replace `weights_used`. When nothing can be valued, `vix_portfolio` is null and `holdings` is empty; the process still writes the signal.
+- **`entry_signal_tool`** — buys only, highest conviction first. `entries[]`: `order`, `ticker`, `action` (`"BUY"`), `target_weight`, `tranche_weight` (today's slice of the portfolio), `signal` (`high_conviction` ≥ 75, `medium_conviction` 40–75, `low_conviction`, or `cycle_close` on a day-5 buy), `score`, `reason`. Tickers with no buy today are `waiting[]` (`ticker`, `score`, `reason`). Also `signal` (`new_tranche`, or `already_prepared_today` — see [Same-day lock](#same-day-lock)), `cycle_day`, `cycle`, and `excluded`.
+- **`active_management`** — `rebalances[]`: `ticker`, `action` (`BUY` / `SELL` / `HOLD` from the sign of `target_weight - current_weight`; `CASH` is included, and `BUY` there means a larger cash reserve), `current_weight`, `target_weight`, `delta_weight`, `reason`, `tactical_action` (`AUMENTAR`, `RECORTAR`, `LIQUIDAR`, `MANTENER`, `RESERVA_TACTICA`). `regime` is `normal`, `insufficient_history`, `stress`, `diversification_collapse`, or `stress+diversification_collapse`. Also `regime_state`, `regime_alerts`, `vol_portfolio`, `diversification_ratio`, `risk_free_rate`, and `excluded`. `portfolio_risk_history.csv` stays an observation log of volatility and diversification. It is not an execution ledger and is not gated on fills.
+- **`portfolio_risk_score_leverage`** — `target_leverage` and `risk_score` are the weight-weighted means of the per-asset leverage (2x–5x) and risk score (0–100). `components`: `score_weights` (`hv`, `cvar`, `iv`, `gex_pcr`), `leverage_min`, `leverage_max`, `portfolio_iv`, `portfolio_iv_coverage` (`tickers_with_iv`, `tickers_without_iv`, `weight_coverage`), and `by_ticker[]` (`ticker`, `weight`, `risk_score`, `leverage`, `effective_exposure`, `hv`, `cvar`, `iv`, `gex_total`, `pcr_oi`). Also `risk_free_rate` and `excluded`. `portfolio_iv` is the weighted ATM IV over the tickers that have one (weights renormalised); a ticker without IV is listed in `portfolio_iv_coverage` and in `warnings` instead of turning `portfolio_iv` into null. The chain's spot is Polygon's `underlying_asset.price`; the local price is a fallback only for tier `native`. For an `adr` / `proxy` symbol with no Polygon spot (options-only plan, no stock snapshots) the spot is the yfinance last close of the US symbol itself (`RY`, never `RY.TO` in CAD), then the put-call-parity forward of the same chain (`portfolio_vix.CBOEVarianceEngine.implied_forward`, discounted). Polygon stock endpoints are never called. The log names the source used.
+- **`portfolio_gex_field`** — one file per refresh, including the single `--once` run. Scalars: `macro_y`, `potential_z`, `grad_x`, `grad_y`, `grad_magnitude`, `n_holdings`. `holdings[]`: `ticker`, `weight`, `price`, `expected_move`, `total_gex`, `regime`, `gamma_flip`, `call_wall`, `put_wall`. Also `risk_free_rate` and `excluded`.
+- **`portfolio_vix`** — `vix_portfolio`, `sigma_portfolio_30d`, `source`, `vol_method`, `corr_method`, `risk_free_rate`, `metrics` (the engine scalars: `VIX_portfolio`, `sigma_portfolio_30d`, `VIX_medio_ponderado`, `ratio_diversificacion`, `beneficio_diversificacion_pts`, `correlacion_implicita_media`) and `holdings[]` (`ticker`, `weight`, `vix`, `sigma_30d`, `mcr`, `ctr`, `ctr_vix_pts`, `ctr_pct`). Also `excluded`. `--tickers` / `--weights` and `EQUAL_WEIGHTS` replace `weights_used`. When nothing can be valued, `vix_portfolio` is null and `holdings` is empty; the process still writes the signal.
 
 - **`fundamental_analysis`** — `n_tickers`, `n_indicators` (12), `score_green_min` (9), `score_medium_min` (6). `holdings[]`: `ticker`, `score_quality`, `n_green`, `n_indicators`, `rating` (`Luz Verde Global`, `Calidad Media`, `Señal de Alerta Global`), `incomplete`, `metrics` (the scorecard numbers) and `signals` (the traffic-light column for each indicator).
+
+### Same-day lock
+
+The entry state records `last_tranche_date` (America/Bogota, or `CYCLE_DATE`) and `last_tranche` (the entries and waiting that were emitted, with their `signal_run_ts`) when a tranche is prepared. Both survive the fills being applied. If a tranche dated today already exists, pending or executed, `entry_signal_tool` does not prepare another: it still applies any fills that have arrived, writes the signal file and exits 0 with
+
+```json
+"data": {
+  "signal": "already_prepared_today",
+  "tranche_status": "pending",
+  "prepared_date": "2026-10-08",
+  "existing_signal_run_ts": "2026-10-08T11:05:16-05:00",
+  "entries": [],
+  "waiting": [],
+  "existing_tranche": {"entries": [], "waiting": []},
+  "cycle_day": 1,
+  "cycle": 1,
+  "excluded": []
+}
+```
+
+`tranche_status` is `pending` (fills not applied yet) or `executed`. `entries` is empty on purpose so an executor cannot repeat the tranche; the earlier tranche is under `existing_tranche`, and its fills file must keep the `existing_signal_run_ts`. The state is not changed, the history CSV is not touched, and the envelope keeps the right `portfolio_source` / `portfolio_run_ts`, so `run_cycle` accepts it (and reports `entry_signal` and `entry_tranche_status` in its `scalars`). Normal runs carry `"signal": "new_tranche"`. The next calendar day prepares the next cycle day as before.
+
+Bypass the lock with `--force-new-tranche` / `ENTRY_FORCE_NEW_TRANCHE=1`, or by naming the day explicitly with `--cycle-day` / `ENTRY_CYCLE_DAY` (a valid day 1..5; an invalid or blank value does not bypass). A run that produced no data for any ticker does not lock the day, so it can be retried. States written before this change have no date and are not locked.
 
 ### Entry state and fills
 

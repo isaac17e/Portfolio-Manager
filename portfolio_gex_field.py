@@ -18,7 +18,7 @@ from scipy.optimize import brentq
 from scipy.interpolate import interp1d
 from scipy.ndimage import gaussian_filter1d
 from datetime import datetime, timedelta
-from pipeline_io import export_signals, load_portfolio
+from pipeline_io import export_signals, load_portfolio, resolve_risk_free_rate
 from gex_utils import gamma_flip_level
 from polygon_client import NO_OPTION_DATA, PolygonClient, PolygonError, failure_reason
 from tickers import (
@@ -44,7 +44,7 @@ BASE_URL = "https://api.polygon.io"
 TIME_HORIZON_MONTHS = 2
 MAX_EXPIRATIONS_CAP = 60
 BASE_STRIKE_RANGE_PCT = 0.08
-RISK_FREE_RATE = 0.05
+RISK_FREE_RATE = resolve_risk_free_rate(0.05)  # env RISK_FREE_RATE
 NEAR_ATM_BAND_PCT = 0.03
 IV_SANITY_MIN, IV_SANITY_MAX = 0.01, 2.50
 DIVIDEND_YIELD_FALLBACK = 0.0
@@ -1346,6 +1346,7 @@ def run_live(refresh_seconds=REFRESH_SECONDS, max_iterations=MAX_ITERATIONS,
 
         excluded = list(_LAST_EXCLUDED)
         data = _senal_gex(result or {}, excluded)
+        data["risk_free_rate"] = RISK_FREE_RATE
         export_signals(
             "portfolio_gex_field", data, _PORTFOLIO_META,
             warnings=exclusion_warnings(excluded) + adr_warnings(PORTFOLIO_HOLDINGS),
@@ -1399,6 +1400,7 @@ def run_headless(output_path=OUTPUT_HTML_PATH):
     result = run_once()
     excluded = list(_LAST_EXCLUDED)
     data = _senal_gex(result or {}, excluded)
+    data["risk_free_rate"] = RISK_FREE_RATE
     export_signals(
         "portfolio_gex_field", data, _PORTFOLIO_META,
         warnings=exclusion_warnings(excluded) + adr_warnings(PORTFOLIO_HOLDINGS),

@@ -15,7 +15,7 @@ from plotly.subplots import make_subplots
 
 from gex_utils import gamma_flip_level
 from polygon_client import NoOptionData, PolygonClient, PolygonError, failure_reason
-from pipeline_io import export_signals, load_portfolio
+from pipeline_io import export_signals, load_portfolio, resolve_risk_free_rate
 from tickers import adr_warnings, exclusion_warnings, options_exclusion, options_underlying, to_polygon
 
 # ============================================================================
@@ -44,7 +44,7 @@ load_dotenv()
 polygon_api_key = os.environ.get("POLYGON_API_KEY")
 cash_reserve_limit      = 0.30
 
-risk_free_rate           = 0.046
+risk_free_rate           = resolve_risk_free_rate(0.046)  # env RISK_FREE_RATE
 dividend_yield           = 0.00
 otm_uoa_vol_oi_threshold = 3.0
 strike_window_pct        = 0.15
@@ -2059,6 +2059,7 @@ def _senal_gestion_activa(resultado):
 
 resultado = run_active_management_engine(portfolio, investment_horizon_days, polygon_api_key, cash_reserve_limit)
 _senal_activa = _senal_gestion_activa(resultado)
+_senal_activa["risk_free_rate"] = risk_free_rate
 export_signals(
     "active_management", _senal_activa, _PORTFOLIO_META,
     warnings=exclusion_warnings(_senal_activa.get("excluded")) + adr_warnings(list(portfolio.keys())),

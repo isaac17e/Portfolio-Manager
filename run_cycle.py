@@ -1,11 +1,17 @@
 """Run the Portfolio-Manager cycle with one command.
 
-Daily mode validates the portfolio file and runs, in order,
+Daily mode validates the portfolio file, checks that the America/Bogota date
+(or ``--date``) is an NYSE session (``--force`` skips this), and runs, in order,
 ``fundamental_analysis``, ``portfolio_risk_score_leverage``,
 ``portfolio_gex_field`` (``--once`` and ``HEADLESS=1``), ``portfolio_vix``
 (``--no-show``), and ``entry_signal_tool``. Weekly mode runs only
 ``active_management``, and only on the first NYSE session of the ISO week
 that has not already succeeded.
+
+``entry_signal_tool`` prepares at most one tranche per day (see its same-day
+lock); run_cycle exports the cycle date to every step as ``CYCLE_DATE`` and
+passes the rest of the environment through unchanged (``RISK_FREE_RATE``,
+``ENTRY_CYCLE_DAY``, ...). ``--force-new-tranche`` bypasses that lock.
 
 Each step is a subprocess of this interpreter (``sys.executable``). Stdin is
 ``DEVNULL``. After a step exits 0, ``<SIGNALS_OUT_DIR>/<script>.json`` must
@@ -14,7 +20,8 @@ portfolio path and ``portfolio_run_ts`` equal to the portfolio ``run_ts``.
 ``hardcoded_fallback`` is a failure. The first failure stops the cycle.
 
 Exit codes:
-    0  success, weekly not due, skipped after horizon_end, or dry-run
+    0  success, not due (weekly, or daily on a non-trading day), skipped
+       after horizon_end, or dry-run
     1  invalid portfolio, step failure, bad signal file, timeout,
        missing NYSE calendar, or a summary/state write error
     2  invalid arguments
@@ -30,10 +37,11 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 BOGOTA = ZoneInfo("America/Bogota")
+NEW_YORK = ZoneInfo("America/New_York")
 SCHEMA_VERSION = 1
 WEIGHT_SUM_TOLERANCE = 1e-4
 DEFAULT_TIMEOUT = 1800.0
@@ -51,12 +59,20 @@ DAILY_STEPS = [
 ]
 WEEKLY_STEPS = ["active_management"]
 ALL_STEPS = DAILY_STEPS + WEEKLY_STEPS
+STEP_ALIASES = {
+    "fundamental": "fundamental_analysis",
+    "risk": "portfolio_risk_score_leverage",
+    "gex": "portfolio_gex_field",
+    "vix": "portfolio_vix",
+    "entry": "entry_signal_tool",
+}
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
 _EXIT_HELP = """
 exit codes:
-  0  success, weekly not due, skipped after horizon_end, or dry-run
+  0  success, not due (weekly, or daily on a non-trading day), skipped
+     after horizon_end, or dry-run
   1  invalid portfolio, step failure, bad/stale signal, timeout,
      missing NYSE calendar, or summary/state write error
   2  invalid arguments
@@ -65,6 +81,13 @@ weekly due check (America/Bogota date, or --date): today is an NYSE session,
 it is the first session of its ISO week, and this week's weekly cycle has not
 already succeeded. A holiday Monday therefore runs on the next session of that
 week. --force skips this check and still respects horizon_end.
+
+daily check (America/Bogota date, or --date): today must be an NYSE session,
+otherwise the run is not_due (non_trading_day). --force skips this check. There
+is no time-of-day rule: a run after the close counts as that session's day and
+only adds a warning.
+
+step aliases for --steps: fundamental, risk, gex, vix, entry.
 """.strip()
 
 
@@ -90,6 +113,10 @@ def _now_bogota() -> datetime:
 
 def _today_bogota() -> date:
     return datetime.now(BOGOTA).date()
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _invalid(message: str) -> None:
@@ -168,7 +195,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="run the weekly cycle even when it is not due; horizon_end still applies",
+        help="run even when not due: the weekly due check, or the daily "
+        "non-trading-day check; horizon_end still applies",
+    )
+    parser.add_argument(
+        "--force-new-tranche",
+        action="store_true",
+        help="let entry_signal_tool prepare a new tranche even if one was already "
+        "prepared today (sets ENTRY_FORCE_NEW_TRANCHE=1 for that step; an explicit "
+        "ENTRY_CYCLE_DAY also bypasses the lock)",
     )
     parser.add_argument(
         "--dry-run",
@@ -178,7 +213,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--steps",
         default=None,
-        help="comma-separated subset of steps, executed in canonical order",
+        help="comma-separated subset of steps, executed in canonical order "
+        "(aliases: " + ", ".join(f"{k}={v}" for k, v in STEP_ALIASES.items()) + ")",
     )
     return parser
 
@@ -208,7 +244,11 @@ def resolve_timeout(args: argparse.Namespace) -> float:
 def select_steps(weekly: bool, steps_arg: str | None) -> list[str]:
     if steps_arg is None:
         return list(WEEKLY_STEPS if weekly else DAILY_STEPS)
-    names = [part.strip() for part in steps_arg.split(",") if part.strip()]
+    names = [
+        STEP_ALIASES.get(part.strip(), part.strip())
+        for part in steps_arg.split(",")
+        if part.strip()
+    ]
     if not names:
         raise UsageError("`--steps` is empty")
     unknown = [name for name in names if name not in ALL_STEPS]
@@ -216,6 +256,7 @@ def select_steps(weekly: bool, steps_arg: str | None) -> list[str]:
         raise UsageError(
             "unknown step(s): " + ", ".join(unknown)
             + ". Known steps: " + ", ".join(ALL_STEPS)
+            + ". Aliases: " + ", ".join(f"{k}={v}" for k, v in STEP_ALIASES.items())
         )
     selected = set(names)
     return [name for name in ALL_STEPS if name in selected]
@@ -344,12 +385,26 @@ def build_command(script: str) -> list[str]:
     return command
 
 
-def step_environment(portfolio_path: str, signals_dir: str, script: str) -> dict:
-    """Parent environment plus the portfolio and signal locations for this step."""
+def step_environment(
+    portfolio_path: str,
+    signals_dir: str,
+    script: str,
+    as_of: date | None = None,
+    force_new_tranche: bool = False,
+) -> dict:
+    """Parent environment plus the portfolio, signal locations and cycle date.
+
+    Everything else (``RISK_FREE_RATE``, ``ENTRY_CYCLE_DAY``, ...) is inherited
+    unchanged. ``CYCLE_DATE`` makes the steps use the same day as ``--date``.
+    """
     env = os.environ.copy()
     env["PORTFOLIO_FILE"] = portfolio_path
     env["SIGNALS_OUT_DIR"] = signals_dir
     env["PYTHONUNBUFFERED"] = "1"
+    if as_of is not None:
+        env["CYCLE_DATE"] = as_of.isoformat()
+    if force_new_tranche and script == "entry_signal_tool":
+        env["ENTRY_FORCE_NEW_TRANCHE"] = "1"
     if script == "portfolio_gex_field":
         env["HEADLESS"] = "1"
     return env
@@ -388,6 +443,59 @@ def nyse_session_dates(start: date, end: date) -> list[date]:
     calendar = xcals.get_calendar("XNYS")
     sessions = calendar.sessions_in_range(pd.Timestamp(start), pd.Timestamp(end))
     return [stamp.date() for stamp in sessions]
+
+
+def nyse_market_close(day: date) -> datetime:
+    """Close of the NYSE session on ``day`` in America/New_York.
+
+    Early closes come from the calendar. When the calendar cannot say (library
+    missing or the date is not a session) the answer is 16:00 ET.
+    """
+    fallback = datetime.combine(day, dtime(16, 0), tzinfo=NEW_YORK)
+    try:
+        try:
+            import pandas_market_calendars as mcal
+        except ImportError:
+            mcal = None
+        if mcal is not None:
+            schedule = mcal.get_calendar("NYSE").schedule(
+                start_date=day.isoformat(), end_date=day.isoformat(),
+            )
+            if schedule is None or len(schedule.index) == 0:
+                return fallback
+            close = schedule["market_close"].iloc[0]
+        else:
+            import exchange_calendars as xcals
+            import pandas as pd
+
+            close = xcals.get_calendar("XNYS").session_close(pd.Timestamp(day))
+        moment = close.to_pydatetime()
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        return moment.astimezone(NEW_YORK)
+    except Exception:
+        return fallback
+
+
+def daily_due(as_of: date) -> tuple[bool, str | None, str | None]:
+    """Return ``(due, reason, warning)`` for the daily cycle.
+
+    Due when ``as_of`` is an NYSE session; otherwise reason ``non_trading_day``.
+    There is no time-of-day rule. The warning is set when the session is today
+    and the run is after that session's close.
+    """
+    if as_of not in set(nyse_session_dates(as_of, as_of)):
+        return False, "non_trading_day", None
+    warning = None
+    now = _now_utc()
+    if as_of == now.astimezone(BOGOTA).date():
+        close = nyse_market_close(as_of)
+        if now >= close:
+            warning = (
+                f"run after NYSE close ({close.strftime('%H:%M')} ET on "
+                f"{as_of.isoformat()}); it counts as that session's day"
+            )
+    return True, None, warning
 
 
 def _iso_week(day: date) -> tuple[int, int]:
@@ -612,6 +720,9 @@ def _absorb_signal(script: str, payload: dict, scalars: dict, signal_warnings: d
             entries = []
         scalars["entries"] = entries
         scalars["n_entries"] = len(entries)
+        if data.get("signal") == "already_prepared_today":
+            scalars["entry_signal"] = "already_prepared_today"
+            scalars["entry_tranche_status"] = data.get("tranche_status")
     if script == "active_management":
         rebalances = data.get("rebalances")
         if isinstance(rebalances, list):
@@ -631,7 +742,14 @@ def _blank_step(script: str, command: list[str] | None = None) -> dict:
     }
 
 
-def run_steps(steps: list[str], portfolio: dict, signals_dir: str, timeout: float) -> dict:
+def run_steps(
+    steps: list[str],
+    portfolio: dict,
+    signals_dir: str,
+    timeout: float,
+    as_of: date | None = None,
+    force_new_tranche: bool = False,
+) -> dict:
     records = []
     failed = None
     scalars: dict = {}
@@ -648,7 +766,9 @@ def run_steps(steps: list[str], portfolio: dict, signals_dir: str, timeout: floa
         started = time.monotonic()
         code, _stdout, stderr, timed_out = _run_command(
             command,
-            step_environment(portfolio["path"], signals_dir, script),
+            step_environment(
+                portfolio["path"], signals_dir, script, as_of, force_new_tranche,
+            ),
             timeout,
         )
         record["duration_seconds"] = round(time.monotonic() - started, 3)
@@ -886,7 +1006,7 @@ def _preview_steps(steps: list[str]) -> list[dict]:
     return [_blank_step(script) for script in steps]
 
 
-def _print_plan(mode: str, as_of: date, portfolio: dict, steps: list[str], signals_dir: str, summary_dir: str, timeout: float, warnings: list[str]) -> None:
+def _print_plan(mode: str, as_of: date, portfolio: dict, steps: list[str], signals_dir: str, summary_dir: str, timeout: float, warnings: list[str], force_new_tranche: bool = False) -> None:
     print(
         f"dry-run mode={mode} as_of={as_of.isoformat()} "
         f"optimizer={portfolio.get('optimizer')} "
@@ -902,10 +1022,15 @@ def _print_plan(mode: str, as_of: date, portfolio: dict, steps: list[str], signa
     print("steps:")
     for index, script in enumerate(steps, start=1):
         command = build_command(script)
-        env = step_environment(portfolio["path"], signals_dir, script)
+        env = step_environment(portfolio["path"], signals_dir, script, as_of, force_new_tranche)
         print(f"  {index} {script}")
         print("    " + " ".join(command))
-        extra = f"PORTFOLIO_FILE={env['PORTFOLIO_FILE']} SIGNALS_OUT_DIR={env['SIGNALS_OUT_DIR']}"
+        extra = (
+            f"PORTFOLIO_FILE={env['PORTFOLIO_FILE']} SIGNALS_OUT_DIR={env['SIGNALS_OUT_DIR']} "
+            f"CYCLE_DATE={env['CYCLE_DATE']}"
+        )
+        if env.get("ENTRY_FORCE_NEW_TRANCHE"):
+            extra += f" ENTRY_FORCE_NEW_TRANCHE={env['ENTRY_FORCE_NEW_TRANCHE']}"
         if script == "portfolio_gex_field":
             extra += f" HEADLESS={env['HEADLESS']}"
         print(f"    env {extra}")
@@ -918,6 +1043,62 @@ def _emit_or_report(summary_dir: str, summary: dict) -> str | None:
         print(f"could not write cycle summary under {summary_dir}: {exc}", file=sys.stderr)
         return str(exc)
     return None
+
+
+def _calendar_failure(
+    exc: Exception,
+    mode: str,
+    as_of: date,
+    portfolio: dict,
+    steps: list[str],
+    cycle_warnings: list[str],
+    summary_dir: str,
+) -> int:
+    message = str(exc)
+    summary = make_summary(
+        mode=mode,
+        status="failed",
+        as_of=as_of,
+        portfolio=portfolio,
+        forced=False,
+        steps=_preview_steps(steps),
+        warnings=cycle_warnings,
+        error=message,
+        message=message,
+    )
+    _emit_or_report(summary_dir, summary)
+    print(message, file=sys.stderr)
+    return 1
+
+
+def _not_due(
+    args: argparse.Namespace,
+    mode: str,
+    as_of: date,
+    portfolio: dict,
+    steps: list[str],
+    cycle_warnings: list[str],
+    summary_dir: str,
+    reason: str | None,
+) -> int:
+    message = f"not_due: {reason} ({as_of.isoformat()})"
+    if args.dry_run:
+        print(message)
+        return 0
+    summary = make_summary(
+        mode=mode,
+        status="not_due",
+        as_of=as_of,
+        portfolio=portfolio,
+        forced=False,
+        steps=_preview_steps(steps),
+        warnings=cycle_warnings,
+        not_due_reason=reason,
+        message=message,
+    )
+    _emit_or_report(summary_dir, summary)
+    print(message)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1001,50 +1182,41 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 due, reason, state_warning = weekly_due(as_of, state_path)
             except CalendarUnavailable as exc:
-                message = str(exc)
-                summary = make_summary(
-                    mode=mode,
-                    status="failed",
-                    as_of=as_of,
-                    portfolio=portfolio,
-                    forced=False,
-                    steps=_preview_steps(steps),
-                    warnings=cycle_warnings,
-                    error=message,
-                    message=message,
+                return _calendar_failure(
+                    exc, mode, as_of, portfolio, steps, cycle_warnings, summary_dir,
                 )
-                _emit_or_report(summary_dir, summary)
-                print(message, file=sys.stderr)
-                return 1
             if state_warning:
                 cycle_warnings.append(state_warning)
             if not due:
-                message = f"not_due: {reason} ({as_of.isoformat()})"
-                if args.dry_run:
-                    print(message)
-                    return 0
-                summary = make_summary(
-                    mode=mode,
-                    status="not_due",
-                    as_of=as_of,
-                    portfolio=portfolio,
-                    forced=False,
-                    steps=_preview_steps(steps),
-                    warnings=cycle_warnings,
-                    not_due_reason=reason,
-                    message=message,
+                return _not_due(
+                    args, mode, as_of, portfolio, steps, cycle_warnings, summary_dir, reason,
                 )
-                _emit_or_report(summary_dir, summary)
-                print(message)
-                return 0
+    elif args.force:
+        cycle_warnings.append("NYSE session check bypassed by --force")
+    else:
+        try:
+            due, reason, close_warning = daily_due(as_of)
+        except CalendarUnavailable as exc:
+            return _calendar_failure(
+                exc, mode, as_of, portfolio, steps, cycle_warnings, summary_dir,
+            )
+        if close_warning:
+            cycle_warnings.append(close_warning)
+        if not due:
+            return _not_due(
+                args, mode, as_of, portfolio, steps, cycle_warnings, summary_dir, reason,
+            )
 
     if args.dry_run:
         _print_plan(
             mode, as_of, portfolio, steps, signals_dir, summary_dir, timeout, cycle_warnings,
+            bool(args.force_new_tranche),
         )
         return 0
 
-    outcome = run_steps(steps, portfolio, signals_dir, timeout)
+    outcome = run_steps(
+        steps, portfolio, signals_dir, timeout, as_of, bool(args.force_new_tranche),
+    )
     status = "success" if outcome["ok"] else "failed"
     message = "cycle success" if outcome["ok"] else outcome["error"]
     summary = make_summary(

@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 from datetime import date
 
-from pipeline_io import export_signals, load_portfolio
+from pipeline_io import export_signals, load_portfolio, resolve_risk_free_rate
 from price_signals import price_indicators, yahoo_closes
 from tickers import (
     adr_warnings, exclusion_warnings, no_options_weight_cap, resolve_instrument, to_polygon, to_yahoo,
@@ -50,7 +50,7 @@ from dotenv import load_dotenv
 load_dotenv()
 polygon_api_key = os.environ.get("POLYGON_API_KEY")
 
-risk_free_rate_annual = 0.046
+risk_free_rate_annual = resolve_risk_free_rate(0.046)  # env RISK_FREE_RATE
 confidence_levels = [0.95, 0.99]
 mar_annual = 0
 
@@ -1234,6 +1234,7 @@ leverage_results = run_leverage_module(
 
 options_module["excluded"] = price_excluded + list(options_module.get("excluded") or [])
 _senal_riesgo_data = _senal_riesgo(leverage_results, options_module)
+_senal_riesgo_data["risk_free_rate"] = risk_free_rate_annual
 export_signals(
     "portfolio_risk_score_leverage",
     _senal_riesgo_data,

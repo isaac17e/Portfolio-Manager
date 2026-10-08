@@ -8,7 +8,7 @@ import tempfile
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest import mock
 from zoneinfo import ZoneInfo
@@ -18,6 +18,7 @@ import run_cycle
 
 BOGOTA = ZoneInfo("America/Bogota")
 PORTFOLIO_RUN_TS = "2026-10-05T16:40:12-05:00"
+DEFAULT_SESSION_DATE = "2026-03-04"
 
 FAKE_STEP = r'''
 import json
@@ -92,6 +93,10 @@ else:
     data = {"excluded": []}
 
 data["headless_env"] = os.environ.get("HEADLESS")
+data["env_seen"] = {
+    name: os.environ.get(name)
+    for name in ("CYCLE_DATE", "RISK_FREE_RATE", "ENTRY_FORCE_NEW_TRANCHE", "ENTRY_CYCLE_DAY")
+}
 run_ts = datetime.now(ZoneInfo("America/Bogota")).replace(microsecond=0).isoformat()
 payload = {
     "schema_version": 1,
@@ -155,6 +160,9 @@ class CycleTestCase(unittest.TestCase):
         summary = os.path.join(self.tmp, "summary")
         state = os.path.join(self.tmp, "state", "weekly_last_run.json")
         log_path = os.path.join(self.tmp, "steps.log")
+        if "--date" not in args:
+            # A fixed NYSE session (Wednesday): daily mode checks the calendar.
+            args = (*args, "--date", DEFAULT_SESSION_DATE)
         cmd = [
             "--portfolio", portfolio_path,
             "--signals-dir", signals,
@@ -523,6 +531,158 @@ class WeeklyTests(CycleTestCase):
         self.assertEqual(columbus, [date(2026, 10, 12)])
 
 
+class DailyCalendarTests(CycleTestCase):
+    def test_labor_day_is_not_due(self):
+        result = self.invoke("--date", "2026-09-07")
+        self.assertEqual(result["code"], 0, result["stderr"])
+        self.assertEqual(self.commands, [])
+        self.assertIn("not_due: non_trading_day", result["stdout"])
+        body = self.summary(result)
+        self.assertEqual(body["mode"], "daily")
+        self.assertEqual(body["status"], "not_due")
+        self.assertEqual(body["not_due_reason"], "non_trading_day")
+        self.assertEqual(body["as_of_date"], "2026-09-07")
+        self.assertEqual([s["status"] for s in body["steps"]], ["not_run"] * len(run_cycle.DAILY_STEPS))
+        self.assert_summary_files(result)
+        self.assertFalse(os.path.isdir(result["signals"]))
+        text = Path(result["summary"], "cycle_summary_latest.txt").read_text(encoding="utf-8")
+        self.assertIn("not_due_reason: non_trading_day", text)
+
+    def test_weekend_is_not_due(self):
+        for day in ("2026-10-10", "2026-10-11"):
+            with self.subTest(day=day):
+                result = self.invoke("--date", day)
+                self.assertEqual(result["code"], 0, result["stderr"])
+                self.assertEqual(self.commands, [])
+                body = self.summary(result)
+                self.assertEqual(body["status"], "not_due")
+                self.assertEqual(body["not_due_reason"], "non_trading_day")
+
+    def test_normal_session_runs(self):
+        result = self.invoke("--date", "2026-09-08")
+        self.assertEqual(result["code"], 0, result["stderr"])
+        self.assertEqual(self.commands, run_cycle.DAILY_STEPS)
+        body = self.summary(result)
+        self.assertEqual(body["status"], "success")
+        self.assertEqual(body["warnings"], [])
+
+    def test_day_after_a_holiday_runs(self):
+        self.assertEqual(self.invoke("--date", "2026-09-07")["code"], 0)
+        self.assertEqual(self.commands, [])
+        self.invoke("--date", "2026-09-08")
+        self.assertEqual(self.commands, run_cycle.DAILY_STEPS)
+
+    def test_force_bypasses_the_calendar_without_needing_it(self):
+        with mock.patch("run_cycle.nyse_session_dates", side_effect=AssertionError("calendar used")):
+            result = self.invoke("--date", "2026-09-07", "--force")
+        self.assertEqual(result["code"], 0, result["stderr"])
+        self.assertEqual(self.commands, run_cycle.DAILY_STEPS)
+        body = self.summary(result)
+        self.assertEqual(body["status"], "success")
+        self.assertTrue(body["forced"])
+        self.assertTrue(any("bypassed" in warning for warning in body["warnings"]))
+
+    def test_dry_run_on_a_holiday_writes_nothing(self):
+        result = self.invoke("--date", "2026-09-07", "--dry-run")
+        self.assertEqual(result["code"], 0, result["stderr"])
+        self.assertIn("not_due: non_trading_day", result["stdout"])
+        self.assertFalse(os.path.exists(os.path.join(result["summary"], "cycle_summary_latest.json")))
+
+    def test_missing_calendar_is_the_same_error_as_weekly(self):
+        message = "NYSE calendar library is not installed. Install pandas_market_calendars."
+        with mock.patch("run_cycle.nyse_session_dates", side_effect=run_cycle.CalendarUnavailable(message)):
+            result = self.invoke("--date", "2026-09-08")
+        self.assertEqual(result["code"], 1)
+        self.assertIn("NYSE calendar library is not installed", result["stderr"])
+        body = self.summary(result)
+        self.assertEqual(body["status"], "failed")
+        self.assertEqual(self.commands, [])
+
+    def _invoke_at(self, now, *args):
+        with mock.patch("run_cycle._now_utc", return_value=now):
+            return self.invoke(*args)
+
+    def test_run_after_the_close_warns_but_runs(self):
+        # 2026-10-07 21:30 UTC = 17:30 EDT, after the 16:00 ET close.
+        now = datetime(2026, 10, 7, 21, 30, tzinfo=timezone.utc)
+        result = self._invoke_at(now, "--date", "2026-10-07")
+        self.assertEqual(result["code"], 0, result["stderr"])
+        self.assertEqual(self.commands, run_cycle.DAILY_STEPS)
+        body = self.summary(result)
+        self.assertEqual(body["status"], "success")
+        self.assertEqual(len(body["warnings"]), 1)
+        self.assertIn("run after NYSE close (16:00 ET", body["warnings"][0])
+        text = Path(result["summary"], "cycle_summary_latest.txt").read_text(encoding="utf-8")
+        self.assertIn("run after NYSE close", text)
+
+    def test_run_before_the_close_has_no_warning(self):
+        now = datetime(2026, 10, 7, 19, 59, tzinfo=timezone.utc)  # 15:59 EDT
+        result = self._invoke_at(now, "--date", "2026-10-07")
+        self.assertEqual(self.summary(result)["warnings"], [])
+
+    def test_replaying_a_past_date_has_no_warning(self):
+        now = datetime(2026, 10, 9, 21, 30, tzinfo=timezone.utc)
+        result = self._invoke_at(now, "--date", "2026-10-07")
+        self.assertEqual(self.summary(result)["warnings"], [])
+
+    def test_early_close_uses_the_calendar(self):
+        # Friday after Thanksgiving closes at 13:00 ET (18:00 UTC).
+        self.assertEqual(run_cycle.nyse_market_close(date(2026, 11, 27)).strftime("%H:%M"), "13:00")
+        now = datetime(2026, 11, 27, 19, 0, tzinfo=timezone.utc)
+        result = self._invoke_at(now, "--date", "2026-11-27")
+        self.assertIn("(13:00 ET", self.summary(result)["warnings"][0])
+        before = datetime(2026, 11, 27, 17, 0, tzinfo=timezone.utc)
+        result = self._invoke_at(before, "--date", "2026-11-27")
+        self.assertEqual(self.summary(result)["warnings"], [])
+
+    def test_market_close_helper(self):
+        close = run_cycle.nyse_market_close(date(2026, 10, 7))
+        self.assertEqual((close.hour, close.minute), (16, 0))
+        self.assertEqual(close.utcoffset().total_seconds(), -4 * 3600)  # EDT
+        winter = run_cycle.nyse_market_close(date(2026, 12, 2))
+        self.assertEqual(winter.utcoffset().total_seconds(), -5 * 3600)  # EST
+        # Not a session: 16:00 ET fallback.
+        sunday = run_cycle.nyse_market_close(date(2026, 10, 11))
+        self.assertEqual((sunday.hour, sunday.minute), (16, 0))
+
+    def test_steps_receive_cycle_date_and_inherit_the_rest(self):
+        env = {"RISK_FREE_RATE": "0.052", "ENTRY_CYCLE_DAY": "2"}
+        result = self.invoke("--date", "2026-09-08", env=env)
+        self.assertEqual(result["code"], 0, result["stderr"])
+        entry = json.loads(Path(result["signals"], "entry_signal_tool.json").read_text(encoding="utf-8"))
+        seen = entry["data"]["env_seen"]
+        self.assertEqual(seen["CYCLE_DATE"], "2026-09-08")
+        self.assertEqual(seen["RISK_FREE_RATE"], "0.052")
+        self.assertEqual(seen["ENTRY_CYCLE_DAY"], "2")
+        self.assertIsNone(seen["ENTRY_FORCE_NEW_TRANCHE"])
+        vix = json.loads(Path(result["signals"], "portfolio_vix.json").read_text(encoding="utf-8"))
+        self.assertEqual(vix["data"]["env_seen"]["RISK_FREE_RATE"], "0.052")
+
+    def test_force_new_tranche_only_reaches_the_entry_step(self):
+        result = self.invoke("--date", "2026-09-08", "--force-new-tranche")
+        self.assertEqual(result["code"], 0, result["stderr"])
+        entry = json.loads(Path(result["signals"], "entry_signal_tool.json").read_text(encoding="utf-8"))
+        self.assertEqual(entry["data"]["env_seen"]["ENTRY_FORCE_NEW_TRANCHE"], "1")
+        vix = json.loads(Path(result["signals"], "portfolio_vix.json").read_text(encoding="utf-8"))
+        self.assertIsNone(vix["data"]["env_seen"]["ENTRY_FORCE_NEW_TRANCHE"])
+
+    def test_step_aliases(self):
+        result = self.invoke("--steps", "entry,vix,gex,risk,fundamental")
+        self.assertEqual(result["code"], 0, result["stderr"])
+        self.assertEqual(self.commands, run_cycle.DAILY_STEPS)
+        self.commands = []
+        result = self.invoke("--steps", "vix,portfolio_gex_field")
+        self.assertEqual(self.commands, ["portfolio_gex_field", "portfolio_vix"])
+
+    def test_unknown_step_still_exits_2_and_lists_aliases(self):
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            code = run_cycle.main(["--steps", "bogus", "--portfolio", os.path.join(self.tmp, "p.json")])
+        self.assertEqual(code, 2)
+        self.assertIn("unknown step(s): bogus", stderr.getvalue())
+        self.assertIn("vix=portfolio_vix", stderr.getvalue())
+
+
 class PortfolioAndCliTests(CycleTestCase):
     def test_invalid_portfolio_file(self):
         cases = [
@@ -569,6 +729,7 @@ class PortfolioAndCliTests(CycleTestCase):
         with redirect_stdout(stdout):
             code = run_cycle.main([
                 "--dry-run",
+                "--date", DEFAULT_SESSION_DATE,
                 "--portfolio", portfolio,
                 "--summary-dir", os.path.join(self.tmp, "dry_summary"),
                 "--signals-dir", os.path.join(self.tmp, "dry_signals"),
@@ -578,6 +739,7 @@ class PortfolioAndCliTests(CycleTestCase):
         self.assertIn("--once", plan)
         self.assertIn("--no-show", plan)
         self.assertIn("HEADLESS=1", plan)
+        self.assertIn(f"CYCLE_DATE={DEFAULT_SESSION_DATE}", plan)
         self.assertFalse(os.path.isdir(os.path.join(self.tmp, "dry_signals")))
 
     def test_weekly_dry_run_not_due_writes_nothing(self):

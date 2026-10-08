@@ -17,7 +17,7 @@ from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-from pipeline_io import export_signals, load_portfolio
+from pipeline_io import export_signals, load_portfolio, resolve_risk_free_rate
 from polygon_client import NoOptionData, PolygonClient, failure_reason
 from tickers import (
     adr_warnings, dividend_yield_from_info, exclusion_warnings, options_exclusion, options_underlying,
@@ -77,7 +77,7 @@ _PORTFOLIO_META = load_portfolio(PORTFOLIO_HOLDINGS)
 PORTFOLIO_HOLDINGS = _PORTFOLIO_META["weights"]
 
 EQUAL_WEIGHTS: bool = False              # True -> ignora los pesos de arriba
-RISK_FREE_RATE: float = 0.045            # tasa libre de riesgo continua
+RISK_FREE_RATE: float = resolve_risk_free_rate(0.045)  # tasa libre de riesgo continua (env RISK_FREE_RATE)
 USE_ESCROWED_DIVIDENDS: bool = True      # dividendos discretos vs. yield continuo
 HISTORY_LOOKBACK: str = "2y"             # ventana histórica para la correlación
 
@@ -2069,6 +2069,7 @@ def _senal_vix(results: Dict[str, object], cfg: "VIXConfig") -> Dict[str, object
         "source": results.get("source"),
         "vol_method": cfg.vol_method,
         "corr_method": cfg.corr_method,
+        "risk_free_rate": cfg.r,
         "metrics": metrics,
         "holdings": holdings,
         "excluded": list(results.get("excluded") or []),

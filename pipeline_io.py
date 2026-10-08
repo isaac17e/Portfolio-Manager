@@ -44,6 +44,44 @@ def _warn(message: str) -> None:
     print(f"[pipeline_io] {message}")
 
 
+def resolve_risk_free_rate(default, env=None):
+    """Annual risk-free rate (decimal): ``RISK_FREE_RATE`` if set, else ``default``.
+
+    Mirrors AM-PM-Architecture's helper. Read it once at script start. A value
+    that is not a number, or outside [0, 0.5), raises ``ValueError``.
+    """
+    raw = (os.environ if env is None else env).get("RISK_FREE_RATE")
+    if raw is None or not str(raw).strip():
+        return float(default)
+    try:
+        rate = float(str(raw).strip())
+    except ValueError:
+        raise ValueError(
+            f"invalid RISK_FREE_RATE: {raw!r}. Use an annual decimal, e.g. 0.052."
+        ) from None
+    if not math.isfinite(rate) or not 0.0 <= rate < 0.5:
+        raise ValueError(
+            f"RISK_FREE_RATE out of range: {raw!r}. Must satisfy 0 <= rf < 0.5 "
+            "(annual decimal: 0.052 is 5.2%)."
+        )
+    return rate
+
+
+def cycle_today() -> date:
+    """Today in America/Bogota, or ``CYCLE_DATE`` (YYYY-MM-DD) when set.
+
+    ``run_cycle.py`` exports its ``--date`` as ``CYCLE_DATE`` so the steps agree
+    with the orchestrator on the day (and tests are deterministic).
+    """
+    raw = os.environ.get("CYCLE_DATE")
+    if raw is None or not raw.strip():
+        return datetime.now(BOGOTA).date()
+    try:
+        return datetime.strptime(raw.strip(), "%Y-%m-%d").date()
+    except ValueError:
+        raise ValueError(f"invalid CYCLE_DATE: {raw!r}. Use YYYY-MM-DD.") from None
+
+
 def _fallback_result(fallback, reason: str) -> dict:
     _warn(f"{reason} Using hardcoded portfolio fallback.")
     weights = {}
@@ -497,9 +535,18 @@ def apply_entry_fills(estado, payload, cycle_length: int = 5, today: str | None 
     return updated, True
 
 
-def stage_pending_entry(estado, run_ts, cycle_day, cycle, targets=None, cash=None, decisions=None):
-    """Remember the signal that is waiting for fills. Does not mark invested."""
+def stage_pending_entry(estado, run_ts, cycle_day, cycle, targets=None, cash=None, decisions=None,
+                        prepared_date=None, tranche=None):
+    """Remember the signal that is waiting for fills. Does not mark invested.
+
+    ``prepared_date`` (America/Bogota, YYYY-MM-DD) and ``tranche`` (the
+    entries/waiting that were emitted) feed the same-day lock, see
+    ``tranche_lock``. Both survive ``apply_entry_fills``.
+    """
     updated = copy.deepcopy(estado or {})
+    if prepared_date is not None:
+        updated["last_tranche_date"] = str(prepared_date)
+        updated["last_tranche"] = to_jsonable(dict(tranche or {}, signal_run_ts=run_ts))
     updated["pending_signal_run_ts"] = run_ts
     updated["pending_cycle_day"] = cycle_day
     updated["pending_cycle"] = cycle
@@ -511,6 +558,32 @@ def stage_pending_entry(estado, run_ts, cycle_day, cycle, targets=None, cash=Non
     }
     updated["pending_decisions"] = {str(key): value for key, value in (decisions or {}).items()}
     return updated
+
+
+def tranche_lock(estado, today) -> dict | None:
+    """The tranche already prepared on ``today``, or None when a new one may be made.
+
+    ``today`` is a date or YYYY-MM-DD in America/Bogota. The lock covers both a
+    tranche still waiting for fills (``status`` "pending") and one whose fills
+    were applied ("executed"). The returned dict has ``status``,
+    ``prepared_date``, ``signal_run_ts`` and ``tranche`` (the emitted
+    entries/waiting, possibly empty).
+    """
+    estado = estado or {}
+    prepared = estado.get("last_tranche_date")
+    if not prepared or str(prepared) != str(today):
+        return None
+    tranche = estado.get("last_tranche")
+    tranche = tranche if isinstance(tranche, dict) else {}
+    signal_run_ts = tranche.get("signal_run_ts")
+    pending = estado.get("pending_signal_run_ts")
+    status = "pending" if pending and pending == signal_run_ts else "executed"
+    return {
+        "status": status,
+        "prepared_date": str(prepared),
+        "signal_run_ts": signal_run_ts,
+        "tranche": tranche,
+    }
 
 
 def suggest_cycle_day(estado, cycle_length: int = 5) -> int:
