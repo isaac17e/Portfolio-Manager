@@ -22,7 +22,8 @@ from pipeline_io import export_signals, load_portfolio
 from gex_utils import gamma_flip_level
 from polygon_client import NO_OPTION_DATA, PolygonClient, PolygonError, failure_reason
 from tickers import (
-    dividend_yield_from_info, exclusion_warnings, no_us_options_reason, to_polygon, to_yahoo,
+    adr_warnings, dividend_yield_from_info, exclusion_warnings, options_exclusion, options_underlying,
+    to_polygon, to_yahoo,
 )
 import plotly.graph_objects as go
 import plotly.io as pio
@@ -654,12 +655,20 @@ def get_portfolio_chains(holdings, horizon_months=TIME_HORIZON_MONTHS):
 
     for ticker, weight in holdings.items():
         print(f"\n{'='*60}\nProcesando {ticker} (peso original: {weight:.2%})\n{'='*60}")
-        reason = no_us_options_reason(ticker)
-        if reason:
-            note(ticker, reason)
+        # Tier adr: precio y cadena del ADR (RY.TO -> RY) bajo la llave local.
+        # Tiers proxy / none se excluyen; el ETF proxy queda solo como
+        # referencia en el motivo y no entra en el GEX del portafolio.
+        exclusion = options_exclusion(ticker)
+        if exclusion:
+            excluded.append(exclusion)
+            failed.append(ticker)
+            print(f"❌ {ticker}: {exclusion['reason']}; se excluye.")
             continue
+        simbolo = options_underlying(ticker)
+        if simbolo != ticker:
+            print(f"   {ticker}: se analiza con el ADR {simbolo}.")
         try:
-            price = get_current_price(ticker)
+            price = get_current_price(simbolo)
         except Exception as exc:
             note(ticker, failure_reason(exc))
             print(f"   ({exc})")
@@ -673,7 +682,7 @@ def get_portfolio_chains(holdings, horizon_months=TIME_HORIZON_MONTHS):
             continue
 
         try:
-            df_opts = get_polygon_options_data(ticker, price, horizon_months=horizon_months)
+            df_opts = get_polygon_options_data(simbolo, price, horizon_months=horizon_months)
         except Exception as exc:
             note(ticker, failure_reason(exc))
             print(f"   ({exc})")
@@ -683,7 +692,7 @@ def get_portfolio_chains(holdings, horizon_months=TIME_HORIZON_MONTHS):
             if reutilizado is not None:
                 portfolio_data[ticker] = reutilizado
                 continue
-            note(ticker, _ULTIMO_FALLO_CADENA.pop(ticker, NO_OPTION_DATA))
+            note(ticker, _ULTIMO_FALLO_CADENA.pop(simbolo, NO_OPTION_DATA))
             continue
 
         try:
@@ -719,7 +728,7 @@ def get_portfolio_chains(holdings, horizon_months=TIME_HORIZON_MONTHS):
                   f"±{required_range_pct*100:.1f}% (antes ±{current_range_pct*100:.1f}%)...")
 
             try:
-                df_opts_wide = get_polygon_options_data(ticker, price, horizon_months=horizon_months,
+                df_opts_wide = get_polygon_options_data(simbolo, price, horizon_months=horizon_months,
                                                           strike_range_pct=required_range_pct)
             except Exception as exc:
                 print(f"⚠️  [{ticker}] El re-fetch ampliado falló ({exc}); se conserva la ventana original.")
@@ -750,6 +759,7 @@ def get_portfolio_chains(holdings, horizon_months=TIME_HORIZON_MONTHS):
 
         portfolio_data[ticker] = {
             "weight": weight,
+            "analysis_ticker": simbolo,
             "price": price,
             "df_options": df_opts,
             "df_gex_structural": df_gex_structural,
@@ -1271,6 +1281,7 @@ def _senal_gex(result, excluded=None):
         metrics = data.get("metrics_structural") or {}
         holdings.append({
             "ticker": ticker,
+            "analysis_ticker": data.get("analysis_ticker", ticker),
             "weight": data.get("weight_normalized", data.get("weight")),
             "price": data.get("price"),
             "expected_move": data.get("expected_move"),
@@ -1337,7 +1348,7 @@ def run_live(refresh_seconds=REFRESH_SECONDS, max_iterations=MAX_ITERATIONS,
         data = _senal_gex(result or {}, excluded)
         export_signals(
             "portfolio_gex_field", data, _PORTFOLIO_META,
-            warnings=exclusion_warnings(excluded),
+            warnings=exclusion_warnings(excluded) + adr_warnings(PORTFOLIO_HOLDINGS),
         )
         if result is not None:
             current_state = result["current_state"]
@@ -1390,7 +1401,7 @@ def run_headless(output_path=OUTPUT_HTML_PATH):
     data = _senal_gex(result or {}, excluded)
     export_signals(
         "portfolio_gex_field", data, _PORTFOLIO_META,
-        warnings=exclusion_warnings(excluded),
+        warnings=exclusion_warnings(excluded) + adr_warnings(PORTFOLIO_HOLDINGS),
     )
     if result is None:
         print("❌ No se escribió el HTML: ningún holding tiene datos válidos.")

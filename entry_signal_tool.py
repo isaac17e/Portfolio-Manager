@@ -23,7 +23,8 @@ from pipeline_io import (
     signal_cycle_number,
     stage_pending_entry,
 )
-from tickers import exclusion_warnings, no_us_options_reason, to_polygon
+from price_signals import price_indicators, price_scores, yahoo_closes
+from tickers import exclusion_warnings, no_options_weight_cap, resolve_instrument, to_polygon
 
 # ---------------- CONFIGURACION ----------------
 from dotenv import load_dotenv
@@ -53,6 +54,32 @@ PESOS = {
     "smart_money": 0.1,
     "volumen_relativo": 0.1,
 }
+
+# Tier "proxy" (tickers.resolve_instrument): sin opciones propias ni ADR. La
+# mitad del score sale del precio diario de la cotizacion local y la otra mitad
+# de las opciones del ETF pais (proxy de IV / gamma / put-call).
+PESOS_PROXY = {
+    "tendencia": 0.15,
+    "rsi": 0.10,
+    "vol_realizada": 0.15,
+    "drawdown": 0.10,
+    "gex_regime": 0.10,
+    "iv_rank": 0.15,
+    "skew": 0.10,
+    "smart_money": 0.15,
+}
+
+# Tier "none" (sin opciones, ADR ni proxy): entrada fija escalonada, por defecto
+# 20% del peso objetivo por dia del ciclo, con el peso objetivo recortado por
+# tickers.no_options_weight_cap (NO_OPTIONS_WEIGHT_CAP_FACTOR / _CAP).
+def _pct_escalonado():
+    try:
+        valor = float(os.environ.get("ENTRY_STAGGER_PCT", "0.20"))
+    except ValueError:
+        return 0.20
+    return valor if 0 < valor <= 1 else 0.20
+
+ENTRADA_ESCALONADA_PCT = _pct_escalonado()
 
 UMBRAL_ALTO = 75
 UMBRAL_MEDIO = 40
@@ -387,15 +414,24 @@ def percentile_historico(hist_df, ticker, columna, valor_actual, absoluto=False)
         valor_actual = abs(valor_actual)
     return (serie < valor_actual).mean() * 100
 
-def calcular_indicadores_ticker(ticker, hist_df):
-    reason = no_us_options_reason(ticker)
-    if reason:
-        raise NoOptionData(reason)
-    spot, vol_relativo = get_spot_y_volumen_relativo(ticker)
-    vencimiento = seleccionar_vencimiento_objetivo(ticker, HORIZON_DIAS_OBJETIVO)
+def _pct_entrada(score):
+    if score >= UMBRAL_ALTO:
+        return 1.0
+    if score >= UMBRAL_MEDIO:
+        return 0.4 + (score - UMBRAL_MEDIO) / (UMBRAL_ALTO - UMBRAL_MEDIO) * 0.4
+    return max(score / UMBRAL_MEDIO * 0.3, 0.0)
+
+def _metricas_opciones(simbolo):
+    """Metricas crudas de la cadena de opciones de ``simbolo`` en Polygon.
+
+    ``simbolo`` es el ticker propio, su ADR o el ETF proxy; lanza NoOptionData
+    si no hay cadena.
+    """
+    spot, vol_relativo = get_spot_y_volumen_relativo(simbolo)
+    vencimiento = seleccionar_vencimiento_objetivo(simbolo, HORIZON_DIAS_OBJETIVO)
     if vencimiento is None:
         raise NoOptionData(NO_OPTION_DATA)
-    chain = parse_chain(get_options_chain(ticker, spot, vencimiento))
+    chain = parse_chain(get_options_chain(simbolo, spot, vencimiento))
     if chain.empty:
         raise NoOptionData(NO_OPTION_DATA)
 
@@ -408,7 +444,7 @@ def calcular_indicadores_ticker(ticker, hist_df):
     smart_money = calcular_smart_money(chain)
     vanna_charm = calcular_vanna_charm_factor()
 
-    crudos = {
+    return {
         "spot": spot,
         "vencimiento": vencimiento,
         "gex_total": gex_total,
@@ -424,6 +460,22 @@ def calcular_indicadores_ticker(ticker, hist_df):
         "vanna_charm": vanna_charm,
     }
 
+def calcular_indicadores_ticker(ticker, hist_df):
+    # Tier "native" usa la cadena propia; tier "adr" la del ADR (RY.TO -> RY).
+    # La fila conserva el ticker local como llave del portafolio.
+    instrumento = resolve_instrument(ticker)
+    if instrumento["tier"] not in ("native", "adr"):
+        raise NoOptionData(instrumento["reason"] or NO_OPTION_DATA)
+    crudos = _metricas_opciones(instrumento["analysis_ticker"])
+    gex_total = crudos["gex_total"]
+    dist_zero_gamma = crudos["dist_zero_gamma"]
+    espacio_walls = crudos["espacio_walls"]
+    iv_atm = crudos["iv_atm"]
+    skew = crudos["skew"]
+    expected_move = crudos["expected_move"]
+    smart_money = crudos["smart_money"]
+    vol_relativo = crudos["volumen_relativo"]
+
     normalizados = {
         "gex_regime": 100 - abs(percentile_historico(hist_df, ticker, "gex_total", gex_total) - 50) * 2,
         "zero_gamma_dist": percentile_historico(
@@ -438,13 +490,7 @@ def calcular_indicadores_ticker(ticker, hist_df):
     }
 
     score = sum(normalizados[k] * PESOS[k] for k in PESOS)
-
-    if score >= UMBRAL_ALTO:
-        pct_entrada = 1.0
-    elif score >= UMBRAL_MEDIO:
-        pct_entrada = 0.4 + (score - UMBRAL_MEDIO) / (UMBRAL_ALTO - UMBRAL_MEDIO) * 0.4
-    else:
-        pct_entrada = max(score / UMBRAL_MEDIO * 0.3, 0.0)
+    pct_entrada = _pct_entrada(score)
 
     fila = {
         "fecha": pd.Timestamp.now(timezone.utc).normalize(),
@@ -453,8 +499,127 @@ def calcular_indicadores_ticker(ticker, hist_df):
         **{f"norm_{k}": v for k, v in normalizados.items()},
         "score_conviccion": score,
         "pct_entrada_sugerido": round(pct_entrada, 3),
+        "tier": instrumento["tier"],
+        "analysis_ticker": instrumento["analysis_ticker"],
+        "proxy_etf": None,
+        "modo_entrada": "opciones",
     }
     return fila
+
+def calcular_indicadores_proxy(ticker, instrumento, hist_df, closes=None, metricas_proxy=None):
+    """Tier "proxy": precio diario local (Yahoo) + opciones del ETF pais.
+
+    ``closes`` y ``metricas_proxy`` se pueden inyectar (pruebas); si faltan se
+    descargan. Las metricas del ETF se guardan con los mismos nombres de columna
+    que las de opciones propias, bajo el ticker local, para que los percentiles
+    y la decision del dia 5 comparen siempre contra la misma serie proxy.
+    """
+    etf = instrumento["proxy_etf"]
+    if closes is None:
+        closes = yahoo_closes(ticker)
+    indicadores = price_indicators(closes)
+    if pd.isna(indicadores["precio"]):
+        raise RuntimeError(f"no price history returned for {ticker}")
+    if metricas_proxy is None:
+        metricas_proxy = _metricas_opciones(etf)
+
+    normalizados = {
+        **price_scores(indicadores),
+        "gex_regime": 100 - abs(
+            percentile_historico(hist_df, ticker, "gex_total", metricas_proxy.get("gex_total")) - 50
+        ) * 2,
+        "iv_rank": percentile_historico(hist_df, ticker, "iv_atm", metricas_proxy.get("iv_atm")),
+        "skew": 100 - percentile_historico(
+            hist_df, ticker, "skew", metricas_proxy.get("skew"), absoluto=True
+        ),
+        "smart_money": percentile_historico(
+            hist_df, ticker, "smart_money", metricas_proxy.get("smart_money")
+        ),
+    }
+    score = sum(normalizados[k] * PESOS_PROXY[k] for k in PESOS_PROXY)
+    pct_entrada = _pct_entrada(score)
+
+    crudos_proxy = {k: v for k, v in metricas_proxy.items() if k != "spot"}
+    return {
+        "fecha": pd.Timestamp.now(timezone.utc).normalize(),
+        "ticker": ticker,
+        "spot": indicadores["precio"],
+        **crudos_proxy,
+        "spot_proxy": metricas_proxy.get("spot"),
+        **{f"px_{k}": v for k, v in indicadores.items()},
+        **{f"norm_{k}": v for k, v in normalizados.items()},
+        "score_conviccion": score,
+        "pct_entrada_sugerido": round(pct_entrada, 3),
+        "tier": "proxy",
+        "analysis_ticker": instrumento["analysis_ticker"],
+        "proxy_etf": etf,
+        "capital_epic": instrumento.get("capital_epic"),
+        "modo_entrada": "proxy",
+    }
+
+def fila_escalonada(ticker, instrumento):
+    """Tier "none": sin score; la entrada es fija por dia (ENTRADA_ESCALONADA_PCT)."""
+    return {
+        "fecha": pd.Timestamp.now(timezone.utc).normalize(),
+        "ticker": ticker,
+        "spot": np.nan,
+        "score_conviccion": np.nan,
+        "pct_entrada_sugerido": np.nan,
+        "tier": "none",
+        "analysis_ticker": instrumento["analysis_ticker"],
+        "proxy_etf": instrumento.get("proxy_etf"),
+        "capital_epic": instrumento.get("capital_epic"),
+        "modo_entrada": "escalonado",
+    }
+
+def calcular_fila_instrumento(ticker, hist_df, warnings, excluded):
+    """Fila del dia segun el tier del ticker, o None si se excluye.
+
+    native / adr -> opciones propias o del ADR; proxy -> precio + ETF pais;
+    none (o proxy sin datos) -> entrada escalonada con tope de peso.
+    """
+    instrumento = resolve_instrument(ticker)
+    warnings.extend(instrumento["warnings"])
+    tier = instrumento["tier"]
+    if tier in ("native", "adr"):
+        try:
+            fila = calcular_indicadores_ticker(ticker, hist_df)
+            if tier == "adr":
+                # Orden por el ADR solo con epic verificado (None si no lo esta).
+                fila["capital_epic"] = instrumento["capital_epic"]
+            return fila
+        except NoOptionData as exc:
+            excluded.append({"ticker": ticker, "reason": str(exc) or NO_OPTION_DATA, "tier": tier})
+            print(f"{ticker}: {exc}; se omite.")
+        except Exception as exc:
+            excluded.append({"ticker": ticker, "reason": failure_reason(exc), "tier": tier})
+            print(f"Error con {ticker}: {exc}; se omite.")
+        return None
+
+    if tier == "proxy":
+        try:
+            fila = calcular_indicadores_proxy(ticker, instrumento, hist_df)
+            warnings.append(
+                f"{ticker}: no US options or ADR; scored with daily prices and "
+                f"{instrumento['proxy_etf']} options as proxy (tier proxy)"
+            )
+            return fila
+        except Exception as exc:
+            motivo = str(exc) if isinstance(exc, NoOptionData) else failure_reason(exc)
+            warnings.append(
+                f"{ticker}: proxy {instrumento['proxy_etf']} unavailable ({motivo}); "
+                "falling back to staggered entry"
+            )
+            print(f"{ticker}: proxy {instrumento['proxy_etf']} sin datos ({exc}); entrada escalonada.")
+            fila = fila_escalonada(ticker, instrumento)
+            fila["tier"] = "none"
+            return fila
+
+    warnings.append(
+        f"{ticker}: {instrumento['reason'] or 'no US options'}; no ADR or proxy ETF; "
+        f"staggered entry {ENTRADA_ESCALONADA_PCT*100:.0f}%/day with capped weight (tier none)"
+    )
+    return fila_escalonada(ticker, instrumento)
 
 # ---------------- VISUALIZACION ----------------
 
@@ -462,6 +627,7 @@ COLORES_ACCION = {
     "CIERRE: ENTRAR": "#0ca30c",
     "CIERRE: CASH": "#d03b3b",
     "COMPLETO": "#2a78d6",
+    "ESCALONADO": "#8a6d00",
 }
 COLOR_TEXTO_NORMAL = "#52514e"
 
@@ -562,6 +728,94 @@ def _contexto(estado, warnings, excluded, dia_ciclo, ciclo, pending_cash=None, p
     }
 
 
+def _texto(fila, columna):
+    valor = fila.get(columna) if hasattr(fila, "get") else None
+    if valor is None or (not isinstance(valor, str) and pd.isna(valor)):
+        return None
+    return str(valor)
+
+
+def construir_fila_estado(fila, pct_previo, peso_original, dia_ciclo, ciclo, hist_actualizado):
+    """Decision del dia para un activo: cuanto sumar hoy, en % de su peso objetivo.
+
+    ``pct_previo`` es la fraccion del peso objetivo ya ejecutada (fills). En
+    entrada escalonada (tier "none") el objetivo es el peso recortado
+    (tickers.no_options_weight_cap) y cada senal compra un tramo fijo de
+    ENTRADA_ESCALONADA_PCT (o lo que falte) sobre lo ejecutado: nunca el 100%
+    de una vez, aunque se hayan perdido fills o sea el dia 5.
+    """
+    ticker = fila["ticker"]
+    escalonado = _texto(fila, "modo_entrada") == "escalonado"
+    peso_objetivo = no_options_weight_cap(peso_original) if escalonado else peso_original
+    es_ultimo_dia = dia_ciclo >= DIAS_CICLO
+    pct_cash = 0.0
+
+    if escalonado:
+        pct_objetivo_hoy = min(1.0, pct_previo + ENTRADA_ESCALONADA_PCT)
+    else:
+        pct_objetivo_hoy = fila["pct_entrada_sugerido"]
+
+    if pct_previo >= 0.999:
+        delta = 0.0
+        accion = "COMPLETO"
+        recomendacion = "COMPLETO (100% del peso objetivo)"
+    elif escalonado:
+        delta = pct_objetivo_hoy - pct_previo
+        tope = f"{peso_objetivo*100:.2f}%" if not pd.isna(peso_objetivo) else "?"
+        accion = "ESCALONADO"
+        recomendacion = (
+            f"ENTRADA ESCALONADA (sin opciones, ADR ni proxy): +{delta*100:.1f}% hoy, "
+            f"{pct_objetivo_hoy*100:.0f}% acumulado del peso recortado {tope}"
+        )
+    elif es_ultimo_dia:
+        # Dia 5: no hay goteo adicional, se cierra el ciclo en firme.
+        decision, motivo = evaluar_flujo_opciones(ticker, hist_actualizado)
+        if decision == "ENTRAR":
+            delta = 1.0 - pct_previo
+            accion = "CIERRE: ENTRAR"
+            recomendacion = f"CIERRE DIA {DIAS_CICLO} -> COMPRAR EL {delta*100:.1f}% RESTANTE ({motivo})"
+        else:
+            delta = 0.0
+            pct_cash = 1.0 - pct_previo
+            accion = "CIERRE: CASH"
+            recomendacion = f"CIERRE DIA {DIAS_CICLO} -> DEJAR {pct_cash*100:.1f}% EN CASH ({motivo})"
+    else:
+        delta = max(0.0, pct_objetivo_hoy - pct_previo)
+        if delta > 0:
+            accion = "SUMAR"
+            recomendacion = "COMPLETAR A 100%" if pct_objetivo_hoy >= 1.0 else f"SUMAR +{delta*100:.1f}%"
+        else:
+            accion = "MANTENER"
+            recomendacion = "MANTENER (ya en el nivel objetivo de hoy)"
+
+    pct_final = min(1.0, pct_previo + delta)
+
+    return {
+        "ciclo": ciclo,
+        "dia_ciclo": dia_ciclo,
+        "ticker": ticker,
+        "peso_objetivo_pct": round(peso_objetivo * 100, 2) if not pd.isna(peso_objetivo) else np.nan,
+        "peso_objetivo_original_pct": (
+            round(peso_original * 100, 2) if not pd.isna(peso_original) else np.nan
+        ),
+        "pct_ya_invertido_previo": round(pct_previo * 100, 1),
+        "pct_objetivo_hoy": round(pct_objetivo_hoy * 100, 1),
+        "delta_sugerido_hoy_pct": round(delta * 100, 1),
+        "pct_invertido_final_pct": round(pct_final * 100, 1),
+        "cash_definitivo_pct": round(pct_cash * 100, 1),
+        "delta_puntos_portafolio": (
+            round(delta * peso_objetivo * 100, 2) if not pd.isna(peso_objetivo) else np.nan
+        ),
+        "accion": accion,
+        "recomendacion": recomendacion,
+        "tier": _texto(fila, "tier") or "native",
+        "analysis_ticker": _texto(fila, "analysis_ticker") or ticker,
+        "proxy_etf": _texto(fila, "proxy_etf"),
+        "capital_epic": _texto(fila, "capital_epic"),
+        "tope_peso_aplicado": escalonado,
+    }
+
+
 def correr_entry_signal(cycle_day=None, invested_pct=None):
     """Calcula la senal del dia. No marca entry_state.json como invertido.
 
@@ -619,20 +873,9 @@ def correr_entry_signal(cycle_day=None, invested_pct=None):
 
     filas_nuevas = []
     for ticker in TICKERS:
-        reason = no_us_options_reason(ticker)
-        if reason:
-            excluded.append({"ticker": ticker, "reason": reason})
-            print(f"{ticker}: {reason}; se omite.")
-            continue
-        try:
-            fila = calcular_indicadores_ticker(ticker, hist_df)
+        fila = calcular_fila_instrumento(ticker, hist_df, warnings, excluded)
+        if fila is not None:
             filas_nuevas.append(fila)
-        except NoOptionData as exc:
-            excluded.append({"ticker": ticker, "reason": str(exc) or NO_OPTION_DATA})
-            print(f"{ticker}: {exc}; se omite.")
-        except Exception as exc:
-            excluded.append({"ticker": ticker, "reason": failure_reason(exc)})
-            print(f"Error con {ticker}: {exc}; se omite.")
 
     warnings.extend(exclusion_warnings(excluded))
     df_nuevo = pd.DataFrame(filas_nuevas)
@@ -651,54 +894,10 @@ def correr_entry_signal(cycle_day=None, invested_pct=None):
     for _, fila in df_nuevo.iterrows():
         ticker = fila["ticker"]
         activo = scoring["activos"].setdefault(ticker, _activo_vacio())
-        pct_previo = activo["pct_ya_invertido"]
-        pct_objetivo_hoy = fila["pct_entrada_sugerido"]
-        peso_objetivo = PESOS_OBJETIVO.get(ticker, np.nan)
-        pct_cash = 0.0
-
-        if pct_previo >= 0.999:
-            delta = 0.0
-            accion = "COMPLETO"
-            recomendacion = "COMPLETO (100% del peso objetivo)"
-        elif es_ultimo_dia:
-            # Dia 5: no hay goteo adicional, se cierra el ciclo en firme.
-            decision, motivo = evaluar_flujo_opciones(ticker, hist_actualizado)
-            if decision == "ENTRAR":
-                delta = 1.0 - pct_previo
-                accion = "CIERRE: ENTRAR"
-                recomendacion = f"CIERRE DIA {DIAS_CICLO} -> COMPRAR EL {delta*100:.1f}% RESTANTE ({motivo})"
-            else:
-                delta = 0.0
-                pct_cash = 1.0 - pct_previo
-                accion = "CIERRE: CASH"
-                recomendacion = f"CIERRE DIA {DIAS_CICLO} -> DEJAR {pct_cash*100:.1f}% EN CASH ({motivo})"
-        else:
-            delta = max(0.0, pct_objetivo_hoy - pct_previo)
-            if delta > 0:
-                accion = "SUMAR"
-                recomendacion = "COMPLETAR A 100%" if pct_objetivo_hoy >= 1.0 else f"SUMAR +{delta*100:.1f}%"
-            else:
-                accion = "MANTENER"
-                recomendacion = "MANTENER (ya en el nivel objetivo de hoy)"
-
-        pct_final = min(1.0, pct_previo + delta)
-
-        filas_estado.append({
-            "ciclo": ciclo,
-            "dia_ciclo": dia_ciclo,
-            "ticker": ticker,
-            "peso_objetivo_pct": round(peso_objetivo * 100, 2) if not pd.isna(peso_objetivo) else np.nan,
-            "pct_ya_invertido_previo": round(pct_previo * 100, 1),
-            "pct_objetivo_hoy": round(pct_objetivo_hoy * 100, 1),
-            "delta_sugerido_hoy_pct": round(delta * 100, 1),
-            "pct_invertido_final_pct": round(pct_final * 100, 1),
-            "cash_definitivo_pct": round(pct_cash * 100, 1),
-            "delta_puntos_portafolio": (
-                round(delta * peso_objetivo * 100, 2) if not pd.isna(peso_objetivo) else np.nan
-            ),
-            "accion": accion,
-            "recomendacion": recomendacion,
-        })
+        filas_estado.append(construir_fila_estado(
+            fila, activo["pct_ya_invertido"], PESOS_OBJETIVO.get(ticker, np.nan),
+            dia_ciclo, ciclo, hist_actualizado,
+        ))
 
     pending_cash = {}
     pending_decisions = {}
@@ -766,16 +965,29 @@ def construir_senal_entrada(resumen):
         reason = "" if pd.isna(fila["recomendacion"]) else str(fila["recomendacion"])
         accion = "" if pd.isna(fila["accion"]) else str(fila["accion"])
         delta_pct = 0.0 if pd.isna(fila["delta_sugerido_hoy_pct"]) else float(fila["delta_sugerido_hoy_pct"])
+        # Campos de tier (tickers.resolve_instrument): solo si la fila los trae.
+        extra = {}
+        if "tier" in fila.index and not pd.isna(fila["tier"]):
+            extra["tier"] = str(fila["tier"])
+            claves = ["analysis_ticker", "proxy_etf"]
+            if extra["tier"] != "native":
+                # Epic de Capital.com solo si esta verificado; None = no operar.
+                claves.append("capital_epic")
+            for key in claves:
+                value = fila.get(key)
+                extra[key] = None if value is None or pd.isna(value) else str(value)
         if delta_pct > 0 and target is not None:
             if accion == "CIERRE: ENTRAR":
                 signal = "cycle_close"
+            elif accion == "ESCALONADO":
+                signal = "staggered"
             elif score is not None and score >= UMBRAL_ALTO:
                 signal = "high_conviction"
             elif score is not None and score >= UMBRAL_MEDIO:
                 signal = "medium_conviction"
             else:
                 signal = "low_conviction"
-            entries.append({
+            entry = {
                 "order": len(entries) + 1,
                 "ticker": str(fila["ticker"]),
                 "action": "BUY",
@@ -784,9 +996,16 @@ def construir_senal_entrada(resumen):
                 "signal": signal,
                 "score": score,
                 "reason": reason,
-            })
+                **extra,
+            }
+            original = fila.get("peso_objetivo_original_pct")
+            tope = fila.get("tope_peso_aplicado")
+            if tope is not None and not pd.isna(tope) and bool(tope) \
+                    and original is not None and not pd.isna(original):
+                entry["uncapped_target_weight"] = round(float(original) / 100.0, 6)
+            entries.append(entry)
         else:
-            waiting.append({"ticker": str(fila["ticker"]), "score": score, "reason": reason})
+            waiting.append({"ticker": str(fila["ticker"]), "score": score, "reason": reason, **extra})
 
     return {
         "entries": entries,

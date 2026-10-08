@@ -6,7 +6,10 @@ import pandas as pd
 from datetime import date
 
 from pipeline_io import export_signals, load_portfolio
-from tickers import exclusion_warnings, no_us_options_reason, to_polygon, to_yahoo
+from price_signals import price_indicators
+from tickers import (
+    adr_warnings, exclusion_warnings, no_options_weight_cap, resolve_instrument, to_polygon, to_yahoo,
+)
 
 portfolio = {
     "XLU": 0.12,
@@ -646,30 +649,61 @@ def run_options_module_for_ticker(ticker, hv_annual, horizon_days, api_key,
         "notional_concentration": max_pain["notional_concentration"]
     }
 
+def options_source(instrument):
+    """Simbolo cuya cadena se lee para el ticker (tickers.resolve_instrument).
+
+    native / adr -> el ticker o su ADR; proxy -> el ETF pais; none -> None.
+    """
+    tier = instrument["tier"]
+    if tier in ("native", "adr"):
+        return instrument["analysis_ticker"]
+    if tier == "proxy":
+        return instrument["proxy_etf"]
+    return None
+
 def run_options_module(tickers, hv_by_asset, weights, horizon_days, api_key,
                         spot_by_asset=None, rf_annual=0):
     results = {}
     excluded = []
+    instruments = {}
     for tk in tickers:
-        reason = no_us_options_reason(tk)
-        if reason:
-            excluded.append({"ticker": tk, "reason": reason})
+        inst = resolve_instrument(tk)
+        tier = inst["tier"]
+        instruments[tk] = inst
+        symbol = options_source(inst)
+        if symbol is None:
+            reason = (inst["reason"] or "no US-listed options") + "; no ADR or proxy ETF (tier none)"
+            excluded.append({"ticker": tk, "reason": reason, "tier": tier})
             log_warn(f"{tk}: {reason}. Se omite del modulo de opciones.")
             continue
-        spot_fb = spot_by_asset.get(tk, np.nan) if spot_by_asset else np.nan
+        # El spot local (p. ej. RY.TO en CAD) no sirve de respaldo para la cadena
+        # del ADR o del ETF proxy (USD): solo se usa en tier native.
+        spot_fb = spot_by_asset.get(tk, np.nan) if spot_by_asset and tier == "native" else np.nan
         try:
-            results[tk] = run_options_module_for_ticker(
-                tk, hv_by_asset.get(tk), horizon_days, api_key,
+            result = run_options_module_for_ticker(
+                symbol, hv_by_asset.get(tk), horizon_days, api_key,
                 spot_fallback=spot_fb, rf_annual=rf_annual
             )
+            result["ticker"] = tk
+            if tier != "native":
+                result.update({"tier": tier, "analysis_ticker": symbol, "proxy_etf": inst["proxy_etf"]})
+            results[tk] = result
         except Exception as exc:
             if not isinstance(exc, (NoOptionData, PolygonError)):
                 log_error(f"{tk}: error procesando la cadena ({exc}). Se omite del modulo de opciones.")
-            excluded.append({"ticker": tk, "reason": failure_reason(exc)})
+            entry = {"ticker": tk, "reason": failure_reason(exc)}
+            if tier == "proxy":
+                # Proxy sin datos: el ticker queda como tier none (tope de peso).
+                entry["reason"] = f"proxy {symbol}: {entry['reason']}"
+                instruments[tk] = {**inst, "tier": "none"}
+            if tier != "native":
+                entry.update({"tier": instruments[tk]["tier"], "proxy_etf": inst["proxy_etf"]})
+            excluded.append(entry)
 
     if len(results) == 0:
         log_warn("MODULO 2: ningun activo tuvo datos de opciones disponibles.")
-        return {"by_asset": {}, "summary": pd.DataFrame(), "portfolio_iv": np.nan, "excluded": excluded}
+        return {"by_asset": {}, "summary": pd.DataFrame(), "portfolio_iv": np.nan, "excluded": excluded,
+                "instruments": instruments}
 
     summary_rows = []
     for r in results.values():
@@ -702,7 +736,25 @@ def run_options_module(tickers, hv_by_asset, weights, horizon_days, api_key,
         "summary": summary_tbl,
         "portfolio_iv": portfolio_iv,
         "excluded": excluded,
+        "instruments": instruments,
     }
+
+def fallback_components(instruments, prices, weights):
+    """Indicadores de precio (tiers proxy / none) y tope de peso (tier none).
+
+    Devuelve ``(price_signals, weight_caps)`` por ticker local. Los precios son
+    los de Yahoo de la cotizacion local que ya usa el Modulo 1.
+    """
+    price_signals = {}
+    weight_caps = {}
+    for tk, inst in (instruments or {}).items():
+        if inst.get("tier") not in ("proxy", "none"):
+            continue
+        if prices is not None and tk in prices.columns:
+            price_signals[tk] = price_indicators(prices[tk])
+        if inst.get("tier") == "none" and tk in weights:
+            weight_caps[tk] = no_options_weight_cap(weights[tk])
+    return price_signals, weight_caps
 
 # =============================================================================
 # BLOQUE 6: APALANCAMIENTO DINAMICO POR ACTIVO
@@ -850,7 +902,7 @@ def plot_gex_profile(options_by_asset):
         if r is None or len(r["gex_profile"]) == 0:
             continue
         df = r["gex_profile"].copy()
-        df["Activo"] = tk
+        df["Activo"] = f"{tk} (proxy {r['proxy_etf']})" if r.get("tier") == "proxy" else tk
         frames.append(df)
 
     if not frames:
@@ -967,11 +1019,15 @@ def _senal_riesgo(leverage_results, options_module):
             return None
         return float(value)
 
+    instruments = options_module.get("instruments") or {}
+    price_signals = options_module.get("price_signals") or {}
+    weight_caps = options_module.get("weight_caps") or {}
+
     by_ticker = []
     for _, row in summary.sort_values("Risk_Score", ascending=False).iterrows():
         ticker = row["Activo"]
         extra = detail.loc[ticker] if ticker in detail.index else None
-        by_ticker.append({
+        item = {
             "ticker": str(ticker),
             "weight": _num(row["Peso_Inicial"]),
             "risk_score": _num(row["Risk_Score"]),
@@ -982,7 +1038,26 @@ def _senal_riesgo(leverage_results, options_module):
             "iv": None if extra is None else _num(extra["IV"]),
             "gex_total": None if extra is None else _num(extra["gex_total"]),
             "pcr_oi": None if extra is None else _num(extra["pcr_oi"]),
-        })
+        }
+        # Tier del instrumento (tickers.resolve_instrument). En tier proxy, iv,
+        # gex_total y pcr_oi salen de las opciones del ETF pais.
+        inst = instruments.get(str(ticker))
+        if inst:
+            item["tier"] = inst.get("tier")
+            item["analysis_ticker"] = inst.get("analysis_ticker")
+            item["proxy_etf"] = inst.get("proxy_etf")
+        if str(ticker) in price_signals:
+            item["price_signals"] = {
+                key: _num(value) for key, value in price_signals[str(ticker)].items()
+            }
+        if str(ticker) in weight_caps:
+            cap = _num(weight_caps[str(ticker)])
+            item["weight_cap"] = cap
+            leverage = item["leverage"]
+            item["effective_exposure_capped"] = (
+                None if cap is None or leverage is None else cap * leverage
+            )
+        by_ticker.append(item)
 
     portfolio_iv = options_module.get("portfolio_iv")
     return {
@@ -997,6 +1072,24 @@ def _senal_riesgo(leverage_results, options_module):
         },
         "excluded": list(options_module.get("excluded") or []),
     }
+
+
+def _fallback_warnings(data):
+    """Avisos de tier proxy / none para la seccion warnings del JSON."""
+    out = []
+    for item in (data.get("components") or {}).get("by_ticker") or []:
+        tier = item.get("tier")
+        if tier == "proxy":
+            out.append(
+                f"{item['ticker']}: no US options or ADR; iv/gex_total/pcr_oi from proxy "
+                f"{item.get('proxy_etf')} options (tier proxy)"
+            )
+        elif tier == "none" and item.get("weight_cap") is not None:
+            out.append(
+                f"{item['ticker']}: no options, ADR or proxy data; weight capped at "
+                f"{item['weight_cap']:.4f} (tier none)"
+            )
+    return out
 
 
 # =============================================================================
@@ -1043,6 +1136,12 @@ else:
         rf_annual=risk_free_rate_annual
     )
 
+_instruments = options_module.get("instruments") or {tk: resolve_instrument(tk) for tk in tickers}
+options_module["instruments"] = _instruments
+options_module["price_signals"], options_module["weight_caps"] = fallback_components(
+    _instruments, prices, portfolio_priced
+)
+
 leverage_results = run_leverage_module(
     expost_results=expost_results,
     options_module=options_module,
@@ -1058,7 +1157,11 @@ export_signals(
     "portfolio_risk_score_leverage",
     _senal_riesgo_data,
     _PORTFOLIO_META,
-    warnings=exclusion_warnings(_senal_riesgo_data.get("excluded")),
+    warnings=(
+        exclusion_warnings(_senal_riesgo_data.get("excluded"))
+        + adr_warnings(list(portfolio.keys()))
+        + _fallback_warnings(_senal_riesgo_data)
+    ),
 )
 
 plots = run_reporting_module(

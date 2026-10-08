@@ -20,7 +20,8 @@ import pandas as pd
 from pipeline_io import export_signals, load_portfolio
 from polygon_client import NoOptionData, PolygonClient, failure_reason
 from tickers import (
-    dividend_yield_from_info, exclusion_warnings, no_us_options_reason, to_polygon, to_yahoo,
+    adr_warnings, dividend_yield_from_info, exclusion_warnings, options_exclusion, options_underlying,
+    to_polygon, to_yahoo,
 )
 from scipy.interpolate import CubicSpline
 from scipy.optimize import brentq, least_squares
@@ -1306,17 +1307,19 @@ class PolygonMarketLoader:
         now = pd.Timestamp.now(tz="UTC")
 
         for tk in tickers:
-            reason = no_us_options_reason(tk)
-            if reason:
-                self.excluded.append({"ticker": str(tk), "reason": reason})
-                warnings.warn(f"[{tk}] {reason}", RuntimeWarning)
+            exclusion = options_exclusion(tk)
+            if exclusion:
+                self.excluded.append(exclusion)
+                warnings.warn(f"[{tk}] {exclusion['reason']}", RuntimeWarning)
                 continue
+            # Tier adr: datos del ADR (RY.TO -> RY); la llave sigue siendo tk.
+            src = options_underlying(tk)
             try:
-                hist = self._history(tk, lookback)
+                hist = self._history(src, lookback)
                 spot = float(hist.iloc[-1])
-                q, dividends = self._dividend_schedule(tk, spot)
+                q, dividends = self._dividend_schedule(src, spot)
 
-                exps = select_cboe_expiries(self._expirations(tk), self.min_days)
+                exps = select_cboe_expiries(self._expirations(src), self.min_days)
                 if not exps:
                     raise NoOptionData("no option data returned (sin vencimientos en la ventana)")
                 if len(exps) < 2:
@@ -1330,7 +1333,7 @@ class PolygonMarketLoader:
                 for e in exps:
                     T = year_fraction(pd.Timestamp(e), now)
                     s_eff, q_eff = escrowed_inputs(spot, q, dividends, T, self.r, now)
-                    chain = self._chain(tk, e, s_eff, T, q_eff)
+                    chain = self._chain(src, e, s_eff, T, q_eff)
                     if chain.empty:
                         warnings.warn(
                             f"[{tk} {e}] Polygon no devolvió contratos utilizables.",
@@ -1392,13 +1395,14 @@ class YahooMarketLoader:
         now = pd.Timestamp.now(tz="UTC")
 
         for tk in tickers:
-            reason = no_us_options_reason(tk)
-            if reason:
-                self.excluded.append({"ticker": str(tk), "reason": reason})
-                warnings.warn(f"[{tk}] {reason}", RuntimeWarning)
+            exclusion = options_exclusion(tk)
+            if exclusion:
+                self.excluded.append(exclusion)
+                warnings.warn(f"[{tk}] {exclusion['reason']}", RuntimeWarning)
                 continue
             try:
-                t = yf.Ticker(to_yahoo(tk))
+                # Tier adr: datos del ADR (RY.TO -> RY); la llave sigue siendo tk.
+                t = yf.Ticker(to_yahoo(options_underlying(tk)))
                 hist = t.history(period=lookback, auto_adjust=True)["Close"].dropna()
                 if hist.empty:
                     raise RuntimeError(f"sin histórico para {tk}")
@@ -1849,11 +1853,11 @@ class PortfolioVIXCalculator:
         eligible = []
         seen = {item["ticker"] for item in self.excluded}
         for ticker in self.cfg.tickers:
-            reason = no_us_options_reason(ticker)
+            exclusion = options_exclusion(ticker)
             key = str(ticker)
-            if reason:
+            if exclusion:
                 if key not in seen:
-                    self.excluded.append({"ticker": key, "reason": reason})
+                    self.excluded.append(exclusion)
                     seen.add(key)
                 continue
             eligible.append(ticker)
@@ -2160,5 +2164,5 @@ if __name__ == "__main__":
     senal = _senal_vix(results, cfg)
     export_signals(
         "portfolio_vix", senal, _vix_portfolio_meta(cfg),
-        warnings=exclusion_warnings(senal.get("excluded")),
+        warnings=exclusion_warnings(senal.get("excluded")) + adr_warnings(cfg.tickers),
     )

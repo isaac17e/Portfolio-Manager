@@ -16,7 +16,7 @@ from plotly.subplots import make_subplots
 from gex_utils import gamma_flip_level
 from polygon_client import NoOptionData, PolygonClient, PolygonError, failure_reason
 from pipeline_io import export_signals, load_portfolio
-from tickers import exclusion_warnings, no_us_options_reason, to_polygon
+from tickers import adr_warnings, exclusion_warnings, options_exclusion, options_underlying, to_polygon
 
 # ============================================================================
 # BLOQUE 1: PARAMETROS CONFIGURABLES
@@ -701,7 +701,9 @@ def get_price_history(tickers, lookback_days=corr_lookback_days, api_key=polygon
     series = {}
 
     for tk in tickers:
-        url = (f"{POLYGON_BASE_URL}/v2/aggs/ticker/{to_polygon(tk)}/range/1/day/"
+        # Tier adr: historico del ADR (RY.TO -> RY), coherente con su IV.
+        simbolo = options_underlying(tk) or tk
+        url = (f"{POLYGON_BASE_URL}/v2/aggs/ticker/{to_polygon(simbolo)}/range/1/day/"
                f"{start.isoformat()}/{end.isoformat()}")
         resp = polygon_get(url, params={"adjusted": "true", "sort": "asc", "limit": 50000},
                            api_key=api_key)
@@ -1930,13 +1932,22 @@ def run_active_management_engine(portfolio, horizon_days, api_key, cash_limit):
     analyses = {}
     excluded = []
     for tk in tickers:
-        reason = no_us_options_reason(tk)
-        if reason:
-            excluded.append({"ticker": tk, "reason": reason})
+        # Tiers (tickers.resolve_instrument): native y adr usan su cadena (la del
+        # ADR para RY.TO -> RY). proxy y none se excluyen: el score tactico
+        # rebalancea por la gamma del propio activo y la de un ETF pais no aplica.
+        exclusion = options_exclusion(tk)
+        if exclusion:
+            reason = exclusion["reason"]
+            excluded.append(exclusion)
             analyses[tk] = {"ticker": tk, "status": "ERROR", "error_message": reason}
             warnings.warn(f"{tk}: {reason}. Se omite del modulo de opciones.")
             continue
-        analyses[tk] = analyze_ticker_options(tk, horizon_days, api_key)
+        simbolo = options_underlying(tk)
+        analyses[tk] = analyze_ticker_options(simbolo, horizon_days, api_key)
+        # La llave del portafolio sigue siendo el ticker local.
+        analyses[tk]["ticker"] = tk
+        if simbolo != tk:
+            analyses[tk]["analysis_ticker"] = simbolo
         if analyses[tk].get("status") != "OK":
             excluded.append({"ticker": tk,
                              "reason": analyses[tk].get("exclusion_reason") or failure_reason(None)})
@@ -2050,7 +2061,7 @@ resultado = run_active_management_engine(portfolio, investment_horizon_days, pol
 _senal_activa = _senal_gestion_activa(resultado)
 export_signals(
     "active_management", _senal_activa, _PORTFOLIO_META,
-    warnings=exclusion_warnings(_senal_activa.get("excluded")),
+    warnings=exclusion_warnings(_senal_activa.get("excluded")) + adr_warnings(list(portfolio.keys())),
 )
 
 if resultado["gamma_plot"] is not None:

@@ -187,6 +187,9 @@ Each script also writes a JSON signal (contract section 4) through `pipeline_io.
 | `ENTRY_CYCLE_DAY` | next day from `entry_state.json` |
 | `ENTRY_INVESTED_PCT` | percents already stored in `entry_state.json` |
 | `HEADLESS` or `GEX_ONCE` | unset (set to `1` for the GEX pipeline run) |
+| `ENTRY_STAGGER_PCT` | `0.20` (tier `none`: share of the target bought per cycle day) |
+| `NO_OPTIONS_WEIGHT_CAP_FACTOR` | `0.5` (tier `none`: target weight x factor) |
+| `NO_OPTIONS_WEIGHT_CAP` | unset (tier `none`: optional absolute weight cap) |
 
 CLI equivalents: `entry_signal_tool.py --cycle-day` and `--invested-pct` (env is used when the flag is omitted). `portfolio_gex_field.py --once` is the same switch as `HEADLESS=1` or `GEX_ONCE=1`.
 
@@ -197,9 +200,17 @@ CLI equivalents: `entry_signal_tool.py --cycle-day` and `--invested-pct` (env is
 | Canonical | Yahoo | Polygon | Capital.com epic (unverified) | US options |
 |---|---|---|---|---|
 | `BRK-B` or `BRK.B` | `BRK-B` | `BRK.B` | `BRK.B` | yes |
-| `RY.TO` | `RY.TO` | `RY.TO` | `RY` | no (suffix `.TO`) |
+| `RY.TO` | `RY.TO` | `RY.TO` | `RY` (verified) | no (suffix `.TO`); analysed via ADR `RY` |
 
 Polygon and Yahoo calls use those forms. Capital.com epics are a best-effort guess (class shares keep the Polygon dot; the exchange suffix is stripped) and **must be verified** against the broker catalogue before any order.
+
+International tickers keep their local symbol as the portfolio key. `resolve_instrument` picks a tier:
+
+- `adr`: a US twin listing in `_ADR_TABLE` (`RY.TO` -> `RY`, the only entry, verified on Capital.com 2026-10-06). Options and orders use the ADR. An unverified entry is used for analysis only, adds a warning, and gets `capital_epic: null`.
+- `proxy`: no ADR. The country ETF of the exchange suffix (`EWC`, `EWJ`, `EWZ`, ...) stands in for IV / gamma / put-call. `entry_signal_tool` adds daily-price indicators from Yahoo (trend vs SMA 50/200, RSI 14, realized vol vs its mean, drawdown). `portfolio_risk_score_leverage` adds the same indicators as `price_signals`.
+- `none`: no ADR and no proxy ETF, or no proxy data. `entry_signal_tool` buys a fixed `ENTRY_STAGGER_PCT` tranche of a capped target per signal, on top of what was filled, (`signal: "staggered"`). `portfolio_risk_score_leverage` reports `weight_cap` and `effective_exposure_capped`.
+
+Entries, waiting rows and `by_ticker` items gain `tier`, `analysis_ticker` and `proxy_etf`. Non-native entries also carry `capital_epic`, which is null unless verified. `portfolio_gex_field`, `portfolio_vix` and `active_management` use the ADR. They exclude `proxy` and `none` tickers, naming the proxy ETF in the reason as a reference only.
 
 Options scripts (`active_management`, `entry_signal_tool`, `portfolio_risk_score_leverage`, `portfolio_vix`, `portfolio_gex_field`) skip a ticker that has no US-listed options, or that returns no option chain, instead of aborting the run. Those scripts add:
 
