@@ -95,7 +95,8 @@ else:
 data["headless_env"] = os.environ.get("HEADLESS")
 data["env_seen"] = {
     name: os.environ.get(name)
-    for name in ("CYCLE_DATE", "RISK_FREE_RATE", "ENTRY_FORCE_NEW_TRANCHE", "ENTRY_CYCLE_DAY")
+    for name in ("CYCLE_DATE", "RISK_FREE_RATE", "ENTRY_FORCE_NEW_TRANCHE", "ENTRY_CYCLE_DAY",
+                 "PORTFOLIO_HORIZON_DAYS")
 }
 run_ts = datetime.now(ZoneInfo("America/Bogota")).replace(microsecond=0).isoformat()
 payload = {

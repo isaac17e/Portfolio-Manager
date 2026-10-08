@@ -12,7 +12,7 @@ import json
 import math
 import os
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
@@ -34,6 +34,15 @@ DEFAULT_EXECUTIONS_DIR = "/workspace/pipeline/executions"
 _APPLIED_FILL_STATUSES = {"filled", "partial", "partially_filled"}
 _WEIGHT_UNIT = 1_000_000
 _ZERO_WEIGHT = 1e-6
+
+# Portfolio horizon (contract section 1: horizon_days, horizon_end,
+# params.horizon_months). run_cycle passes each step its horizon in calendar
+# days through HORIZON_ENV; standalone runs read it from the portfolio file.
+HORIZON_ENV = "PORTFOLIO_HORIZON_DAYS"
+# Shortest option expiry (calendar days) any script reads for the horizon.
+# Below a week the chain is dominated by expiry-week gamma and pin effects.
+MIN_OPTION_DAYS = 7
+_DAYS_PER_MONTH = 30.44
 
 
 def _now_bogota() -> datetime:
@@ -96,6 +105,9 @@ def _fallback_result(fallback, reason: str) -> dict:
         "portfolio_source": "hardcoded_fallback",
         "portfolio_run_ts": None,
         "portfolio_optimizer": None,
+        "horizon_days": None,
+        "horizon_end": None,
+        "horizon_months": None,
     }
 
 
@@ -190,12 +202,177 @@ def load_portfolio(fallback) -> dict:
 
     run_ts = payload.get("run_ts")
     optimizer = payload.get("optimizer")
+    horizon = portfolio_horizon_fields(payload)
+    end = horizon["horizon_end"]
     return {
         "weights": weights,
         "portfolio_source": path,
         "portfolio_run_ts": run_ts if isinstance(run_ts, str) and run_ts else None,
         "portfolio_optimizer": optimizer if isinstance(optimizer, str) and optimizer else None,
+        "horizon_days": horizon["horizon_days"],
+        "horizon_end": end.isoformat() if end else None,
+        "horizon_months": horizon["horizon_months"],
     }
+
+
+def _positive_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and number > 0 else None
+
+
+def _iso_date(value):
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.strptime(value.strip()[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _add_months(start: date, months: float) -> date:
+    whole = int(months)
+    if whole != months:
+        return start + timedelta(days=round(months * _DAYS_PER_MONTH))
+    index = start.month - 1 + whole
+    year, month = start.year + index // 12, index % 12 + 1
+    for day in range(start.day, 0, -1):
+        try:
+            return date(year, month, day)
+        except ValueError:
+            continue
+    return date(year, month, 1)
+
+
+def portfolio_horizon_fields(portfolio) -> dict:
+    """Horizon fields of a portfolio payload, or of a ``load_portfolio`` result.
+
+    Returns ``horizon_days`` (int or None), ``horizon_end`` (date or None),
+    ``horizon_months`` (number or None; top level or ``params.horizon_months``)
+    and ``run_date`` (date of ``run_ts`` / ``portfolio_run_ts`` or None).
+    Invalid values are treated as missing.
+    """
+    portfolio = portfolio if isinstance(portfolio, dict) else {}
+    days = _positive_number(portfolio.get("horizon_days"))
+    params = portfolio.get("params") if isinstance(portfolio.get("params"), dict) else {}
+    months = _positive_number(portfolio.get("horizon_months"))
+    if months is None:
+        months = _positive_number(params.get("horizon_months"))
+    run_ts = portfolio.get("run_ts") or portfolio.get("portfolio_run_ts")
+    run_date = None
+    if isinstance(run_ts, str) and run_ts.strip():
+        try:
+            run_date = datetime.fromisoformat(re.sub(r"Z$", "+00:00", run_ts.strip())).date()
+        except ValueError:
+            run_date = None
+    return {
+        "horizon_days": int(round(days)) if days is not None else None,
+        "horizon_end": _iso_date(portfolio.get("horizon_end")),
+        "horizon_months": months,
+        "run_date": run_date,
+    }
+
+
+def portfolio_horizon_days(portfolio, today=None, mode: str = "remaining") -> int | None:
+    """Calendar days of the portfolio horizon, or None when the file has none.
+
+    ``mode="full"``: the whole term (``horizon_days``, else ``horizon_end``
+    minus the run date, else ``horizon_months``). ``mode="remaining"``: days
+    from ``today`` (default ``cycle_today()``) to ``horizon_end``; the end is
+    derived from the run date plus ``horizon_days`` / ``horizon_months`` when
+    ``horizon_end`` is missing, and without any end date it is the full term.
+    The remaining value can be zero or negative after the horizon has passed.
+    """
+    if mode not in ("full", "remaining"):
+        raise ValueError(f"mode must be 'full' or 'remaining', got {mode!r}")
+    info = portfolio_horizon_fields(portfolio)
+    run_date, end = info["run_date"], info["horizon_end"]
+    if end is None and run_date is not None:
+        if info["horizon_days"] is not None:
+            end = run_date + timedelta(days=info["horizon_days"])
+        elif info["horizon_months"] is not None:
+            end = _add_months(run_date, info["horizon_months"])
+
+    full = info["horizon_days"]
+    if full is None and end is not None and run_date is not None and end > run_date:
+        full = (end - run_date).days
+    if full is None and info["horizon_months"] is not None:
+        full = int(round(info["horizon_months"] * _DAYS_PER_MONTH))
+
+    if mode == "full":
+        return full
+    if end is None:
+        return full
+    today = _iso_date(today) or cycle_today()
+    return (end - today).days
+
+
+def resolve_horizon(portfolio_meta, default_days, mode: str = "remaining", today=None,
+                    env=None, min_days: int = MIN_OPTION_DAYS) -> dict:
+    """Horizon a script works with, in calendar days, with where it came from.
+
+    Order: ``PORTFOLIO_HORIZON_DAYS`` (set by run_cycle), then the portfolio
+    file (``portfolio_horizon_days`` with ``mode``), then ``default_days``.
+    ``days`` is never below ``min_days``. The dict goes into each signal's
+    ``data["horizon"]``: ``days``, ``source`` ("portfolio" or "default"),
+    ``via`` ("env", "file" or None), ``mode``, ``raw_days`` (before the floor),
+    ``min_days``, ``floored``, ``default_days`` and ``horizon_end``.
+    """
+    environ = os.environ if env is None else env
+    raw, source, via = None, "default", None
+    text = environ.get(HORIZON_ENV)
+    if text is not None and str(text).strip():
+        try:
+            number = float(str(text).strip())
+        except ValueError:
+            number = None
+        if number is not None and math.isfinite(number):
+            raw, source, via = int(round(number)), "portfolio", "env"
+        else:
+            _warn(f"Ignoring invalid {HORIZON_ENV}={text!r}.")
+    if raw is None:
+        from_file = portfolio_horizon_days(portfolio_meta, today=today, mode=mode)
+        if from_file is not None:
+            raw, source, via = int(from_file), "portfolio", "file"
+    if raw is None:
+        raw = int(round(default_days))
+    days = max(raw, int(min_days))
+    end = portfolio_horizon_fields(portfolio_meta)["horizon_end"]
+    return {
+        "days": days,
+        "source": source,
+        "via": via,
+        "mode": mode,
+        "raw_days": raw,
+        "min_days": int(min_days),
+        "floored": days != raw,
+        "default_days": int(round(default_days)),
+        "horizon_end": end.isoformat() if end else None,
+    }
+
+
+def pick_expiration(expirations, today, target_days, min_days: int = MIN_OPTION_DAYS):
+    """Expiry closest to ``today + target_days`` among those ``>= min_days`` out.
+
+    ``expirations`` are dates or YYYY-MM-DD strings. Returns ``(expiry, fallback)``.
+    When no expiry clears the floor, the one closest to the target is returned
+    with ``fallback=True``; an empty list gives ``(None, False)``. Ties go to
+    the earlier expiry, as in the scripts' previous selection.
+    """
+    today = _iso_date(today)
+    parsed = sorted({d for d in (_iso_date(e) for e in expirations or []) if d is not None})
+    parsed = [d for d in parsed if d >= today]
+    if not parsed:
+        return None, False
+    target = today + timedelta(days=max(int(round(target_days)), int(min_days)))
+    eligible = [d for d in parsed if (d - today).days >= int(min_days)]
+    pool = eligible or parsed
+    return min(pool, key=lambda d: abs((d - target).days)), not eligible
 
 
 def _is_nan(value) -> bool:

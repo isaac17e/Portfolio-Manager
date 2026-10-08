@@ -13,6 +13,12 @@ lock); run_cycle exports the cycle date to every step as ``CYCLE_DATE`` and
 passes the rest of the environment through unchanged (``RISK_FREE_RATE``,
 ``ENTRY_CYCLE_DAY``, ...). ``--force-new-tranche`` bypasses that lock.
 
+The portfolio horizon goes to each step as ``PORTFOLIO_HORIZON_DAYS`` (calendar
+days, ``STEP_HORIZON_MODE``): the full term for ``entry_signal_tool``, the days
+left from the cycle date to ``horizon_end`` for the risk, GEX, VIX and active
+management steps. Without a horizon in the portfolio the variable is unset and
+each step keeps its own default.
+
 Each step is a subprocess of this interpreter (``sys.executable``). Stdin is
 ``DEVNULL``. After a step exits 0, ``<SIGNALS_OUT_DIR>/<script>.json`` must
 have been written during that step, with ``portfolio_source`` equal to the
@@ -40,6 +46,8 @@ import time
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+import pipeline_io
+
 BOGOTA = ZoneInfo("America/Bogota")
 NEW_YORK = ZoneInfo("America/New_York")
 SCHEMA_VERSION = 1
@@ -59,6 +67,17 @@ DAILY_STEPS = [
 ]
 WEEKLY_STEPS = ["active_management"]
 ALL_STEPS = DAILY_STEPS + WEEKLY_STEPS
+# Horizon each step receives in PORTFOLIO_HORIZON_DAYS (calendar days).
+# "full": the whole portfolio term (entry builds the position for all of it).
+# "remaining": days from the cycle date to horizon_end (risk and hedging
+# readings look at what is left). fundamental_analysis uses no horizon.
+STEP_HORIZON_MODE = {
+    "portfolio_risk_score_leverage": "remaining",
+    "portfolio_gex_field": "remaining",
+    "portfolio_vix": "remaining",
+    "entry_signal_tool": "full",
+    "active_management": "remaining",
+}
 STEP_ALIASES = {
     "fundamental": "fundamental_analysis",
     "risk": "portfolio_risk_score_leverage",
@@ -301,12 +320,15 @@ def load_portfolio_file(path: str) -> dict:
     weights = _parse_weights(payload.get("weights"))
     tickers = _parse_tickers(payload.get("tickers"), weights)
     horizon_end = _parse_horizon_end(payload)
+    horizon = pipeline_io.portfolio_horizon_fields(payload)
 
     return {
         "path": path,
         "optimizer": optimizer,
         "run_ts": run_ts,
         "horizon_end": horizon_end,
+        "horizon_days": horizon["horizon_days"],
+        "horizon_months": horizon["horizon_months"],
         "tickers": tickers,
         "weights": weights,
     }
@@ -385,22 +407,42 @@ def build_command(script: str) -> list[str]:
     return command
 
 
+def step_horizon_days(script: str, portfolio: dict, as_of: date) -> int | None:
+    """Calendar days of horizon for ``script`` (see ``STEP_HORIZON_MODE``).
+
+    None for a step without a horizon or a portfolio without one. A
+    "remaining" value can be <= 0 after horizon_end; the step floors it at
+    ``pipeline_io.MIN_OPTION_DAYS``.
+    """
+    mode = STEP_HORIZON_MODE.get(script)
+    if mode is None:
+        return None
+    return pipeline_io.portfolio_horizon_days(portfolio, today=as_of, mode=mode)
+
+
 def step_environment(
     portfolio_path: str,
     signals_dir: str,
     script: str,
     as_of: date | None = None,
     force_new_tranche: bool = False,
+    horizon_days: int | None = None,
 ) -> dict:
     """Parent environment plus the portfolio, signal locations and cycle date.
 
     Everything else (``RISK_FREE_RATE``, ``ENTRY_CYCLE_DAY``, ...) is inherited
     unchanged. ``CYCLE_DATE`` makes the steps use the same day as ``--date``.
+    ``PORTFOLIO_HORIZON_DAYS`` is set to ``horizon_days``; without one it is
+    removed so the step does not inherit a horizon from another portfolio.
     """
     env = os.environ.copy()
     env["PORTFOLIO_FILE"] = portfolio_path
     env["SIGNALS_OUT_DIR"] = signals_dir
     env["PYTHONUNBUFFERED"] = "1"
+    if horizon_days is not None:
+        env[pipeline_io.HORIZON_ENV] = str(int(horizon_days))
+    else:
+        env.pop(pipeline_io.HORIZON_ENV, None)
     if as_of is not None:
         env["CYCLE_DATE"] = as_of.isoformat()
     if force_new_tranche and script == "entry_signal_tool":
@@ -761,6 +803,8 @@ def run_steps(
             continue
         command = build_command(script)
         record = _blank_step(script, command)
+        horizon_days = step_horizon_days(script, portfolio, as_of)
+        record["horizon_days"] = horizon_days
 
         step_start = _now_bogota()
         started = time.monotonic()
@@ -768,6 +812,7 @@ def run_steps(
             command,
             step_environment(
                 portfolio["path"], signals_dir, script, as_of, force_new_tranche,
+                horizon_days,
             ),
             timeout,
         )
@@ -828,6 +873,8 @@ def _portfolio_view(portfolio: dict) -> dict:
         "optimizer": portfolio.get("optimizer"),
         "run_ts": portfolio.get("run_ts"),
         "horizon_end": horizon,
+        "horizon_days": portfolio.get("horizon_days"),
+        "horizon_months": portfolio.get("horizon_months"),
     }
 
 
@@ -1022,13 +1069,18 @@ def _print_plan(mode: str, as_of: date, portfolio: dict, steps: list[str], signa
     print("steps:")
     for index, script in enumerate(steps, start=1):
         command = build_command(script)
-        env = step_environment(portfolio["path"], signals_dir, script, as_of, force_new_tranche)
+        env = step_environment(
+            portfolio["path"], signals_dir, script, as_of, force_new_tranche,
+            step_horizon_days(script, portfolio, as_of),
+        )
         print(f"  {index} {script}")
         print("    " + " ".join(command))
         extra = (
             f"PORTFOLIO_FILE={env['PORTFOLIO_FILE']} SIGNALS_OUT_DIR={env['SIGNALS_OUT_DIR']} "
             f"CYCLE_DATE={env['CYCLE_DATE']}"
         )
+        if env.get(pipeline_io.HORIZON_ENV):
+            extra += f" {pipeline_io.HORIZON_ENV}={env[pipeline_io.HORIZON_ENV]}"
         if env.get("ENTRY_FORCE_NEW_TRANCHE"):
             extra += f" ENTRY_FORCE_NEW_TRANCHE={env['ENTRY_FORCE_NEW_TRANCHE']}"
         if script == "portfolio_gex_field":

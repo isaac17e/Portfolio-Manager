@@ -14,6 +14,7 @@ import plotly.graph_objects as go
 from gex_utils import gamma_flip_level
 from polygon_client import NO_OPTION_DATA, NoOptionData, PolygonClient, failure_reason
 from pipeline_io import (
+    MIN_OPTION_DAYS,
     apply_entry_fills,
     cycle_today,
     entry_state_path,
@@ -22,8 +23,10 @@ from pipeline_io import (
     load_portfolio,
     load_portfolio_fills,
     parse_invested_overrides,
+    pick_expiration,
     portfolio_key,
     resolve_cycle_day,
+    resolve_horizon,
     signal_cycle_number,
     stage_pending_entry,
     tranche_lock,
@@ -93,7 +96,14 @@ UMBRAL_MEDIO = 40
 # firme la fraccion no invertida: comprar el 100% restante o consolidarla en cash.
 DIAS_CICLO = 5
 
-HORIZON_DIAS_OBJETIVO = 30
+# La entrada se arma para todo el plazo del portafolio: el vencimiento objetivo
+# es el horizonte completo (horizon_days del JSON; run_cycle lo pasa en
+# PORTFOLIO_HORIZON_DAYS). Sin portafolio se conservan los 30 dias de antes.
+# La busqueda es una ventana de +/- VENTANA_BUSQUEDA_VENCIMIENTO_DIAS dias
+# alrededor del objetivo, nunca por debajo de MIN_OPTION_DAYS.
+HORIZON_DIAS_DEFAULT = 30
+HORIZON = resolve_horizon(_PORTFOLIO_META, HORIZON_DIAS_DEFAULT, mode="full")
+HORIZON_DIAS_OBJETIVO = HORIZON["days"]
 VENTANA_BUSQUEDA_VENCIMIENTO_DIAS = 20
 
 MAX_PAGINAS_CADENA = 40
@@ -284,9 +294,15 @@ def get_spot_y_volumen_relativo(ticker):
 # y el ultimo en o antes) con limit=1 cada uno. Una sola pagina de 1000 contratos
 # ordenada por fecha cubre apenas 2-5 dias en subyacentes con vencimientos
 # semanales (GLD, XLU, KO...) y el "mas cercano" terminaba siendo uno de esos.
+#
+# La ventana va de objetivo - VENTANA a objetivo + VENTANA (piso MIN_OPTION_DAYS).
+# Si no hay vencimientos en ella se toma el primero con >= MIN_OPTION_DAYS dias
+# y, si tampoco hay, el mas cercano disponible.
 def seleccionar_vencimiento_objetivo(ticker, horizon_days):
     hoy = datetime.now(timezone.utc).date()
-    fecha_objetivo = hoy + timedelta(days=horizon_days)
+    objetivo = max(int(horizon_days), MIN_OPTION_DAYS)
+    fecha_objetivo = hoy + timedelta(days=objetivo)
+    desde = hoy + timedelta(days=max(MIN_OPTION_DAYS, objetivo - VENTANA_BUSQUEDA_VENCIMIENTO_DIAS))
     url = f"{BASE_URL}/v3/reference/options/contracts"
     base = {"underlying_ticker": to_polygon(ticker), "contract_type": "call",
             "sort": "expiration_date", "limit": 1}
@@ -295,20 +311,30 @@ def seleccionar_vencimiento_objetivo(ticker, horizon_days):
          "expiration_date.gte": str(fecha_objetivo),
          "expiration_date.lte": str(fecha_objetivo + timedelta(days=VENTANA_BUSQUEDA_VENCIMIENTO_DIAS))},
         {**base, "order": "desc",
-         "expiration_date.gte": str(hoy),
+         "expiration_date.gte": str(desde),
          "expiration_date.lte": str(fecha_objetivo)},
     ]
+
+    def _fechas(params):
+        r = polygon().get(url, params)
+        return {datetime.strptime(c["expiration_date"], "%Y-%m-%d").date()
+                for c in r.get("results", []) if c.get("expiration_date")}
+
     vencimientos = set()
     for params in consultas:
         # Si una de las dos consultas falla se lanza el error: con un solo lado
         # se elegiria un vencimiento lejano al objetivo sin saberlo.
-        r = polygon().get(url, params)
-        for c in r.get("results", []):
-            if c.get("expiration_date"):
-                vencimientos.add(datetime.strptime(c["expiration_date"], "%Y-%m-%d").date())
+        vencimientos |= _fechas(params)
+    if not vencimientos:
+        for gte in (hoy + timedelta(days=MIN_OPTION_DAYS), hoy):
+            vencimientos = _fechas({**base, "order": "asc", "expiration_date.gte": str(gte)})
+            if vencimientos:
+                print(f"[WARN] {ticker}: sin vencimientos en {desde}..{fecha_objetivo + timedelta(days=VENTANA_BUSQUEDA_VENCIMIENTO_DIAS)}; "
+                      f"se usa el mas cercano disponible ({min(vencimientos)}).")
+                break
     if not vencimientos:
         return None
-    return min(sorted(vencimientos), key=lambda d: abs((d - fecha_objetivo).days))
+    return pick_expiration(vencimientos, hoy, objetivo)[0]
 
 def get_options_chain(ticker, spot, vencimiento):
     url = f"{BASE_URL}/v3/snapshot/options/{to_polygon(ticker)}"
@@ -1130,14 +1156,17 @@ def main(argv=None):
     if ctx.get("locked"):
         # Nada que preparar: se escribe la senal con el estado y no se toca el
         # estado del portafolio (el tramo pendiente conserva su signal_run_ts).
+        bloqueada = construir_senal_bloqueada(ctx["locked"])
+        bloqueada["horizon"] = HORIZON
         export_signals(
-            "entry_signal_tool", construir_senal_bloqueada(ctx["locked"]), _PORTFOLIO_META,
+            "entry_signal_tool", bloqueada, _PORTFOLIO_META,
             warnings=ctx["warnings"],
         )
         return
     imprimir_resumen(resumen)
     data = construir_senal_entrada(resumen)
     data["signal"] = "new_tranche"
+    data["horizon"] = HORIZON
     if data.get("cycle_day") is None:
         data["cycle_day"] = ctx["cycle_day"]
         data["cycle"] = ctx["cycle"]

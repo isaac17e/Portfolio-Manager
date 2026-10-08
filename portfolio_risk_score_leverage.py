@@ -5,7 +5,10 @@ import numpy as np
 import pandas as pd
 from datetime import date
 
-from pipeline_io import export_signals, load_portfolio, resolve_risk_free_rate
+from pipeline_io import (
+    MIN_OPTION_DAYS, export_signals, load_portfolio, pick_expiration, resolve_horizon,
+    resolve_risk_free_rate,
+)
 from price_signals import price_indicators, yahoo_closes
 from tickers import (
     adr_warnings, exclusion_warnings, no_options_weight_cap, resolve_instrument, to_polygon, to_yahoo,
@@ -39,7 +42,18 @@ if abs(total_weight - 1) > 1e-6:
 investment_horizon_months = 1
 trading_days_per_month = 21
 trading_days_per_year = 252
-horizon_days = round(investment_horizon_months * trading_days_per_month)
+# Horizonte del portafolio: dias calendario que quedan hasta horizon_end
+# (run_cycle los pasa en PORTFOLIO_HORIZON_DAYS; suelto se leen del JSON).
+# Sin portafolio: 1 mes = 21 dias habiles ~ 29 dias calendario, como antes.
+# options_target_days elige el vencimiento; horizon_days (habiles) escala las
+# lecturas *_Horizonte del modulo ex-post.
+_default_options_days = round(investment_horizon_months * trading_days_per_month * 7 / 5)
+HORIZON = resolve_horizon(_PORTFOLIO_META, _default_options_days, mode="remaining")
+options_target_days = HORIZON["days"]
+if HORIZON["source"] == "default":
+    horizon_days = round(investment_horizon_months * trading_days_per_month)
+else:
+    horizon_days = max(1, round(options_target_days * 5 / 7))
 
 start_date = date(2021, 1, 1)
 end_date = date.today()
@@ -66,7 +80,8 @@ polygon_max_pages_snapshot = 20
 
 print(
     f"[CONFIG] Portafolio: {', '.join(portfolio.keys())} | "
-    f"Horizonte: {investment_horizon_months} mes(es) (~{horizon_days} dias habiles) | "
+    f"Horizonte: {options_target_days} dias calendario (~{horizon_days} dias habiles, "
+    f"fuente {HORIZON['source']}) | "
     f"Ventana: {start_date} a {end_date}"
 )
 
@@ -421,9 +436,14 @@ def fill_missing_iv_greeks(chain, days_to_expiry, rf_annual, spot_fallback):
 
     return chain
 
-def get_target_expiration(ticker, horizon_days, api_key):
+def get_target_expiration(ticker, target_days, api_key):
+    """Vencimiento mas cercano a hoy + ``target_days`` (dias calendario).
+
+    pipeline_io.pick_expiration: se descartan los de menos de MIN_OPTION_DAYS
+    dias; si ninguno los cumple se usa el mas cercano disponible.
+    """
     today = dt.date.today()
-    target_date = today + dt.timedelta(days=round(horizon_days * 7 / 5))
+    target_date = today + dt.timedelta(days=max(int(target_days), MIN_OPTION_DAYS))
 
     # Se piden solo los dos vencimientos que rodean al objetivo (el primero en o
     # despues y el ultimo en o antes), con limit=1 cada uno. Antes se pedia una
@@ -453,7 +473,12 @@ def get_target_expiration(ticker, horizon_days, api_key):
         log_warn(f"Sin contratos de opciones disponibles para {ticker} (posible activo sin mercado de opciones).")
         return {"expiration": None, "days_to_expiry": None}
 
-    best_exp = min(expirations, key=lambda e: abs((e - target_date).days))
+    best_exp, below_min = pick_expiration(expirations, today, (target_date - today).days)
+    if best_exp is None:
+        log_warn(f"Sin vencimientos vigentes para {ticker}.")
+        return {"expiration": None, "days_to_expiry": None}
+    if below_min:
+        log_warn(f"{ticker}: ningun vencimiento con >= {MIN_OPTION_DAYS} dias; se usa {best_exp}.")
     return {"expiration": best_exp, "days_to_expiry": (best_exp - today).days}
 
 def get_option_chain_snapshot(ticker, expiration_date, api_key):
@@ -634,14 +659,15 @@ def spot_listado_us(ticker, chain, days_to_expiry, rf_annual):
         return spot, "paridad put-call de la cadena Polygon"
     return np.nan, None
 
-def run_options_module_for_ticker(ticker, hv_annual, horizon_days, api_key,
+def run_options_module_for_ticker(ticker, hv_annual, target_days, api_key,
                                    spot_fallback=np.nan, rf_annual=0):
+    """``target_days``: dias calendario hasta el vencimiento buscado (horizonte)."""
     log_info(f"MODULO 2: procesando cadena de opciones de {ticker}...")
 
     # Si el ticker no se puede valorar se lanza la excepcion (NoOptionData o
     # PolygonError) y run_options_module la convierte en el motivo de exclusion.
     try:
-        exp_info = get_target_expiration(ticker, horizon_days, api_key)
+        exp_info = get_target_expiration(ticker, target_days, api_key)
         if exp_info["expiration"] is None:
             log_warn(f"{ticker}: sin expiracion valida encontrada. Se omite del modulo de opciones.")
             raise NoOptionData(NO_OPTION_DATA)
@@ -716,7 +742,7 @@ def options_source(instrument):
         return instrument["proxy_etf"]
     return None
 
-def run_options_module(tickers, hv_by_asset, weights, horizon_days, api_key,
+def run_options_module(tickers, hv_by_asset, weights, target_days, api_key,
                         spot_by_asset=None, rf_annual=0):
     results = {}
     excluded = []
@@ -736,7 +762,7 @@ def run_options_module(tickers, hv_by_asset, weights, horizon_days, api_key,
         spot_fb = spot_by_asset.get(tk, np.nan) if spot_by_asset and tier == "native" else np.nan
         try:
             result = run_options_module_for_ticker(
-                symbol, hv_by_asset.get(tk), horizon_days, api_key,
+                symbol, hv_by_asset.get(tk), target_days, api_key,
                 spot_fallback=spot_fb, rf_annual=rf_annual
             )
             result["ticker"] = tk
@@ -1211,7 +1237,7 @@ else:
         tickers=tickers,
         hv_by_asset=hv_by_asset,
         weights=portfolio_priced,
-        horizon_days=horizon_days,
+        target_days=options_target_days,
         api_key=polygon_api_key,
         spot_by_asset=spot_by_asset,
         rf_annual=risk_free_rate_annual
@@ -1235,6 +1261,7 @@ leverage_results = run_leverage_module(
 options_module["excluded"] = price_excluded + list(options_module.get("excluded") or [])
 _senal_riesgo_data = _senal_riesgo(leverage_results, options_module)
 _senal_riesgo_data["risk_free_rate"] = risk_free_rate_annual
+_senal_riesgo_data["horizon"] = dict(HORIZON, trading_days=horizon_days)
 export_signals(
     "portfolio_risk_score_leverage",
     _senal_riesgo_data,

@@ -17,7 +17,9 @@ from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
-from pipeline_io import export_signals, load_portfolio, resolve_risk_free_rate
+from pipeline_io import (
+    MIN_OPTION_DAYS, export_signals, load_portfolio, resolve_horizon, resolve_risk_free_rate,
+)
 from polygon_client import NoOptionData, PolygonClient, failure_reason
 from tickers import (
     adr_warnings, dividend_yield_from_info, exclusion_warnings, options_exclusion, options_underlying,
@@ -75,6 +77,13 @@ PORTFOLIO_HOLDINGS: Dict[str, Optional[float]] = {
 
 _PORTFOLIO_META = load_portfolio(PORTFOLIO_HOLDINGS)
 PORTFOLIO_HOLDINGS = _PORTFOLIO_META["weights"]
+
+# El VIX de portafolio sigue siendo el indice CBOE a 30 dias. Ademas se publica
+# la misma lectura al horizonte del portafolio (dias calendario que quedan hasta
+# horizon_end; run_cycle los pasa en PORTFOLIO_HORIZON_DAYS), interpolando en
+# varianza total entre los dos vencimientos que lo encierran (metodo CBOE). Sin
+# portafolio el horizonte es 30 dias y las dos lecturas coinciden.
+HORIZON = resolve_horizon(_PORTFOLIO_META, 30, mode="remaining")
 
 EQUAL_WEIGHTS: bool = False              # True -> ignora los pesos de arriba
 RISK_FREE_RATE: float = resolve_risk_free_rate(0.045)  # tasa libre de riesgo continua (env RISK_FREE_RATE)
@@ -714,10 +723,18 @@ class CBOEVarianceEngine:
     def interpolate_30d(
         T1: float, var1: float, T2: Optional[float], var2: Optional[float]
     ) -> float:
+        return CBOEVarianceEngine.interpolate_days(T1, var1, T2, var2, 30.0)
+
+    @staticmethod
+    def interpolate_days(
+        T1: float, var1: float, T2: Optional[float], var2: Optional[float], days: float
+    ) -> float:
+        """Varianza anualizada a ``days`` dias (interpolacion CBOE en minutos)."""
+        n_target = float(days) * MINUTES_PER_YEAR / 365.0
         if T2 is None or var2 is None:
             warnings.warn(
                 "Sólo hay un vencimiento disponible: se usa su varianza sin interpolar "
-                "al horizonte de 30 días (cobertura mínima no satisfecha).",
+                f"al horizonte de {days:g} días (cobertura mínima no satisfecha).",
                 RuntimeWarning,
             )
             return float(var1)
@@ -725,17 +742,33 @@ class CBOEVarianceEngine:
         n1, n2 = T1 * MINUTES_PER_YEAR, T2 * MINUTES_PER_YEAR
         if abs(n2 - n1) < 1e-9:
             return 0.5 * (var1 + var2)
-        if not (n1 <= MINUTES_PER_30D <= n2):
+        if not (n1 <= n_target <= n2):
             warnings.warn(
-                f"Los vencimientos ({T1*365:.1f}d, {T2*365:.1f}d) no encierran los 30 días: "
+                f"Los vencimientos ({T1*365:.1f}d, {T2*365:.1f}d) no encierran los {days:g} días: "
                 "se extrapola linealmente en varianza total (menor fiabilidad).",
                 RuntimeWarning,
             )
         term = (
-            T1 * var1 * (n2 - MINUTES_PER_30D) / (n2 - n1)
-            + T2 * var2 * (MINUTES_PER_30D - n1) / (n2 - n1)
+            T1 * var1 * (n2 - n_target) / (n2 - n1)
+            + T2 * var2 * (n_target - n1) / (n2 - n1)
         )
-        return float(term * MINUTES_PER_YEAR / MINUTES_PER_30D)
+        return float(term * MINUTES_PER_YEAR / n_target)
+
+
+def bracket_pair(items, days: float, years=lambda item: item.T):
+    """Los dos elementos (ordenados por plazo) que encierran ``days`` dias.
+
+    Sin un par que lo encierre, los dos primeros (como hacia el VIX a 30d); con
+    uno solo, (ese, None).
+    """
+    items = sorted(items, key=years)
+    near = [it for it in items if years(it) * 365.0 <= days]
+    nxt = [it for it in items if years(it) * 365.0 > days]
+    if near and nxt:
+        return near[-1], nxt[0]
+    if not items:
+        return None, None
+    return items[0], (items[1] if len(items) > 1 else None)
 
 
 class SingleAssetVIX:
@@ -832,13 +865,21 @@ class SingleAssetVIX:
             raise NoOptionData("no option data returned (ningún vencimiento utilizable)")
 
         fits.sort(key=lambda f: f.T)
-        near, nxt = fits[0], (fits[1] if len(fits) > 1 else None)
+        near, nxt = bracket_pair(fits, 30.0)
         var30 = self.engine.interpolate_30d(
             near.T, near.variance, nxt.T if nxt else None, nxt.variance if nxt else None
         )
         if self.verbose:
             print(f"    [30d]     VIX_{data.ticker} = {100*math.sqrt(max(var30, 0)):.2f}")
         return max(var30, 1e-12), fits
+
+    def horizon_variance(self, fits: List[SmileFit], days: float) -> float:
+        """Varianza anualizada a ``days`` dias con el par de vencimientos que los encierra."""
+        near, nxt = bracket_pair(fits, days)
+        var_h = self.engine.interpolate_days(
+            near.T, near.variance, nxt.T if nxt else None, nxt.variance if nxt else None, days
+        )
+        return max(var_h, 1e-12)
 
 
 # ==============================================================================
@@ -992,17 +1033,29 @@ def year_fraction(expiry: pd.Timestamp, now: Optional[pd.Timestamp] = None) -> f
     return max((exp - now).total_seconds(), 60.0) / SECONDS_PER_YEAR
 
 
-def select_cboe_expiries(expiries: Sequence[str], min_days: float = OPT_MIN_DTE) -> List[str]:
+def select_cboe_expiries(
+    expiries: Sequence[str], min_days: float = OPT_MIN_DTE, target_days: float = 30.0
+) -> List[str]:
     now = pd.Timestamp.now(tz="UTC")
     cand = [(e, year_fraction(pd.Timestamp(e), now) * 365.0) for e in sorted(set(expiries))]
     cand = [(e, d) for e, d in cand if d >= min_days]
     if not cand:
         return []
-    near = [e for e, d in cand if d <= 30.0]
-    nxt = [e for e, d in cand if d > 30.0]
+    near = [e for e, d in cand if d <= target_days]
+    nxt = [e for e, d in cand if d > target_days]
     if near and nxt:
         return [near[-1], nxt[0]]
     return [e for e, _ in cand[:2]]
+
+
+def select_expiries_for(
+    expiries: Sequence[str], min_days: float = OPT_MIN_DTE, horizon_days: Optional[float] = None
+) -> List[str]:
+    """Par CBOE de 30 dias mas, si difiere, el par que encierra el horizonte."""
+    exps = select_cboe_expiries(expiries, min_days)
+    if horizon_days is not None and float(horizon_days) != 30.0:
+        exps = sorted(set(exps) | set(select_cboe_expiries(expiries, min_days, float(horizon_days))))
+    return exps
 
 
 def clamp_iv(iv: Optional[float]) -> float:
@@ -1053,6 +1106,7 @@ class PolygonMarketLoader:
         max_days: float = OPT_MAX_DTE,
         strike_range_pct: float = OPT_STRIKE_RANGE_PCT,
         verbose: bool = True,
+        horizon_days: Optional[float] = None,
     ) -> None:
         self.api_key = api_key or POLYGON_API_KEY
         if not self.api_key:
@@ -1063,7 +1117,9 @@ class PolygonMarketLoader:
         self.r = r
         self.engine = engine
         self.min_days = min_days
-        self.max_days = max_days
+        self.horizon_days = horizon_days
+        # Hace falta un vencimiento posterior al horizonte para encerrarlo.
+        self.max_days = max(max_days, float(horizon_days) + 45.0) if horizon_days else max_days
         self.strike_range_pct = strike_range_pct
         self.verbose = verbose
         self.excluded: List[Dict[str, str]] = []
@@ -1319,7 +1375,7 @@ class PolygonMarketLoader:
                 spot = float(hist.iloc[-1])
                 q, dividends = self._dividend_schedule(src, spot)
 
-                exps = select_cboe_expiries(self._expirations(src), self.min_days)
+                exps = select_expiries_for(self._expirations(src), self.min_days, self.horizon_days)
                 if not exps:
                     raise NoOptionData("no option data returned (sin vencimientos en la ventana)")
                 if len(exps) < 2:
@@ -1377,13 +1433,15 @@ class PolygonMarketLoader:
 
 
 class YahooMarketLoader:
-    def __init__(self, min_days: float = 7.0, verbose: bool = True) -> None:
+    def __init__(self, min_days: float = 7.0, verbose: bool = True,
+                 horizon_days: Optional[float] = None) -> None:
         self.min_days = min_days
+        self.horizon_days = horizon_days
         self.verbose = verbose
         self.excluded: List[Dict[str, str]] = []
 
     def _pick_expiries(self, expiries: Sequence[str]) -> List[str]:
-        return select_cboe_expiries(expiries, self.min_days)
+        return select_expiries_for(expiries, self.min_days, self.horizon_days)
 
     def load(
         self, tickers: Sequence[str], lookback: str = "2y"
@@ -1831,6 +1889,7 @@ class VIXConfig:
     verbose: bool = True
     html_file: str = OUTPUT_HTML
     show_plot: bool = SHOW_PLOT
+    horizon_days: float = float(HORIZON["days"])
 
 
 class PortfolioVIXCalculator:
@@ -1883,6 +1942,7 @@ class PortfolioVIXCalculator:
                     r=self.cfg.r,
                     engine=self.cfg.american_engine,
                     verbose=self.cfg.verbose,
+                    horizon_days=self.cfg.horizon_days,
                 )
                 data = loader.load(tickers, self.cfg.lookback)
                 if data[0]:
@@ -1910,7 +1970,8 @@ class PortfolioVIXCalculator:
                     "instalado (`pip install yfinance`). Usa --synthetic solo para pruebas."
                 )
             try:
-                loader = YahooMarketLoader(verbose=self.cfg.verbose)
+                loader = YahooMarketLoader(verbose=self.cfg.verbose,
+                                           horizon_days=self.cfg.horizon_days)
                 data = loader.load(tickers, self.cfg.lookback)
             except Exception as exc:  # noqa: BLE001
                 raise RuntimeError(
@@ -1944,6 +2005,7 @@ class PortfolioVIXCalculator:
             "plot": None,
             "source": self.source_used,
             "excluded": list(self.excluded),
+            "horizon": None,
         }
 
     # -- ejecución -------------------------------------------------------------
@@ -1951,12 +2013,15 @@ class PortfolioVIXCalculator:
         assets, prices = self._load()
 
         sig30: List[float] = []
+        sig_h: List[float] = []
         used: List[str] = []
         fits_by_asset: Dict[str, List[SmileFit]] = {}
         for a in assets:
             try:
                 var30, fits = self.single.compute(a)
+                var_h = self.single.horizon_variance(fits, self.cfg.horizon_days)
                 sig30.append(math.sqrt(var30))
+                sig_h.append(math.sqrt(var_h))
                 used.append(a.ticker)
                 fits_by_asset[a.ticker] = fits
             except Exception as exc:  # noqa: BLE001
@@ -1984,6 +2049,21 @@ class PortfolioVIXCalculator:
         vix, cov, breakdown, metrics = self.aggregator.aggregate(
             used, w, np.array(sig30), corr
         )
+        # Misma agregacion con las vol anualizadas al horizonte del portafolio.
+        vix_h, _cov_h, breakdown_h, metrics_h = self.aggregator.aggregate(
+            used, w, np.array(sig_h), corr
+        )
+        dias_h = float(self.cfg.horizon_days)
+        horizon = {
+            "days": dias_h,
+            "vix_portfolio": vix_h,
+            "sigma_portfolio_annual": metrics_h["sigma_portfolio_30d"],
+            "sigma_portfolio_horizon": metrics_h["sigma_portfolio_30d"] * math.sqrt(dias_h / 365.0),
+            "by_ticker": {tk: float(v) for tk, v in breakdown_h["VIX_individual"].items()},
+        }
+        if self.cfg.verbose:
+            print(f"\n  VIX_port al horizonte ({dias_h:g} días, anualizado) = {vix_h:.2f} | "
+                  f"sigma en el horizonte = {100 * horizon['sigma_portfolio_horizon']:.2f}%")
         figure = (
             ReportPlotter.build_figure(fits_by_asset, breakdown, metrics, corr, self.source_used)
             if _HAS_PLOTLY
@@ -2014,6 +2094,7 @@ class PortfolioVIXCalculator:
             "plot": plot,
             "source": self.source_used,
             "excluded": list(self.excluded),
+            "horizon": horizon,
         }
 
     @staticmethod
@@ -2063,9 +2144,17 @@ def _senal_vix(results: Dict[str, object], cfg: "VIXConfig") -> Dict[str, object
             "ctr_pct": row.get("CTR_%"),
         })
     metrics = dict(results["metrics"])
+    lectura_h = results.get("horizon") or {}
+    por_ticker_h = lectura_h.get("by_ticker") or {}
+    for item in holdings:
+        item["vix_horizon"] = por_ticker_h.get(item["ticker"])
     return {
         "vix_portfolio": results["vix"],
         "sigma_portfolio_30d": metrics.get("sigma_portfolio_30d"),
+        # Lectura al horizonte del portafolio (VIX anualizado y sigma del plazo).
+        "vix_portfolio_horizon": lectura_h.get("vix_portfolio"),
+        "sigma_portfolio_horizon": lectura_h.get("sigma_portfolio_horizon"),
+        "horizon": dict(HORIZON, days=cfg.horizon_days),
         "source": results.get("source"),
         "vol_method": cfg.vol_method,
         "corr_method": cfg.corr_method,
@@ -2138,6 +2227,7 @@ def _parse_args() -> VIXConfig:
         verbose=not a.quiet,
         html_file=a.html,
         show_plot=SHOW_PLOT if a.show is None else a.show,
+        horizon_days=float(HORIZON["days"]),
     )
 
 

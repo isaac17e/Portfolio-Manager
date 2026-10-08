@@ -18,7 +18,9 @@ from scipy.optimize import brentq
 from scipy.interpolate import interp1d
 from scipy.ndimage import gaussian_filter1d
 from datetime import datetime, timedelta
-from pipeline_io import export_signals, load_portfolio, resolve_risk_free_rate
+from pipeline_io import (
+    MIN_OPTION_DAYS, export_signals, load_portfolio, resolve_horizon, resolve_risk_free_rate,
+)
 from gex_utils import gamma_flip_level
 from polygon_client import NO_OPTION_DATA, PolygonClient, PolygonError, failure_reason
 from tickers import (
@@ -95,6 +97,31 @@ PORTFOLIO_HOLDINGS = {
 
 _PORTFOLIO_META = load_portfolio(PORTFOLIO_HOLDINGS)
 PORTFOLIO_HOLDINGS = _PORTFOLIO_META["weights"]
+
+# Horizonte: dias calendario que quedan hasta horizon_end (run_cycle los pasa en
+# PORTFOLIO_HORIZON_DAYS; suelto se leen del JSON). La cadena llega hasta ese
+# vencimiento. Piso GEX_MIN_HORIZON_DAYS: el GEX estructural descarta lo de
+# <= NEAR_TERM_DAYS_CUTOFF dias, asi que se exige al menos MIN_OPTION_DAYS mas.
+# Sin portafolio: TIME_HORIZON_MONTHS (2 meses = 60 dias), como antes. Si a
+# ese plazo no hay contratos se reintenta con el plazo por defecto.
+DEFAULT_HORIZON_DAYS = int(TIME_HORIZON_MONTHS * 30.44)
+GEX_MIN_HORIZON_DAYS = NEAR_TERM_DAYS_CUTOFF + MIN_OPTION_DAYS
+HORIZON = resolve_horizon(_PORTFOLIO_META, DEFAULT_HORIZON_DAYS, mode="remaining",
+                          min_days=GEX_MIN_HORIZON_DAYS)
+GEX_HORIZON_DAYS = HORIZON["days"]
+GEX_HORIZON_MONTHS = (TIME_HORIZON_MONTHS if HORIZON["source"] == "default"
+                      else GEX_HORIZON_DAYS / 30.44)
+
+
+def _horizonte(horizon_months=None, horizon_days=None):
+    """(meses, dias) coherentes; sin argumentos, el horizonte del portafolio."""
+    if horizon_months is None and horizon_days is None:
+        return GEX_HORIZON_MONTHS, GEX_HORIZON_DAYS
+    if horizon_days is None:
+        return horizon_months, int(horizon_months * 30.44)
+    if horizon_months is None:
+        return horizon_days / 30.44, int(horizon_days)
+    return horizon_months, int(horizon_days)
 
 REFRESH_SECONDS = 60
 MAX_ITERATIONS = None
@@ -280,39 +307,54 @@ def get_current_price(ticker):
                 return None
 
 
-def get_polygon_options_data(ticker, current_price, horizon_months=TIME_HORIZON_MONTHS,
-                              strike_range_pct=None):
+def get_polygon_options_data(ticker, current_price, horizon_months=None,
+                              strike_range_pct=None, horizon_days=None):
+    """Cadena con vencimientos hasta ``horizon_days`` (dias calendario).
+
+    Sin argumentos de horizonte usa el del portafolio (GEX_HORIZON_DAYS). Si a
+    ese plazo Polygon no trae contratos y es menor que DEFAULT_HORIZON_DAYS, se
+    reintenta con el plazo por defecto.
+    """
     if current_price is None:
         print(f"❌ [{ticker}] No se puede extraer la cadena de opciones sin precio spot.")
         return pd.DataFrame()
 
+    horizon_months, horizon_days = _horizonte(horizon_months, horizon_days)
     if strike_range_pct is None:
         strike_range_pct = get_dynamic_strike_range(horizon_months)
 
     today = datetime.utcnow().date()
-    cutoff_date = today + timedelta(days=int(horizon_months * 30.44))
+    plazos = [horizon_days] + ([DEFAULT_HORIZON_DAYS] if horizon_days < DEFAULT_HORIZON_DAYS else [])
 
     url = f"{BASE_URL}/v3/snapshot/options/{to_polygon(ticker)}"
-    params = {
-        "limit": 250,
-        "strike_price.gte": round(current_price * (1 - strike_range_pct), 2),
-        "strike_price.lte": round(current_price * (1 + strike_range_pct), 2),
-        "expiration_date.gte": today.isoformat(),
-        "expiration_date.lte": cutoff_date.isoformat(),
-    }
+    all_contracts = []
+    for i, dias in enumerate(plazos):
+        cutoff_date = today + timedelta(days=int(dias))
+        params = {
+            "limit": 250,
+            "strike_price.gte": round(current_price * (1 - strike_range_pct), 2),
+            "strike_price.lte": round(current_price * (1 + strike_range_pct), 2),
+            "expiration_date.gte": today.isoformat(),
+            "expiration_date.lte": cutoff_date.isoformat(),
+        }
 
-    # Una pagina fallida o el tope de paginas cuentan como fallo del ticker: antes
-    # el corte a las 40 paginas era silencioso y el GEX salia de una cadena parcial.
-    try:
-        all_contracts = polygon().paginate(url, params, max_pages=POLYGON_MAX_PAGES)
-    except PolygonError as e:
-        print(f"❌ [{ticker}] ERROR con Polygon API: {e}")
-        _ULTIMO_FALLO_CADENA[ticker] = failure_reason(e)
-        return pd.DataFrame()
-    _ULTIMO_FALLO_CADENA.pop(ticker, None)
+        # Una pagina fallida o el tope de paginas cuentan como fallo del ticker: antes
+        # el corte a las 40 paginas era silencioso y el GEX salia de una cadena parcial.
+        try:
+            all_contracts = polygon().paginate(url, params, max_pages=POLYGON_MAX_PAGES)
+        except PolygonError as e:
+            print(f"❌ [{ticker}] ERROR con Polygon API: {e}")
+            _ULTIMO_FALLO_CADENA[ticker] = failure_reason(e)
+            return pd.DataFrame()
+        _ULTIMO_FALLO_CADENA.pop(ticker, None)
+        if all_contracts:
+            break
+        if i + 1 < len(plazos):
+            print(f"⚠️  [{ticker}] Sin contratos a {dias} días; se reintenta con "
+                  f"{DEFAULT_HORIZON_DAYS} días (plazo por defecto).")
 
     if not all_contracts:
-        print(f"⚠️  [{ticker}] Polygon no devolvió contratos para horizonte={horizon_months}m "
+        print(f"⚠️  [{ticker}] Polygon no devolvió contratos para horizonte={horizon_days}d "
               f"/ ventana strikes=±{strike_range_pct*100:.1f}%.")
         return pd.DataFrame()
 
@@ -430,7 +472,7 @@ def get_polygon_options_data(ticker, current_price, horizon_months=TIME_HORIZON_
     df = df.dropna(subset=["gamma"])
     n_dropped_gamma = n_before - len(df)
 
-    print(f"✅ [{ticker}] Cadena cargada: {len(df)} contratos válidos | Horizonte: {horizon_months} mes(es) "
+    print(f"✅ [{ticker}] Cadena cargada: {len(df)} contratos válidos | Horizonte: {horizon_months:.3g} mes(es) "
           f"(hasta {cutoff_date}) | Ventana strikes: ±{strike_range_pct*100:.1f}% | "
           f"Expiraciones: {len(df['expiration'].unique())}")
     if n_dropped_gamma:
@@ -594,7 +636,7 @@ def calculate_macro_y_axis(macro_indicators, weights=MACRO_WEIGHTS):
 # BLOQUE 6: MOVIMIENTO ESPERADO (1σ)
 # ============================================================
 
-def calculate_expected_move(df_options, current_price, horizon_months=TIME_HORIZON_MONTHS,
+def calculate_expected_move(df_options, current_price, horizon_months=GEX_HORIZON_MONTHS,
                              near_atm_band=NEAR_ATM_BAND_PCT, near_term_days_cutoff=NEAR_TERM_DAYS_CUTOFF):
     if df_options is None or df_options.empty:
         print("❌ No hay datos de opciones para estimar el movimiento esperado.")
@@ -641,8 +683,9 @@ def _reusar_ultimo_dato(ticker, motivo, max_age_seconds=STALE_DATA_MAX_SECONDS):
     return dict(guardado["data"], stale_seconds=edad)
 
 
-def get_portfolio_chains(holdings, horizon_months=TIME_HORIZON_MONTHS):
+def get_portfolio_chains(holdings, horizon_months=None, horizon_days=None):
     global _LAST_EXCLUDED
+    horizon_months, horizon_days = _horizonte(horizon_months, horizon_days)
     portfolio_data = {}
     failed = []
     excluded = []
@@ -682,7 +725,8 @@ def get_portfolio_chains(holdings, horizon_months=TIME_HORIZON_MONTHS):
             continue
 
         try:
-            df_opts = get_polygon_options_data(simbolo, price, horizon_months=horizon_months)
+            df_opts = get_polygon_options_data(simbolo, price, horizon_months=horizon_months,
+                                               horizon_days=horizon_days)
         except Exception as exc:
             note(ticker, failure_reason(exc))
             print(f"   ({exc})")
@@ -729,7 +773,8 @@ def get_portfolio_chains(holdings, horizon_months=TIME_HORIZON_MONTHS):
 
             try:
                 df_opts_wide = get_polygon_options_data(simbolo, price, horizon_months=horizon_months,
-                                                          strike_range_pct=required_range_pct)
+                                                          strike_range_pct=required_range_pct,
+                                                          horizon_days=horizon_days)
             except Exception as exc:
                 print(f"⚠️  [{ticker}] El re-fetch ampliado falló ({exc}); se conserva la ventana original.")
                 df_opts_wide = pd.DataFrame()
@@ -793,7 +838,7 @@ def get_portfolio_chains(holdings, horizon_months=TIME_HORIZON_MONTHS):
         stale_note = (f"| dato reutilizado de hace {v['stale_seconds']/60:.1f} min"
                       if v.get("stale_seconds") else "")
         print(f"   {t}: peso={v['weight_normalized']:.2%} | "
-              f"movimiento esperado (1σ, {horizon_months}m)=±{v['expected_move']*100:.2f}% "
+              f"movimiento esperado (1σ, {horizon_days}d)=±{v['expected_move']*100:.2f}% "
               f"{coverage_note} {stale_note}")
 
     return portfolio_data
@@ -1006,7 +1051,7 @@ def get_holdings_reference_lines(portfolio_data, sigma_range=SIGMA_RANGE):
 
 def plot_3d_portfolio_field(X, Y, Z, current_state, reference_lines, portfolio_data,
                              surface_data=None, state_history=None,
-                             horizon_months=TIME_HORIZON_MONTHS, camera_eye=None):
+                             horizon_months=GEX_HORIZON_MONTHS, camera_eye=None):
     if X is None or Y is None or Z is None:
         print("❌ Superficie no disponible. No se puede graficar.")
         return None
@@ -1105,7 +1150,7 @@ def plot_3d_portfolio_field(X, Y, Z, current_state, reference_lines, portfolio_d
 
     fig.update_layout(
         title=f"Portfolio GEX Potential Field — {len(portfolio_data)} holdings "
-              f"(horizonte {horizon_months}m) | actualizado {datetime.utcnow().strftime('%H:%M:%S')} UTC",
+              f"(horizonte {horizon_months:.3g}m) | actualizado {datetime.utcnow().strftime('%H:%M:%S')} UTC",
         scene=dict(
             domain=dict(x=[0.24, 1.0], y=[0.0, 1.0]),
             xaxis_title="X: Posición en σ del movimiento esperado agregado",
@@ -1347,6 +1392,7 @@ def run_live(refresh_seconds=REFRESH_SECONDS, max_iterations=MAX_ITERATIONS,
         excluded = list(_LAST_EXCLUDED)
         data = _senal_gex(result or {}, excluded)
         data["risk_free_rate"] = RISK_FREE_RATE
+        data["horizon"] = HORIZON
         export_signals(
             "portfolio_gex_field", data, _PORTFOLIO_META,
             warnings=exclusion_warnings(excluded) + adr_warnings(PORTFOLIO_HOLDINGS),
@@ -1401,6 +1447,7 @@ def run_headless(output_path=OUTPUT_HTML_PATH):
     excluded = list(_LAST_EXCLUDED)
     data = _senal_gex(result or {}, excluded)
     data["risk_free_rate"] = RISK_FREE_RATE
+    data["horizon"] = HORIZON
     export_signals(
         "portfolio_gex_field", data, _PORTFOLIO_META,
         warnings=exclusion_warnings(excluded) + adr_warnings(PORTFOLIO_HOLDINGS),

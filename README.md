@@ -19,7 +19,7 @@ Most scripts take a portfolio as a `ticker: weight` dictionary at the top of the
 
 ## `active_management.py` — Tactical active management engine
 
-1. **Options data** (Polygon v3): spot price, the expiration closest to the investment horizon (30 trading days by default, about 42 calendar days) and the full chain snapshot.
+1. **Options data** (Polygon v3): spot price, the expiration closest to the days left in the portfolio horizon (without one, 30 trading days, about 42 calendar days) and the full chain snapshot.
 2. **Microstructure metrics** per ticker:
    - **GEX**: total gamma exposure, regime and gamma flip level;
    - **order flow**: unusual options activity (volume/OI above a threshold), call vs. put sweep dominance, put/call ratio;
@@ -82,7 +82,7 @@ Extends the **CBOE VIX methodology** from one index to a portfolio of N stocks/E
 
 1. **Chain cleaning** with static no-arbitrage filters (quotes, spreads, bounds, monotonicity), and **de-Americanization** of American option prices (Bjerksund-Stensland 1993 or a CRR binomial tree). Dividends are handled as escrowed discrete payments or a continuous yield.
 2. **Smile construction** per expiration with raw SVI (Gatheral's butterfly test and an R² guard), or a cubic spline as the alternative.
-3. **CBOE model-free variance** per asset: implied forward from put-call parity, strike strip weighted by ΔK·Q(K)/K², interpolated to a constant 30-day horizon.
+3. **CBOE model-free variance** per asset: implied forward from put-call parity, strike strip weighted by ΔK·Q(K)/K², interpolated to a constant 30-day horizon. The same interpolation at the portfolio horizon is published next to it (`vix_portfolio_horizon`).
 4. **Portfolio aggregation**: correlation matrix (EWMA, sample or random-matrix filtered) combined with the 30-day implied volatilities to get the portfolio VIX, plus **Euler risk attribution** per asset.
 
 Data comes from Polygon, with Yahoo Finance as the fallback. Synthetic data is used only when asked for (`--synthetic` or `--source synthetic`), never as a silent fallback. `--weights` must give one non-negative value per ticker, in the same order. It has a CLI:
@@ -98,7 +98,7 @@ python portfolio_vix.py --tickers SPY QQQ GLD --weights 0.5 0.3 0.2 \
 
 A live visualization of where the portfolio sits in terms of dealer positioning and macro stress:
 
-- **X axis**: price displacement in expected-move (σ) units. For each holding, net GEX is computed from options expiring within 2 months (implied volatility inverted with the Bjerksund-Stensland American model), smoothed and combined into a weighted **composite force** for the portfolio.
+- **X axis**: price displacement in expected-move (σ) units. For each holding, net GEX is computed from options expiring within the days left in the portfolio horizon (2 months without one; implied volatility inverted with the Bjerksund-Stensland American model), smoothed and combined into a weighted **composite force** for the portfolio.
 - **Y axis**: macro/liquidity/volatility stress, built from the 1-year percentile ranks of VIX (50%), the 10-year yield (25%) and the dollar index (25%).
 - **Z**: a potential surface in which macro stress amplifies negative-gamma (risk) zones more than it deepens positive-gamma (stable) zones. The script marks the portfolio's current state, the gradient and reference lines for each holding.
 
@@ -128,15 +128,17 @@ The number of green signals gives a global rating: **Global Green Light** (≥ 9
 
 ## Options horizon per script
 
-Each options script reads a different part of the curve on purpose, so their numbers are not interchangeable:
+The portfolio's horizon (`horizon_end`, `horizon_days`, `params.horizon_months` in the portfolio JSON) is the single source of the investment term. `run_cycle` passes each step its horizon in calendar days as `PORTFOLIO_HORIZON_DAYS`; a script run on its own computes the same number from `PORTFOLIO_FILE` (`pipeline_io.resolve_horizon`). Risk and hedging readings use the days **left** from the cycle date (`CYCLE_DATE`, else today) to `horizon_end`; the entry tool uses the **full** term, since it builds the position for the whole holding period. With no portfolio file, or a file without a horizon, each script keeps the default in the table. No script reads an expiration shorter than `pipeline_io.MIN_OPTION_DAYS` (7 calendar days; below a week the chain is dominated by expiry-week gamma and pinning) unless nothing else is listed, in which case it takes the nearest available one and warns.
 
-| Script | Expirations used |
-|---|---|
-| `active_management` | the one closest to 30 trading days (about 42 calendar days) |
-| `entry_signal_tool` | the one closest to 30 calendar days |
-| `portfolio_risk_score_leverage` | the one closest to 1 month (21 trading days, about 29 calendar days) |
-| `portfolio_vix` | the two that bracket 30 days (CBOE rule), interpolated to 30 days |
-| `portfolio_gex_field` | every expiration within 2 months; GEX from those beyond 7 days |
+| Script | Horizon | Expirations used | Default without a horizon |
+|---|---|---|---|
+| `active_management` | remaining | the one closest to the horizon | 30 trading days = 42 calendar days |
+| `entry_signal_tool` | full | the one closest to the horizon, searched in ± 20 days around it; if that window is empty, the first one ≥ 7 days, else the nearest | 30 calendar days |
+| `portfolio_risk_score_leverage` | remaining | the one closest to the horizon; ex-post `*_Horizonte` readings scale to `round(days × 5/7)` trading days | 21 trading days = 29 calendar days |
+| `portfolio_vix` | remaining | the two that bracket 30 days (CBOE index, unchanged) plus the two that bracket the horizon, each interpolated with the CBOE rule | 30 days (both readings equal) |
+| `portfolio_gex_field` | remaining | every expiration up to the horizon (at least 14 days, so the beyond-7-days structural GEX is never empty); retried at 60 days if Polygon returns nothing | 2 months = 60 days |
+
+Every signal records the horizon it used in `data.horizon`: `days`, `source` (`portfolio` or `default`), `via` (`env` from run_cycle, `file`, or null), `mode`, `raw_days` (before the 7-day floor), `floored`, `default_days` and `horizon_end`. The risk score adds `trading_days`. `portfolio_vix` also publishes `vix_portfolio_horizon` (annualized VIX at the horizon), `sigma_portfolio_horizon` (σ over the horizon, not annualized) and `holdings[].vix_horizon`; `vix_portfolio` stays the 30-day index. Annualized readouts are unchanged.
 
 The gamma flip (zero-gamma level) is computed once, in `gex_utils.py`, and shared by all four GEX scripts: strikes without exposure are ignored so they cannot create a false flip at the edge of the strike window.
 
@@ -186,7 +188,7 @@ Daily mode only runs on an NYSE session. The date is the America/Bogota date (ov
 python run_cycle.py --portfolio /workspace/pipeline/portfolio/portfolio_latest.json
 ```
 
-Idempotent entry tranches: `entry_signal_tool` prepares at most one tranche per America/Bogota day (see [Same-day lock](#same-day-lock)), so a second daily run the same day does not open the next cycle day. `run_cycle` exports its date to every step as `CYCLE_DATE` and otherwise passes the environment through unchanged (`RISK_FREE_RATE`, `ENTRY_CYCLE_DAY`, ...).
+Idempotent entry tranches: `entry_signal_tool` prepares at most one tranche per America/Bogota day (see [Same-day lock](#same-day-lock)), so a second daily run the same day does not open the next cycle day. `run_cycle` exports its date to every step as `CYCLE_DATE`, each step's horizon as `PORTFOLIO_HORIZON_DAYS` (full term for the entry tool, days left to `horizon_end` for risk, GEX, VIX and active management; unset when the portfolio has no horizon; recorded per step as `horizon_days` in the cycle summary), and otherwise passes the environment through unchanged (`RISK_FREE_RATE`, `ENTRY_CYCLE_DAY`, ...).
 
 Weekly mode runs only `active_management`. Schedule that command every day; the script decides whether today is the session to run. Today is the America/Bogota date (override with `--date YYYY-MM-DD`). It runs when that date is an NYSE session, it is the first NYSE session of its ISO week, and the weekly cycle has not already succeeded in that week. A Monday holiday (Labor Day, Memorial Day) therefore runs on the next session of that week, which is Tuesday. Columbus Day does not close the NYSE, so that week stays on Monday. The last success is stored in `/workspace/pipeline/state/weekly_last_run.json` and is updated only after every weekly step succeeds.
 
@@ -238,6 +240,7 @@ Each script also writes a JSON signal (contract section 4) through `pipeline_io.
 | `ENTRY_INVESTED_PCT` | percents already stored in the entry state |
 | `ENTRY_FORCE_NEW_TRANCHE` | unset (`1` = same as `--force-new-tranche`) |
 | `CYCLE_DATE` | unset = today in America/Bogota (`YYYY-MM-DD`; `run_cycle` sets it from `--date`) |
+| `PORTFOLIO_HORIZON_DAYS` | unset = read from `PORTFOLIO_FILE`, else each script's default (`run_cycle` sets it per step, see [Options horizon per script](#options-horizon-per-script)) |
 | `RISK_FREE_RATE` | unset = each script's own default (see [Risk-free rate](#risk-free-rate)) |
 | `HEADLESS` or `GEX_ONCE` | unset (set to `1` for the GEX pipeline run) |
 | `ENTRY_STAGGER_PCT` | `0.20` (tier `none`: share of the target bought per cycle day) |

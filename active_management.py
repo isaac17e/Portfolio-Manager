@@ -15,7 +15,10 @@ from plotly.subplots import make_subplots
 
 from gex_utils import gamma_flip_level
 from polygon_client import NoOptionData, PolygonClient, PolygonError, failure_reason
-from pipeline_io import export_signals, load_portfolio, resolve_risk_free_rate
+from pipeline_io import (
+    MIN_OPTION_DAYS, export_signals, load_portfolio, pick_expiration, resolve_horizon,
+    resolve_risk_free_rate,
+)
 from tickers import adr_warnings, exclusion_warnings, options_exclusion, options_underlying, to_polygon
 
 # ============================================================================
@@ -34,7 +37,13 @@ portfolio = {"GLD": 0.18,
 _PORTFOLIO_META = load_portfolio(portfolio)
 portfolio = _PORTFOLIO_META["weights"]
 
-investment_horizon_days = 30
+# Horizonte en dias calendario: lo que queda hasta horizon_end del portafolio
+# (run_cycle lo pasa en PORTFOLIO_HORIZON_DAYS; suelto se lee del JSON). Sin
+# portafolio: 30 dias habiles = 42 calendario, como antes.
+DEFAULT_HORIZON_TRADING_DAYS = 30
+HORIZON = resolve_horizon(_PORTFOLIO_META, math.ceil(DEFAULT_HORIZON_TRADING_DAYS * 7 / 5),
+                          mode="remaining")
+investment_horizon_days = HORIZON["days"]
 
 # ------------------------------------------------
 # API KEY - Polygon.io
@@ -272,8 +281,10 @@ def select_target_expiration(ticker, horizon_days, api_key=polygon_api_key):
     # de contratos ordenada por fecha no sirve: en subyacentes con vencimientos
     # diarios o semanales (SPY, GLD) los primeros 1000 contratos cubren apenas
     # 2-5 dias y el "mas cercano al objetivo" terminaba siendo uno de esos.
+    # horizon_days son dias CALENDARIO (antes habiles x 7/5). pick_expiration
+    # descarta los de menos de MIN_OPTION_DAYS salvo que no haya otro.
     today = date.today()
-    target_date = today + timedelta(days=math.ceil(horizon_days * 7 / 5))
+    target_date = today + timedelta(days=max(int(horizon_days), MIN_OPTION_DAYS))
     url = f"{POLYGON_BASE_URL}/v3/reference/options/contracts"
     base = {"underlying_ticker": to_polygon(ticker), "contract_type": "call",
             "sort": "expiration_date", "limit": 1}
@@ -301,7 +312,10 @@ def select_target_expiration(ticker, horizon_days, api_key=polygon_api_key):
     if not candidatos:
         warnings.warn(f"No se encontraron contratos de opciones para {ticker}")
         return None
-    return min(candidatos, key=lambda d: abs((d - target_date).days))
+    elegido, bajo_minimo = pick_expiration(candidatos, today, (target_date - today).days)
+    if bajo_minimo:
+        warnings.warn(f"{ticker}: ningun vencimiento con >= {MIN_OPTION_DAYS} dias; se usa {elegido}")
+    return elegido
 
 # ============================================================================
 # BLOQUE 3: METRICAS DE MICROESTRUCTURA (GEX / ORDER FLOW / VANNA-CHARM)
@@ -1682,7 +1696,7 @@ def generate_executive_dashboard(tabla_rebalanceo):
                             "Nuevo_Peso", "Movimiento_Esperado_Pct", "Rango_USD", "Racional"]]
 
     print("\n================ MOTOR DE GESTION ACTIVA - RESUMEN EJECUTIVO ================")
-    print(f"Horizonte: {investment_horizon_days} dias habiles | Generado: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
+    print(f"Horizonte: {investment_horizon_days} dias calendario ({HORIZON['source']}) | Generado: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
 
     display_cols = ["Ticker", "Peso_Inicial", "Score_Tactico", "Accion",
                      "Nuevo_Peso", "Movimiento_Esperado_Pct", "Rango_USD"]
@@ -2060,6 +2074,7 @@ def _senal_gestion_activa(resultado):
 resultado = run_active_management_engine(portfolio, investment_horizon_days, polygon_api_key, cash_reserve_limit)
 _senal_activa = _senal_gestion_activa(resultado)
 _senal_activa["risk_free_rate"] = risk_free_rate
+_senal_activa["horizon"] = HORIZON
 export_signals(
     "active_management", _senal_activa, _PORTFOLIO_META,
     warnings=exclusion_warnings(_senal_activa.get("excluded")) + adr_warnings(list(portfolio.keys())),
