@@ -5,3 +5,4 @@ requests
 plotly
 scipy
 python-dotenv
+pandas_market_calendars

@@ -174,6 +174,49 @@ python fundamental_analysis.py
 
 `POLYGON_CALLS_PER_MINUTE` defaults to **100** (sliding window). Set it to `5` on the free Stocks tier. HTTP 429 and 5xx are retried with exponential backoff and jitter; a `Retry-After` header is honored.
 
+## Cycle orchestrator (`run_cycle.py`)
+
+One command validates the portfolio file, runs each script as a subprocess of the same interpreter, and writes a cycle summary. Stdin of every step is closed (`DEVNULL`) so a prompt cannot hang the cycle. A per-step timeout stops a step that does not return.
+
+Daily mode is the default. The steps run in this order: `fundamental_analysis`, `portfolio_risk_score_leverage`, `portfolio_gex_field` (`--once` and `HEADLESS=1`), `portfolio_vix` (`--no-show`, so the cycle does not open the report window), `entry_signal_tool`. The entry tool is not passed a cycle day: it uses `ENTRY_CYCLE_DAY` / `ENTRY_INVESTED_PCT` when those are set, otherwise `entry_state.json`, and it does not call `input()`.
+
+```bash
+python run_cycle.py --portfolio /workspace/pipeline/portfolio/portfolio_latest.json
+```
+
+Weekly mode runs only `active_management`. Schedule that command every day; the script decides whether today is the session to run. Today is the America/Bogota date (override with `--date YYYY-MM-DD`). It runs when that date is an NYSE session, it is the first NYSE session of its ISO week, and the weekly cycle has not already succeeded in that week. A Monday holiday (Labor Day, Memorial Day) therefore runs on the next session of that week, which is Tuesday. Columbus Day does not close the NYSE, so that week stays on Monday. The last success is stored in `/workspace/pipeline/state/weekly_last_run.json` and is updated only after every weekly step succeeds.
+
+If today is after the portfolio's `horizon_end`, weekly mode writes a summary with status `skipped_after_horizon` and exits 0. A null `horizon_end` still runs, and the summary carries a warning. `--force` skips the due check and still honors `horizon_end`.
+
+```bash
+python run_cycle.py --weekly --portfolio /workspace/pipeline/portfolio/portfolio_latest.json
+```
+
+| Flag / env | Default | Role |
+|---|---|---|
+| `--portfolio` / `PORTFOLIO_FILE` | `/workspace/pipeline/portfolio/portfolio_latest.json` | Portfolio JSON. Each step receives this path as `PORTFOLIO_FILE`. |
+| `--signals-dir` / `SIGNALS_OUT_DIR` | `/workspace/pipeline/signals` | Where each step must write `<script>.json`. The flag wins over the env var. |
+| `--summary-dir` / `CYCLE_SUMMARY_DIR` | `/workspace/pipeline` | `cycle_summary_latest.json`, `cycle_summary_latest.txt`, and timestamped copies `cycle_summary_<YYYYMMDDTHHMMSS>.json` / `.txt`. |
+| `--weekly-state` / `WEEKLY_STATE_FILE` | `/workspace/pipeline/state/weekly_last_run.json` | Last successful weekly run date. |
+| `--timeout` / `CYCLE_STEP_TIMEOUT` | `1800` | Seconds allowed for each step. |
+| `--weekly` | off | Only `active_management`, plus the calendar and horizon checks. |
+| `--date YYYY-MM-DD` | today in America/Bogota | Date used for the horizon and the weekly due check. |
+| `--force` | off | Bypass the weekly due check. |
+| `--dry-run` | off | Print the plan, or the skip reason, and write nothing. |
+| `--steps a,b` | the mode's full list | Subset of the known scripts, always in canonical order. |
+
+The portfolio file must be schema version 1, with `run_ts`, `optimizer`, weights that sum to about 1 (absolute tolerance `0.0001`), and the same names in `tickers` and `weights`. `horizon_end` is `YYYY-MM-DD` or null.
+
+A step is accepted only when it exits 0 and `<SIGNALS_OUT_DIR>/<script>.json` was written during the step (file mtime and the file's `run_ts` are at or after the step start, America/Bogota). `portfolio_source` must equal the portfolio path and `portfolio_run_ts` must equal the portfolio's `run_ts`. `portfolio_source: "hardcoded_fallback"` is a failure. The cycle stops at the first failure and does not read later files. The summary is still written, with `status: failed` and `failing_step` set to that script. The error includes the step name, the exit code, and the tail of stderr.
+
+The summary's `scalars` include `target_leverage`, `risk_score`, `vix_portfolio`, `n_entries`, and `entries` when those steps ran. `signal_warnings` and `excluded` collect each signal file's `warnings` and `data.excluded`. Timestamps are America/Bogota ISO-8601. Writes are atomic (`*.tmp` then `os.replace`).
+
+Exit codes: `0` success, not due, skipped after the horizon, or dry-run; `1` invalid portfolio, step failure, stale or mismatched signal, timeout, missing NYSE calendar, or a summary/state write error; `2` bad arguments.
+
+The weekly calendar is `pandas_market_calendars` (NYSE), or `exchange_calendars` (`XNYS`) if only that package is installed. Import is lazy. If neither is installed the weekly run exits 1 and names the missing library. The calendars are local; the check does not use the network. `--force` does not need the calendar.
+
+Not-due reasons, printed as `not_due: <reason> (YYYY-MM-DD)`: `non_trading_day`, `not_first_trading_day_of_week`, `already_ran_this_week`.
+
 ## Pipeline signals
 
 Each script also writes a JSON signal (contract section 4) through `pipeline_io.py`. The hardcoded portfolio dict stays in the script and is the fallback.
