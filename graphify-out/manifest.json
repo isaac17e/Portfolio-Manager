@@ -72,15 +72,15 @@
     "semantic_hash": "5c47f9d413ac96063c290252fc170c21"
   },
   "tickers.py": {
-    "mtime": 1791472575.1081576,
-    "seen": 1791472993.777497,
-    "ast_hash": "105bcbcce9e8dfa05794c6983afa152a",
+    "mtime": 1791474287.9689512,
+    "seen": 1791474323.448064,
+    "ast_hash": "e937845e7ac91de06c61206a95744f15",
     "semantic_hash": ""
   },
   "README.md": {
-    "mtime": 1791472981.647668,
-    "seen": 1791472993.777499,
-    "ast_hash": "b090a9392645540a97c0992e91d20aeb",
+    "mtime": 1791474293.5921493,
+    "seen": 1791474323.4480672,
+    "ast_hash": "4f6a64d25638f402360f9101f9a41bfa",
     "semantic_hash": ""
   },
   "requirements.txt": {
@@ -120,9 +120,9 @@
     "semantic_hash": ""
   },
   "tests/test_international_fallback.py": {
-    "mtime": 1791472981.6473382,
-    "seen": 1791472993.777493,
-    "ast_hash": "1d173e495d70df982e71d427804aeb6b",
+    "mtime": 1791474312.6093335,
+    "seen": 1791474323.448061,
+    "ast_hash": "92d11cb541d15ca5268265cd4246f303",
     "semantic_hash": ""
   }
 }
