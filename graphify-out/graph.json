@@ -52,19 +52,6 @@
   },
   "nodes": [
     {
-      "id": "tests_test_review_fixes_gammafliptests",
-      "label": "GammaFlipTests",
-      "_callable": true,
-      "_callable_class": true,
-      "_origin": "ast",
-      "community": 0,
-      "community_name": "active_management.py",
-      "file_type": "code",
-      "norm_label": "gammafliptests",
-      "source_file": "tests/test_review_fixes.py",
-      "source_location": "L53"
-    },
-    {
       "id": "fundamental_analysis_indicador",
       "label": "Indicador",
       "_callable": true,
@@ -169,17 +156,17 @@
       "source_location": "L925"
     },
     {
-      "id": "portfolio_vix_vixconfig",
-      "label": "VIXConfig",
+      "id": "portfolio_vix_singleassetvix",
+      "label": "SingleAssetVIX",
       "_callable": true,
       "_callable_class": true,
       "_origin": "ast",
       "community": 12,
       "community_name": ".__init__",
       "file_type": "code",
-      "norm_label": "vixconfig",
+      "norm_label": "singleassetvix",
       "source_file": "portfolio_vix.py",
-      "source_location": "L1816"
+      "source_location": "L740"
     },
     {
       "id": "portfolio_vix_portfoliovixcalculator",
@@ -247,19 +234,6 @@
       "source_location": "L306"
     },
     {
-      "id": "portfolio_vix_singleassetvix",
-      "label": "SingleAssetVIX",
-      "_callable": true,
-      "_callable_class": true,
-      "_origin": "ast",
-      "community": 14,
-      "community_name": ".load",
-      "file_type": "code",
-      "norm_label": "singleassetvix",
-      "source_file": "portfolio_vix.py",
-      "source_location": "L740"
-    },
-    {
       "id": "portfolio_vix_syntheticmarketgenerator",
       "label": "SyntheticMarketGenerator",
       "_callable": true,
@@ -286,17 +260,17 @@
       "source_location": "L1376"
     },
     {
-      "id": "tests_test_cycle1_fixes_fillsgatingtests",
-      "label": "FillsGatingTests",
+      "id": "tests_test_review_fixes_gammafliptests",
+      "label": "GammaFlipTests",
       "_callable": true,
       "_callable_class": true,
       "_origin": "ast",
       "community": 15,
-      "community_name": "FillsGatingTests",
+      "community_name": "gamma_flip_level",
       "file_type": "code",
-      "norm_label": "fillsgatingtests",
-      "source_file": "tests/test_cycle1_fixes.py",
-      "source_location": "L114"
+      "norm_label": "gammafliptests",
+      "source_file": "tests/test_review_fixes.py",
+      "source_location": "L53"
     },
     {
       "id": "portfolio_vix_cboevarianceengine",
@@ -312,30 +286,43 @@
       "source_location": "L657"
     },
     {
-      "id": "tests_test_cycle1_fixes_gexheadlesstests",
-      "label": "GexHeadlessTests",
-      "_callable": true,
-      "_callable_class": true,
-      "_origin": "ast",
-      "community": 2,
-      "community_name": "test_cycle1_fixes.py",
-      "file_type": "code",
-      "norm_label": "gexheadlesstests",
-      "source_file": "tests/test_cycle1_fixes.py",
-      "source_location": "L281"
-    },
-    {
       "id": "tests_test_pipeline_io_exportsignalstests",
       "label": "ExportSignalsTests",
       "_callable": true,
       "_callable_class": true,
       "_origin": "ast",
       "community": 2,
-      "community_name": "test_cycle1_fixes.py",
+      "community_name": "test_pipeline_io.py",
       "file_type": "code",
       "norm_label": "exportsignalstests",
       "source_file": "tests/test_pipeline_io.py",
       "source_location": "L104"
+    },
+    {
+      "id": "tests_test_pipeline_io_loadportfoliotests",
+      "label": "LoadPortfolioTests",
+      "_callable": true,
+      "_callable_class": true,
+      "_origin": "ast",
+      "community": 2,
+      "community_name": "test_pipeline_io.py",
+      "file_type": "code",
+      "norm_label": "loadportfoliotests",
+      "source_file": "tests/test_pipeline_io.py",
+      "source_location": "L35"
+    },
+    {
+      "id": "tests_test_review_fixes_dividendyieldtests",
+      "label": "DividendYieldTests",
+      "_callable": true,
+      "_callable_class": true,
+      "_origin": "ast",
+      "community": 20,
+      "community_name": "test_review_fixes.py",
+      "file_type": "code",
+      "norm_label": "dividendyieldtests",
+      "source_file": "tests/test_review_fixes.py",
+      "source_location": "L166"
     },
     {
       "id": "tests_test_review_fixes_entrypercentiletests",
@@ -447,25 +434,12 @@
       "_callable": true,
       "_callable_class": true,
       "_origin": "ast",
-      "community": 25,
+      "community": 26,
       "community_name": "PolygonClient",
       "file_type": "code",
       "norm_label": "polygonclient",
       "source_file": "polygon_client.py",
       "source_location": "L153"
-    },
-    {
-      "id": "polygon_client_polygontruncated",
-      "label": "PolygonTruncated",
-      "_callable": true,
-      "_callable_class": true,
-      "_origin": "ast",
-      "community": 25,
-      "community_name": "PolygonClient",
-      "file_type": "code",
-      "norm_label": "polygontruncated",
-      "source_file": "polygon_client.py",
-      "source_location": "L43"
     },
     {
       "id": "tests_test_cycle1_fixes_polygonbackofftests",
@@ -474,7 +448,7 @@
       "_callable_class": true,
       "_origin": "ast",
       "community": 26,
-      "community_name": "PolygonBackoffTests",
+      "community_name": "PolygonClient",
       "file_type": "code",
       "norm_label": "polygonbackofftests",
       "source_file": "tests/test_cycle1_fixes.py",
@@ -487,7 +461,7 @@
       "_callable_class": true,
       "_origin": "ast",
       "community": 26,
-      "community_name": "PolygonBackoffTests",
+      "community_name": "PolygonClient",
       "file_type": "code",
       "norm_label": "_resp",
       "source_file": "tests/test_cycle1_fixes.py",
@@ -507,19 +481,6 @@
       "source_location": "L99"
     },
     {
-      "id": "tests_test_pipeline_io_loadportfoliotests",
-      "label": "LoadPortfolioTests",
-      "_callable": true,
-      "_callable_class": true,
-      "_origin": "ast",
-      "community": 28,
-      "community_name": "LoadPortfolioTests",
-      "file_type": "code",
-      "norm_label": "loadportfoliotests",
-      "source_file": "tests/test_pipeline_io.py",
-      "source_location": "L35"
-    },
-    {
       "id": "tests_test_review_fixes_vixweightsargstests",
       "label": "VixWeightsArgsTests",
       "_callable": true,
@@ -533,17 +494,30 @@
       "source_location": "L223"
     },
     {
-      "id": "tests_test_review_fixes_dividendyieldtests",
-      "label": "DividendYieldTests",
+      "id": "tests_test_cycle1_fixes_gexheadlesstests",
+      "label": "GexHeadlessTests",
       "_callable": true,
       "_callable_class": true,
       "_origin": "ast",
       "community": 3,
       "community_name": "portfolio_gex_field.py",
       "file_type": "code",
-      "norm_label": "dividendyieldtests",
-      "source_file": "tests/test_review_fixes.py",
-      "source_location": "L166"
+      "norm_label": "gexheadlesstests",
+      "source_file": "tests/test_cycle1_fixes.py",
+      "source_location": "L281"
+    },
+    {
+      "id": "polygon_client_polygontruncated",
+      "label": "PolygonTruncated",
+      "_callable": true,
+      "_callable_class": true,
+      "_origin": "ast",
+      "community": 7,
+      "community_name": "polygon_client.py",
+      "file_type": "code",
+      "norm_label": "polygontruncated",
+      "source_file": "polygon_client.py",
+      "source_location": "L43"
     },
     {
       "id": "polygon_client_ratelimiter",
@@ -559,6 +533,19 @@
       "source_location": "L71"
     },
     {
+      "id": "tests_test_cycle1_fixes_fillsgatingtests",
+      "label": "FillsGatingTests",
+      "_callable": true,
+      "_callable_class": true,
+      "_origin": "ast",
+      "community": 8,
+      "community_name": "to_polygon",
+      "file_type": "code",
+      "norm_label": "fillsgatingtests",
+      "source_file": "tests/test_cycle1_fixes.py",
+      "source_location": "L114"
+    },
+    {
       "id": "tests_test_cycle1_fixes_tickermappingtests",
       "label": "TickerMappingTests",
       "_callable": true,
@@ -570,6 +557,19 @@
       "norm_label": "tickermappingtests",
       "source_file": "tests/test_cycle1_fixes.py",
       "source_location": "L74"
+    },
+    {
+      "id": "portfolio_vix_vixconfig",
+      "label": "VIXConfig",
+      "_callable": true,
+      "_callable_class": true,
+      "_origin": "ast",
+      "community": 9,
+      "community_name": "portfolio_vix.py",
+      "file_type": "code",
+      "norm_label": "vixconfig",
+      "source_file": "portfolio_vix.py",
+      "source_location": "L1816"
     },
     {
       "id": "active_management_analyze_ticker_options",
@@ -1208,18 +1208,6 @@
       "source_location": "L845"
     },
     {
-      "id": "gex_utils_gamma_flip_level",
-      "label": "gamma_flip_level()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 0,
-      "community_name": "active_management.py",
-      "file_type": "code",
-      "norm_label": "gamma_flip_level()",
-      "source_file": "gex_utils.py",
-      "source_location": "L13"
-    },
-    {
       "id": "portfolio_risk_score_leverage_get_log_returns",
       "label": "get_log_returns()",
       "_callable": true,
@@ -1232,76 +1220,16 @@
       "source_location": "L141"
     },
     {
-      "id": "tests_test_review_fixes_gammafliptests_test_crossing_detected_in_both_directions",
-      "label": ".test_crossing_detected_in_both_directions()",
+      "id": "portfolio_risk_score_leverage_get_portfolio_returns",
+      "label": "get_portfolio_returns()",
       "_callable": true,
       "_origin": "ast",
       "community": 0,
       "community_name": "active_management.py",
       "file_type": "code",
-      "norm_label": ".test_crossing_detected_in_both_directions()",
-      "source_file": "tests/test_review_fixes.py",
-      "source_location": "L64"
-    },
-    {
-      "id": "tests_test_review_fixes_gammafliptests_test_gex_field_uses_the_filter",
-      "label": ".test_gex_field_uses_the_filter()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 0,
-      "community_name": "active_management.py",
-      "file_type": "code",
-      "norm_label": ".test_gex_field_uses_the_filter()",
-      "source_file": "tests/test_review_fixes.py",
-      "source_location": "L72"
-    },
-    {
-      "id": "tests_test_review_fixes_gammafliptests_test_real_crossing_is_interpolated",
-      "label": ".test_real_crossing_is_interpolated()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 0,
-      "community_name": "active_management.py",
-      "file_type": "code",
-      "norm_label": ".test_real_crossing_is_interpolated()",
-      "source_file": "tests/test_review_fixes.py",
-      "source_location": "L58"
-    },
-    {
-      "id": "tests_test_review_fixes_gammafliptests_test_risk_score_zero_gamma_uses_the_filter",
-      "label": ".test_risk_score_zero_gamma_uses_the_filter()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 0,
-      "community_name": "active_management.py",
-      "file_type": "code",
-      "norm_label": ".test_risk_score_zero_gamma_uses_the_filter()",
-      "source_file": "tests/test_review_fixes.py",
-      "source_location": "L80"
-    },
-    {
-      "id": "tests_test_review_fixes_gammafliptests_test_unsorted_input_and_short_series",
-      "label": ".test_unsorted_input_and_short_series()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 0,
-      "community_name": "active_management.py",
-      "file_type": "code",
-      "norm_label": ".test_unsorted_input_and_short_series()",
-      "source_file": "tests/test_review_fixes.py",
-      "source_location": "L68"
-    },
-    {
-      "id": "tests_test_review_fixes_gammafliptests_test_zero_exposure_strikes_do_not_create_a_flip",
-      "label": ".test_zero_exposure_strikes_do_not_create_a_flip()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 0,
-      "community_name": "active_management.py",
-      "file_type": "code",
-      "norm_label": ".test_zero_exposure_strikes_do_not_create_a_flip()",
-      "source_file": "tests/test_review_fixes.py",
-      "source_location": "L54"
+      "norm_label": "get_portfolio_returns()",
+      "source_file": "portfolio_risk_score_leverage.py",
+      "source_location": "L145"
     },
     {
       "id": "fundamental_analysis_analizar_cartera",
@@ -1868,6 +1796,18 @@
       "source_location": "L528"
     },
     {
+      "id": "portfolio_vix_clamp_iv",
+      "label": "clamp_iv()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 11,
+      "community_name": "PolygonMarketLoader",
+      "file_type": "code",
+      "norm_label": "clamp_iv()",
+      "source_file": "portfolio_vix.py",
+      "source_location": "L1007"
+    },
+    {
       "id": "portfolio_vix_escrowed_inputs",
       "label": "escrowed_inputs()",
       "_callable": true,
@@ -1878,6 +1818,18 @@
       "norm_label": "escrowed_inputs()",
       "source_file": "portfolio_vix.py",
       "source_location": "L1019"
+    },
+    {
+      "id": "portfolio_vix_polygonmarketloader_chain",
+      "label": "._chain()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 11,
+      "community_name": "PolygonMarketLoader",
+      "file_type": "code",
+      "norm_label": "._chain()",
+      "source_file": "portfolio_vix.py",
+      "source_location": "L1210"
     },
     {
       "id": "portfolio_vix_polygonmarketloader_dividend_schedule",
@@ -1976,28 +1928,16 @@
       "source_location": "L1077"
     },
     {
-      "id": "portfolio_vix_select_cboe_expiries",
-      "label": "select_cboe_expiries()",
+      "id": "portfolio_vix_deamericanizer_init",
+      "label": ".__init__()",
       "_callable": true,
       "_origin": "ast",
-      "community": 11,
-      "community_name": "PolygonMarketLoader",
+      "community": 12,
+      "community_name": ".__init__",
       "file_type": "code",
-      "norm_label": "select_cboe_expiries()",
+      "norm_label": ".__init__()",
       "source_file": "portfolio_vix.py",
-      "source_location": "L994"
-    },
-    {
-      "id": "portfolio_vix_year_fraction",
-      "label": "year_fraction()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 11,
-      "community_name": "PolygonMarketLoader",
-      "file_type": "code",
-      "norm_label": "year_fraction()",
-      "source_file": "portfolio_vix.py",
-      "source_location": "L984"
+      "source_location": "L447"
     },
     {
       "id": "portfolio_vix_optionchaincleaner_clean",
@@ -2046,6 +1986,18 @@
       "norm_label": "._monotonic_mask()",
       "source_file": "portfolio_vix.py",
       "source_location": "L355"
+    },
+    {
+      "id": "portfolio_vix_polygonmarketloader_init",
+      "label": ".__init__()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 12,
+      "community_name": ".__init__",
+      "file_type": "code",
+      "norm_label": ".__init__()",
+      "source_file": "portfolio_vix.py",
+      "source_location": "L1046"
     },
     {
       "id": "portfolio_vix_portfoliovix_aggregate",
@@ -2204,6 +2156,18 @@
       "source_location": "L1552"
     },
     {
+      "id": "portfolio_vix_select_cboe_expiries",
+      "label": "select_cboe_expiries()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 14,
+      "community_name": ".load",
+      "file_type": "code",
+      "norm_label": "select_cboe_expiries()",
+      "source_file": "portfolio_vix.py",
+      "source_location": "L994"
+    },
+    {
       "id": "portfolio_vix_singleassetvix_compute",
       "label": ".compute()",
       "_callable": true,
@@ -2288,124 +2252,112 @@
       "source_location": "L1382"
     },
     {
-      "id": "tests_test_cycle1_fixes_estado",
-      "label": "_estado()",
+      "id": "portfolio_vix_year_fraction",
+      "label": "year_fraction()",
       "_callable": true,
       "_origin": "ast",
-      "community": 15,
-      "community_name": "FillsGatingTests",
+      "community": 14,
+      "community_name": ".load",
       "file_type": "code",
-      "norm_label": "_estado()",
-      "source_file": "tests/test_cycle1_fixes.py",
-      "source_location": "L38"
+      "norm_label": "year_fraction()",
+      "source_file": "portfolio_vix.py",
+      "source_location": "L984"
     },
     {
-      "id": "tests_test_cycle1_fixes_fills",
-      "label": "_fills()",
+      "id": "gex_utils_gamma_flip_level",
+      "label": "gamma_flip_level()",
       "_callable": true,
       "_origin": "ast",
       "community": 15,
-      "community_name": "FillsGatingTests",
+      "community_name": "gamma_flip_level",
       "file_type": "code",
-      "norm_label": "_fills()",
-      "source_file": "tests/test_cycle1_fixes.py",
-      "source_location": "L57"
+      "norm_label": "gamma_flip_level()",
+      "source_file": "gex_utils.py",
+      "source_location": "L13"
     },
     {
-      "id": "tests_test_cycle1_fixes_fillsgatingtests_test_cycle_day_defaults_and_invested_parse",
-      "label": ".test_cycle_day_defaults_and_invested_parse()",
+      "id": "portfolio_risk_score_leverage_compute_zero_gamma_level",
+      "label": "compute_zero_gamma_level()",
       "_callable": true,
       "_origin": "ast",
       "community": 15,
-      "community_name": "FillsGatingTests",
+      "community_name": "gamma_flip_level",
       "file_type": "code",
-      "norm_label": ".test_cycle_day_defaults_and_invested_parse()",
-      "source_file": "tests/test_cycle1_fixes.py",
-      "source_location": "L164"
+      "norm_label": "compute_zero_gamma_level()",
+      "source_file": "portfolio_risk_score_leverage.py",
+      "source_location": "L561"
     },
     {
-      "id": "tests_test_cycle1_fixes_fillsgatingtests_test_export_warnings_are_optional",
-      "label": ".test_export_warnings_are_optional()",
+      "id": "tests_test_review_fixes_gammafliptests_test_crossing_detected_in_both_directions",
+      "label": ".test_crossing_detected_in_both_directions()",
       "_callable": true,
       "_origin": "ast",
       "community": 15,
-      "community_name": "FillsGatingTests",
+      "community_name": "gamma_flip_level",
       "file_type": "code",
-      "norm_label": ".test_export_warnings_are_optional()",
-      "source_file": "tests/test_cycle1_fixes.py",
-      "source_location": "L207"
+      "norm_label": ".test_crossing_detected_in_both_directions()",
+      "source_file": "tests/test_review_fixes.py",
+      "source_location": "L64"
     },
     {
-      "id": "tests_test_cycle1_fixes_fillsgatingtests_test_locate_prefers_named_file_then_newest_fills",
-      "label": ".test_locate_prefers_named_file_then_newest_fills()",
+      "id": "tests_test_review_fixes_gammafliptests_test_gex_field_uses_the_filter",
+      "label": ".test_gex_field_uses_the_filter()",
       "_callable": true,
       "_origin": "ast",
       "community": 15,
-      "community_name": "FillsGatingTests",
+      "community_name": "gamma_flip_level",
       "file_type": "code",
-      "norm_label": ".test_locate_prefers_named_file_then_newest_fills()",
-      "source_file": "tests/test_cycle1_fixes.py",
-      "source_location": "L188"
+      "norm_label": ".test_gex_field_uses_the_filter()",
+      "source_file": "tests/test_review_fixes.py",
+      "source_location": "L72"
     },
     {
-      "id": "tests_test_cycle1_fixes_fillsgatingtests_test_matching_fill_advances_weight_and_cash_and_day",
-      "label": ".test_matching_fill_advances_weight_and_cash_and_day()",
+      "id": "tests_test_review_fixes_gammafliptests_test_real_crossing_is_interpolated",
+      "label": ".test_real_crossing_is_interpolated()",
       "_callable": true,
       "_origin": "ast",
       "community": 15,
-      "community_name": "FillsGatingTests",
+      "community_name": "gamma_flip_level",
       "file_type": "code",
-      "norm_label": ".test_matching_fill_advances_weight_and_cash_and_day()",
-      "source_file": "tests/test_cycle1_fixes.py",
-      "source_location": "L115"
+      "norm_label": ".test_real_crossing_is_interpolated()",
+      "source_file": "tests/test_review_fixes.py",
+      "source_location": "L58"
     },
     {
-      "id": "tests_test_cycle1_fixes_fillsgatingtests_test_mismatched_run_ts_does_not_advance",
-      "label": ".test_mismatched_run_ts_does_not_advance()",
+      "id": "tests_test_review_fixes_gammafliptests_test_risk_score_zero_gamma_uses_the_filter",
+      "label": ".test_risk_score_zero_gamma_uses_the_filter()",
       "_callable": true,
       "_origin": "ast",
       "community": 15,
-      "community_name": "FillsGatingTests",
+      "community_name": "gamma_flip_level",
       "file_type": "code",
-      "norm_label": ".test_mismatched_run_ts_does_not_advance()",
-      "source_file": "tests/test_cycle1_fixes.py",
-      "source_location": "L128"
+      "norm_label": ".test_risk_score_zero_gamma_uses_the_filter()",
+      "source_file": "tests/test_review_fixes.py",
+      "source_location": "L80"
     },
     {
-      "id": "tests_test_cycle1_fixes_fillsgatingtests_test_partial_status_counts",
-      "label": ".test_partial_status_counts()",
+      "id": "tests_test_review_fixes_gammafliptests_test_unsorted_input_and_short_series",
+      "label": ".test_unsorted_input_and_short_series()",
       "_callable": true,
       "_origin": "ast",
       "community": 15,
-      "community_name": "FillsGatingTests",
+      "community_name": "gamma_flip_level",
       "file_type": "code",
-      "norm_label": ".test_partial_status_counts()",
-      "source_file": "tests/test_cycle1_fixes.py",
-      "source_location": "L145"
+      "norm_label": ".test_unsorted_input_and_short_series()",
+      "source_file": "tests/test_review_fixes.py",
+      "source_location": "L68"
     },
     {
-      "id": "tests_test_cycle1_fixes_fillsgatingtests_test_rejected_fill_does_not_change_weight_but_confirms_the_signal",
-      "label": ".test_rejected_fill_does_not_change_weight_but_confirms_the_signal()",
+      "id": "tests_test_review_fixes_gammafliptests_test_zero_exposure_strikes_do_not_create_a_flip",
+      "label": ".test_zero_exposure_strikes_do_not_create_a_flip()",
       "_callable": true,
       "_origin": "ast",
       "community": 15,
-      "community_name": "FillsGatingTests",
+      "community_name": "gamma_flip_level",
       "file_type": "code",
-      "norm_label": ".test_rejected_fill_does_not_change_weight_but_confirms_the_signal()",
-      "source_file": "tests/test_cycle1_fixes.py",
-      "source_location": "L136"
-    },
-    {
-      "id": "tests_test_cycle1_fixes_fillsgatingtests_test_staging_a_signal_does_not_mark_invested",
-      "label": ".test_staging_a_signal_does_not_mark_invested()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 15,
-      "community_name": "FillsGatingTests",
-      "file_type": "code",
-      "norm_label": ".test_staging_a_signal_does_not_mark_invested()",
-      "source_file": "tests/test_cycle1_fixes.py",
-      "source_location": "L153"
+      "norm_label": ".test_zero_exposure_strikes_do_not_create_a_flip()",
+      "source_file": "tests/test_review_fixes.py",
+      "source_location": "L54"
     },
     {
       "id": "portfolio_vix_black76_price",
@@ -2660,6 +2612,18 @@
       "source_location": "L468"
     },
     {
+      "id": "entry_signal_tool_guardar_estado",
+      "label": "guardar_estado()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 19,
+      "community_name": "entry_signal_tool.py",
+      "file_type": "code",
+      "norm_label": "guardar_estado()",
+      "source_file": "entry_signal_tool.py",
+      "source_location": "L120"
+    },
+    {
       "id": "entry_signal_tool_imprimir_resumen",
       "label": "imprimir_resumen()",
       "_callable": true,
@@ -2744,48 +2708,12 @@
       "source_location": "L208"
     },
     {
-      "id": "pipeline_io_now_bogota",
-      "label": "_now_bogota()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 2,
-      "community_name": "test_cycle1_fixes.py",
-      "file_type": "code",
-      "norm_label": "_now_bogota()",
-      "source_file": "pipeline_io.py",
-      "source_location": "L38"
-    },
-    {
-      "id": "tests_test_cycle1_fixes_gexheadlesstests_test_entry_signal_source_has_no_input_prompt",
-      "label": ".test_entry_signal_source_has_no_input_prompt()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 2,
-      "community_name": "test_cycle1_fixes.py",
-      "file_type": "code",
-      "norm_label": ".test_entry_signal_source_has_no_input_prompt()",
-      "source_file": "tests/test_cycle1_fixes.py",
-      "source_location": "L291"
-    },
-    {
-      "id": "tests_test_cycle1_fixes_gexheadlesstests_test_flag_and_env_parsing",
-      "label": ".test_flag_and_env_parsing()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 2,
-      "community_name": "test_cycle1_fixes.py",
-      "file_type": "code",
-      "norm_label": ".test_flag_and_env_parsing()",
-      "source_file": "tests/test_cycle1_fixes.py",
-      "source_location": "L282"
-    },
-    {
       "id": "tests_test_pipeline_io_exportsignalstests_test_export_writes_latest_and_timestamped_copy",
       "label": ".test_export_writes_latest_and_timestamped_copy()",
       "_callable": true,
       "_origin": "ast",
       "community": 2,
-      "community_name": "test_cycle1_fixes.py",
+      "community_name": "test_pipeline_io.py",
       "file_type": "code",
       "norm_label": ".test_export_writes_latest_and_timestamped_copy()",
       "source_file": "tests/test_pipeline_io.py",
@@ -2797,7 +2725,7 @@
       "_callable": true,
       "_origin": "ast",
       "community": 2,
-      "community_name": "test_cycle1_fixes.py",
+      "community_name": "test_pipeline_io.py",
       "file_type": "code",
       "norm_label": ".test_read_only_directory_does_not_raise()",
       "source_file": "tests/test_pipeline_io.py",
@@ -2809,11 +2737,119 @@
       "_callable": true,
       "_origin": "ast",
       "community": 2,
-      "community_name": "test_cycle1_fixes.py",
+      "community_name": "test_pipeline_io.py",
       "file_type": "code",
       "norm_label": ".test_unwritable_directory_does_not_raise()",
       "source_file": "tests/test_pipeline_io.py",
       "source_location": "L145"
+    },
+    {
+      "id": "tests_test_pipeline_io_loadportfoliotests_test_invalid_json_negative_and_bad_schema_fall_back",
+      "label": ".test_invalid_json_negative_and_bad_schema_fall_back()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 2,
+      "community_name": "test_pipeline_io.py",
+      "file_type": "code",
+      "norm_label": ".test_invalid_json_negative_and_bad_schema_fall_back()",
+      "source_file": "tests/test_pipeline_io.py",
+      "source_location": "L82"
+    },
+    {
+      "id": "tests_test_pipeline_io_loadportfoliotests_test_load_renormalizes_and_returns_metadata",
+      "label": ".test_load_renormalizes_and_returns_metadata()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 2,
+      "community_name": "test_pipeline_io.py",
+      "file_type": "code",
+      "norm_label": ".test_load_renormalizes_and_returns_metadata()",
+      "source_file": "tests/test_pipeline_io.py",
+      "source_location": "L36"
+    },
+    {
+      "id": "tests_test_pipeline_io_loadportfoliotests_test_missing_file_uses_fallback_without_renormalizing",
+      "label": ".test_missing_file_uses_fallback_without_renormalizing()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 2,
+      "community_name": "test_pipeline_io.py",
+      "file_type": "code",
+      "norm_label": ".test_missing_file_uses_fallback_without_renormalizing()",
+      "source_file": "tests/test_pipeline_io.py",
+      "source_location": "L66"
+    },
+    {
+      "id": "tests_test_pipeline_io_loadportfoliotests_test_three_equal_weights_sum_to_one_at_six_decimals",
+      "label": ".test_three_equal_weights_sum_to_one_at_six_decimals()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 2,
+      "community_name": "test_pipeline_io.py",
+      "file_type": "code",
+      "norm_label": ".test_three_equal_weights_sum_to_one_at_six_decimals()",
+      "source_file": "tests/test_pipeline_io.py",
+      "source_location": "L52"
+    },
+    {
+      "id": "tests_test_pipeline_io_portfolio",
+      "label": "_portfolio()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 2,
+      "community_name": "test_pipeline_io.py",
+      "file_type": "code",
+      "norm_label": "_portfolio()",
+      "source_file": "tests/test_pipeline_io.py",
+      "source_location": "L25"
+    },
+    {
+      "id": "tests_test_review_fixes_dividendyieldtests_test_fraction_fields_win",
+      "label": ".test_fraction_fields_win()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 20,
+      "community_name": "test_review_fixes.py",
+      "file_type": "code",
+      "norm_label": ".test_fraction_fields_win()",
+      "source_file": "tests/test_review_fixes.py",
+      "source_location": "L171"
+    },
+    {
+      "id": "tests_test_review_fixes_dividendyieldtests_test_gex_field_dividend_yield",
+      "label": ".test_gex_field_dividend_yield()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 20,
+      "community_name": "test_review_fixes.py",
+      "file_type": "code",
+      "norm_label": ".test_gex_field_dividend_yield()",
+      "source_file": "tests/test_review_fixes.py",
+      "source_location": "L180"
+    },
+    {
+      "id": "tests_test_review_fixes_dividendyieldtests_test_missing_or_implausible",
+      "label": ".test_missing_or_implausible()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 20,
+      "community_name": "test_review_fixes.py",
+      "file_type": "code",
+      "norm_label": ".test_missing_or_implausible()",
+      "source_file": "tests/test_review_fixes.py",
+      "source_location": "L176"
+    },
+    {
+      "id": "tests_test_review_fixes_dividendyieldtests_test_percent_field_is_scaled",
+      "label": ".test_percent_field_is_scaled()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 20,
+      "community_name": "test_review_fixes.py",
+      "file_type": "code",
+      "norm_label": ".test_percent_field_is_scaled()",
+      "source_file": "tests/test_review_fixes.py",
+      "source_location": "L167"
     },
     {
       "id": "tests_test_review_fixes_entrypercentiletests_test_absolute_percentile_compares_magnitudes",
@@ -2862,6 +2898,18 @@
       "norm_label": ".test_ticker_without_prices_is_excluded()",
       "source_file": "tests/test_review_fixes.py",
       "source_location": "L191"
+    },
+    {
+      "id": "tickers_dividend_yield_from_info",
+      "label": "dividend_yield_from_info()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 20,
+      "community_name": "test_review_fixes.py",
+      "file_type": "code",
+      "norm_label": "dividend_yield_from_info()",
+      "source_file": "tickers.py",
+      "source_location": "L164"
     },
     {
       "id": "entry_signal_tool_activo_vacio",
@@ -3020,28 +3068,64 @@
       "source_location": "L98"
     },
     {
+      "id": "pipeline_io_apply_entry_fills",
+      "label": "apply_entry_fills()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 23,
+      "community_name": "pipeline_io.py",
+      "file_type": "code",
+      "norm_label": "apply_entry_fills()",
+      "source_file": "pipeline_io.py",
+      "source_location": "L354"
+    },
+    {
+      "id": "pipeline_io_as_float",
+      "label": "_as_float()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 23,
+      "community_name": "pipeline_io.py",
+      "file_type": "code",
+      "norm_label": "_as_float()",
+      "source_file": "pipeline_io.py",
+      "source_location": "L341"
+    },
+    {
+      "id": "pipeline_io_blank_activo",
+      "label": "_blank_activo()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 23,
+      "community_name": "pipeline_io.py",
+      "file_type": "code",
+      "norm_label": "_blank_activo()",
+      "source_file": "pipeline_io.py",
+      "source_location": "L350"
+    },
+    {
       "id": "pipeline_io_flexible_fraction",
       "label": "_flexible_fraction()",
       "_callable": true,
       "_origin": "ast",
       "community": 23,
-      "community_name": "json",
+      "community_name": "pipeline_io.py",
       "file_type": "code",
       "norm_label": "_flexible_fraction()",
       "source_file": "pipeline_io.py",
       "source_location": "L501"
     },
     {
-      "id": "pipeline_io_load_portfolio",
-      "label": "load_portfolio()",
+      "id": "pipeline_io_now_bogota",
+      "label": "_now_bogota()",
       "_callable": true,
       "_origin": "ast",
       "community": 23,
-      "community_name": "json",
+      "community_name": "pipeline_io.py",
       "file_type": "code",
-      "norm_label": "load_portfolio()",
+      "norm_label": "_now_bogota()",
       "source_file": "pipeline_io.py",
-      "source_location": "L120"
+      "source_location": "L38"
     },
     {
       "id": "pipeline_io_parse_invested_overrides",
@@ -3049,7 +3133,7 @@
       "_callable": true,
       "_origin": "ast",
       "community": 23,
-      "community_name": "json",
+      "community_name": "pipeline_io.py",
       "file_type": "code",
       "norm_label": "parse_invested_overrides()",
       "source_file": "pipeline_io.py",
@@ -3061,23 +3145,23 @@
       "_callable": true,
       "_origin": "ast",
       "community": 23,
-      "community_name": "json",
+      "community_name": "pipeline_io.py",
       "file_type": "code",
       "norm_label": "_percent_number()",
       "source_file": "pipeline_io.py",
       "source_location": "L490"
     },
     {
-      "id": "pipeline_io_renormalize_weights",
-      "label": "_renormalize_weights()",
+      "id": "pipeline_io_stage_pending_entry",
+      "label": "stage_pending_entry()",
       "_callable": true,
       "_origin": "ast",
       "community": 23,
-      "community_name": "json",
+      "community_name": "pipeline_io.py",
       "file_type": "code",
-      "norm_label": "_renormalize_weights()",
+      "norm_label": "stage_pending_entry()",
       "source_file": "pipeline_io.py",
-      "source_location": "L63"
+      "source_location": "L428"
     },
     {
       "id": "tests_test_review_fixes_failurereasontests_test_reasons",
@@ -3096,7 +3180,7 @@
       "label": ".get()",
       "_callable": true,
       "_origin": "ast",
-      "community": 25,
+      "community": 26,
       "community_name": "PolygonClient",
       "file_type": "code",
       "norm_label": ".get()",
@@ -3108,7 +3192,7 @@
       "label": ".paginate()",
       "_callable": true,
       "_origin": "ast",
-      "community": 25,
+      "community": 26,
       "community_name": "PolygonClient",
       "file_type": "code",
       "norm_label": ".paginate()",
@@ -3120,7 +3204,7 @@
       "label": "._url()",
       "_callable": true,
       "_origin": "ast",
-      "community": 25,
+      "community": 26,
       "community_name": "PolygonClient",
       "file_type": "code",
       "norm_label": "._url()",
@@ -3128,24 +3212,12 @@
       "source_location": "L170"
     },
     {
-      "id": "portfolio_gex_field_polygon",
-      "label": "polygon()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 25,
-      "community_name": "PolygonClient",
-      "file_type": "code",
-      "norm_label": "polygon()",
-      "source_file": "portfolio_gex_field.py",
-      "source_location": "L131"
-    },
-    {
       "id": "tests_test_cycle1_fixes_polygonbackofftests_test_client_does_not_retry_400",
       "label": ".test_client_does_not_retry_400()",
       "_callable": true,
       "_origin": "ast",
       "community": 26,
-      "community_name": "PolygonBackoffTests",
+      "community_name": "PolygonClient",
       "file_type": "code",
       "norm_label": ".test_client_does_not_retry_400()",
       "source_file": "tests/test_cycle1_fixes.py",
@@ -3157,7 +3229,7 @@
       "_callable": true,
       "_origin": "ast",
       "community": 26,
-      "community_name": "PolygonBackoffTests",
+      "community_name": "PolygonClient",
       "file_type": "code",
       "norm_label": ".test_client_retries_429_and_5xx_with_mocked_responses()",
       "source_file": "tests/test_cycle1_fixes.py",
@@ -3169,7 +3241,7 @@
       "_callable": true,
       "_origin": "ast",
       "community": 26,
-      "community_name": "PolygonBackoffTests",
+      "community_name": "PolygonClient",
       "file_type": "code",
       "norm_label": "fake_get()",
       "source_file": "tests/test_cycle1_fixes.py",
@@ -3181,7 +3253,7 @@
       "_callable": true,
       "_origin": "ast",
       "community": 26,
-      "community_name": "PolygonBackoffTests",
+      "community_name": "PolygonClient",
       "file_type": "code",
       "norm_label": ".test_default_calls_per_minute_is_100()",
       "source_file": "tests/test_cycle1_fixes.py",
@@ -3193,7 +3265,7 @@
       "_callable": true,
       "_origin": "ast",
       "community": 26,
-      "community_name": "PolygonBackoffTests",
+      "community_name": "PolygonClient",
       "file_type": "code",
       "norm_label": ".test_retry_after_beats_exponential_jitter()",
       "source_file": "tests/test_cycle1_fixes.py",
@@ -3205,7 +3277,7 @@
       "_callable": true,
       "_origin": "ast",
       "community": 26,
-      "community_name": "PolygonBackoffTests",
+      "community_name": "PolygonClient",
       "file_type": "code",
       "norm_label": ".__init__()",
       "source_file": "tests/test_cycle1_fixes.py",
@@ -3217,7 +3289,7 @@
       "_callable": true,
       "_origin": "ast",
       "community": 26,
-      "community_name": "PolygonBackoffTests",
+      "community_name": "PolygonClient",
       "file_type": "code",
       "norm_label": ".json()",
       "source_file": "tests/test_cycle1_fixes.py",
@@ -3306,66 +3378,6 @@
       "norm_label": "_load_active_management()",
       "source_file": "tests/test_review_fixes.py",
       "source_location": "L35"
-    },
-    {
-      "id": "tests_test_pipeline_io_loadportfoliotests_test_invalid_json_negative_and_bad_schema_fall_back",
-      "label": ".test_invalid_json_negative_and_bad_schema_fall_back()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 28,
-      "community_name": "LoadPortfolioTests",
-      "file_type": "code",
-      "norm_label": ".test_invalid_json_negative_and_bad_schema_fall_back()",
-      "source_file": "tests/test_pipeline_io.py",
-      "source_location": "L82"
-    },
-    {
-      "id": "tests_test_pipeline_io_loadportfoliotests_test_load_renormalizes_and_returns_metadata",
-      "label": ".test_load_renormalizes_and_returns_metadata()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 28,
-      "community_name": "LoadPortfolioTests",
-      "file_type": "code",
-      "norm_label": ".test_load_renormalizes_and_returns_metadata()",
-      "source_file": "tests/test_pipeline_io.py",
-      "source_location": "L36"
-    },
-    {
-      "id": "tests_test_pipeline_io_loadportfoliotests_test_missing_file_uses_fallback_without_renormalizing",
-      "label": ".test_missing_file_uses_fallback_without_renormalizing()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 28,
-      "community_name": "LoadPortfolioTests",
-      "file_type": "code",
-      "norm_label": ".test_missing_file_uses_fallback_without_renormalizing()",
-      "source_file": "tests/test_pipeline_io.py",
-      "source_location": "L66"
-    },
-    {
-      "id": "tests_test_pipeline_io_loadportfoliotests_test_three_equal_weights_sum_to_one_at_six_decimals",
-      "label": ".test_three_equal_weights_sum_to_one_at_six_decimals()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 28,
-      "community_name": "LoadPortfolioTests",
-      "file_type": "code",
-      "norm_label": ".test_three_equal_weights_sum_to_one_at_six_decimals()",
-      "source_file": "tests/test_pipeline_io.py",
-      "source_location": "L52"
-    },
-    {
-      "id": "tests_test_pipeline_io_portfolio",
-      "label": "_portfolio()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 28,
-      "community_name": "LoadPortfolioTests",
-      "file_type": "code",
-      "norm_label": "_portfolio()",
-      "source_file": "tests/test_pipeline_io.py",
-      "source_location": "L25"
     },
     {
       "id": "tests_test_review_fixes_vixweightsargstests_parse",
@@ -3620,6 +3632,18 @@
       "source_location": "L878"
     },
     {
+      "id": "portfolio_gex_field_get_current_price",
+      "label": "get_current_price()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 3,
+      "community_name": "portfolio_gex_field.py",
+      "file_type": "code",
+      "norm_label": "get_current_price()",
+      "source_file": "portfolio_gex_field.py",
+      "source_location": "L257"
+    },
+    {
       "id": "portfolio_gex_field_get_dividend_yield",
       "label": "get_dividend_yield()",
       "_callable": true,
@@ -3764,6 +3788,18 @@
       "source_location": "L997"
     },
     {
+      "id": "portfolio_gex_field_polygon",
+      "label": "polygon()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 3,
+      "community_name": "portfolio_gex_field.py",
+      "file_type": "code",
+      "norm_label": "polygon()",
+      "source_file": "portfolio_gex_field.py",
+      "source_location": "L131"
+    },
+    {
       "id": "portfolio_gex_field_potential_function",
       "label": "potential_function()",
       "_callable": true,
@@ -3872,64 +3908,28 @@
       "source_location": "L1216"
     },
     {
-      "id": "tests_test_review_fixes_dividendyieldtests_test_fraction_fields_win",
-      "label": ".test_fraction_fields_win()",
+      "id": "tests_test_cycle1_fixes_gexheadlesstests_test_entry_signal_source_has_no_input_prompt",
+      "label": ".test_entry_signal_source_has_no_input_prompt()",
       "_callable": true,
       "_origin": "ast",
       "community": 3,
       "community_name": "portfolio_gex_field.py",
       "file_type": "code",
-      "norm_label": ".test_fraction_fields_win()",
-      "source_file": "tests/test_review_fixes.py",
-      "source_location": "L171"
+      "norm_label": ".test_entry_signal_source_has_no_input_prompt()",
+      "source_file": "tests/test_cycle1_fixes.py",
+      "source_location": "L291"
     },
     {
-      "id": "tests_test_review_fixes_dividendyieldtests_test_gex_field_dividend_yield",
-      "label": ".test_gex_field_dividend_yield()",
+      "id": "tests_test_cycle1_fixes_gexheadlesstests_test_flag_and_env_parsing",
+      "label": ".test_flag_and_env_parsing()",
       "_callable": true,
       "_origin": "ast",
       "community": 3,
       "community_name": "portfolio_gex_field.py",
       "file_type": "code",
-      "norm_label": ".test_gex_field_dividend_yield()",
-      "source_file": "tests/test_review_fixes.py",
-      "source_location": "L180"
-    },
-    {
-      "id": "tests_test_review_fixes_dividendyieldtests_test_missing_or_implausible",
-      "label": ".test_missing_or_implausible()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 3,
-      "community_name": "portfolio_gex_field.py",
-      "file_type": "code",
-      "norm_label": ".test_missing_or_implausible()",
-      "source_file": "tests/test_review_fixes.py",
-      "source_location": "L176"
-    },
-    {
-      "id": "tests_test_review_fixes_dividendyieldtests_test_percent_field_is_scaled",
-      "label": ".test_percent_field_is_scaled()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 3,
-      "community_name": "portfolio_gex_field.py",
-      "file_type": "code",
-      "norm_label": ".test_percent_field_is_scaled()",
-      "source_file": "tests/test_review_fixes.py",
-      "source_location": "L167"
-    },
-    {
-      "id": "tickers_dividend_yield_from_info",
-      "label": "dividend_yield_from_info()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 3,
-      "community_name": "portfolio_gex_field.py",
-      "file_type": "code",
-      "norm_label": "dividend_yield_from_info()",
-      "source_file": "tickers.py",
-      "source_location": "L164"
+      "norm_label": ".test_flag_and_env_parsing()",
+      "source_file": "tests/test_cycle1_fixes.py",
+      "source_location": "L282"
     },
     {
       "id": "tickers_exclusion_warnings",
@@ -3968,52 +3968,16 @@
       "source_location": "L444"
     },
     {
-      "id": "pipeline_io_apply_entry_fills",
-      "label": "apply_entry_fills()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 4,
-      "community_name": "pipeline_io.py",
-      "file_type": "code",
-      "norm_label": "apply_entry_fills()",
-      "source_file": "pipeline_io.py",
-      "source_location": "L354"
-    },
-    {
-      "id": "pipeline_io_as_float",
-      "label": "_as_float()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 4,
-      "community_name": "pipeline_io.py",
-      "file_type": "code",
-      "norm_label": "_as_float()",
-      "source_file": "pipeline_io.py",
-      "source_location": "L341"
-    },
-    {
       "id": "pipeline_io_atomic_write",
       "label": "_atomic_write()",
       "_callable": true,
       "_origin": "ast",
       "community": 4,
-      "community_name": "pipeline_io.py",
+      "community_name": "export_signals",
       "file_type": "code",
       "norm_label": "_atomic_write()",
       "source_file": "pipeline_io.py",
       "source_location": "L226"
-    },
-    {
-      "id": "pipeline_io_blank_activo",
-      "label": "_blank_activo()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 4,
-      "community_name": "pipeline_io.py",
-      "file_type": "code",
-      "norm_label": "_blank_activo()",
-      "source_file": "pipeline_io.py",
-      "source_location": "L350"
     },
     {
       "id": "pipeline_io_executions_dir",
@@ -4021,7 +3985,7 @@
       "_callable": true,
       "_origin": "ast",
       "community": 4,
-      "community_name": "pipeline_io.py",
+      "community_name": "export_signals",
       "file_type": "code",
       "norm_label": "executions_dir()",
       "source_file": "pipeline_io.py",
@@ -4033,7 +3997,7 @@
       "_callable": true,
       "_origin": "ast",
       "community": 4,
-      "community_name": "pipeline_io.py",
+      "community_name": "export_signals",
       "file_type": "code",
       "norm_label": "export_signals()",
       "source_file": "pipeline_io.py",
@@ -4045,7 +4009,7 @@
       "_callable": true,
       "_origin": "ast",
       "community": 4,
-      "community_name": "pipeline_io.py",
+      "community_name": "export_signals",
       "file_type": "code",
       "norm_label": "_fallback_result()",
       "source_file": "pipeline_io.py",
@@ -4057,7 +4021,7 @@
       "_callable": true,
       "_origin": "ast",
       "community": 4,
-      "community_name": "pipeline_io.py",
+      "community_name": "export_signals",
       "file_type": "code",
       "norm_label": "_is_nan()",
       "source_file": "pipeline_io.py",
@@ -4069,11 +4033,23 @@
       "_callable": true,
       "_origin": "ast",
       "community": 4,
-      "community_name": "pipeline_io.py",
+      "community_name": "export_signals",
       "file_type": "code",
       "norm_label": "load_fills()",
       "source_file": "pipeline_io.py",
       "source_location": "L310"
+    },
+    {
+      "id": "pipeline_io_load_portfolio",
+      "label": "load_portfolio()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 4,
+      "community_name": "export_signals",
+      "file_type": "code",
+      "norm_label": "load_portfolio()",
+      "source_file": "pipeline_io.py",
+      "source_location": "L120"
     },
     {
       "id": "pipeline_io_locate_fills_file",
@@ -4081,23 +4057,23 @@
       "_callable": true,
       "_origin": "ast",
       "community": 4,
-      "community_name": "pipeline_io.py",
+      "community_name": "export_signals",
       "file_type": "code",
       "norm_label": "locate_fills_file()",
       "source_file": "pipeline_io.py",
       "source_location": "L285"
     },
     {
-      "id": "pipeline_io_stage_pending_entry",
-      "label": "stage_pending_entry()",
+      "id": "pipeline_io_renormalize_weights",
+      "label": "_renormalize_weights()",
       "_callable": true,
       "_origin": "ast",
       "community": 4,
-      "community_name": "pipeline_io.py",
+      "community_name": "export_signals",
       "file_type": "code",
-      "norm_label": "stage_pending_entry()",
+      "norm_label": "_renormalize_weights()",
       "source_file": "pipeline_io.py",
-      "source_location": "L428"
+      "source_location": "L63"
     },
     {
       "id": "pipeline_io_to_jsonable",
@@ -4105,7 +4081,7 @@
       "_callable": true,
       "_origin": "ast",
       "community": 4,
-      "community_name": "pipeline_io.py",
+      "community_name": "export_signals",
       "file_type": "code",
       "norm_label": "to_jsonable()",
       "source_file": "pipeline_io.py",
@@ -4117,7 +4093,7 @@
       "_callable": true,
       "_origin": "ast",
       "community": 4,
-      "community_name": "pipeline_io.py",
+      "community_name": "export_signals",
       "file_type": "code",
       "norm_label": "_warn()",
       "source_file": "pipeline_io.py",
@@ -4292,18 +4268,6 @@
       "source_location": "L156"
     },
     {
-      "id": "portfolio_risk_score_leverage_compute_zero_gamma_level",
-      "label": "compute_zero_gamma_level()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 5,
-      "community_name": "portfolio_risk_score_leverage.py",
-      "file_type": "code",
-      "norm_label": "compute_zero_gamma_level()",
-      "source_file": "portfolio_risk_score_leverage.py",
-      "source_location": "L561"
-    },
-    {
       "id": "portfolio_risk_score_leverage_cornish_fisher_es",
       "label": "cornish_fisher_es()",
       "_callable": true,
@@ -4362,18 +4326,6 @@
       "norm_label": "g()",
       "source_file": "portfolio_risk_score_leverage.py",
       "source_location": "L471"
-    },
-    {
-      "id": "portfolio_risk_score_leverage_get_portfolio_returns",
-      "label": "get_portfolio_returns()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 5,
-      "community_name": "portfolio_risk_score_leverage.py",
-      "file_type": "code",
-      "norm_label": "get_portfolio_returns()",
-      "source_file": "portfolio_risk_score_leverage.py",
-      "source_location": "L145"
     },
     {
       "id": "portfolio_risk_score_leverage_get_price_data",
@@ -4748,16 +4700,124 @@
       "source_location": "L135"
     },
     {
-      "id": "portfolio_gex_field_get_current_price",
-      "label": "get_current_price()",
+      "id": "tests_test_cycle1_fixes_estado",
+      "label": "_estado()",
       "_callable": true,
       "_origin": "ast",
       "community": 8,
       "community_name": "to_polygon",
       "file_type": "code",
-      "norm_label": "get_current_price()",
-      "source_file": "portfolio_gex_field.py",
-      "source_location": "L257"
+      "norm_label": "_estado()",
+      "source_file": "tests/test_cycle1_fixes.py",
+      "source_location": "L38"
+    },
+    {
+      "id": "tests_test_cycle1_fixes_fills",
+      "label": "_fills()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 8,
+      "community_name": "to_polygon",
+      "file_type": "code",
+      "norm_label": "_fills()",
+      "source_file": "tests/test_cycle1_fixes.py",
+      "source_location": "L57"
+    },
+    {
+      "id": "tests_test_cycle1_fixes_fillsgatingtests_test_cycle_day_defaults_and_invested_parse",
+      "label": ".test_cycle_day_defaults_and_invested_parse()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 8,
+      "community_name": "to_polygon",
+      "file_type": "code",
+      "norm_label": ".test_cycle_day_defaults_and_invested_parse()",
+      "source_file": "tests/test_cycle1_fixes.py",
+      "source_location": "L164"
+    },
+    {
+      "id": "tests_test_cycle1_fixes_fillsgatingtests_test_export_warnings_are_optional",
+      "label": ".test_export_warnings_are_optional()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 8,
+      "community_name": "to_polygon",
+      "file_type": "code",
+      "norm_label": ".test_export_warnings_are_optional()",
+      "source_file": "tests/test_cycle1_fixes.py",
+      "source_location": "L207"
+    },
+    {
+      "id": "tests_test_cycle1_fixes_fillsgatingtests_test_locate_prefers_named_file_then_newest_fills",
+      "label": ".test_locate_prefers_named_file_then_newest_fills()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 8,
+      "community_name": "to_polygon",
+      "file_type": "code",
+      "norm_label": ".test_locate_prefers_named_file_then_newest_fills()",
+      "source_file": "tests/test_cycle1_fixes.py",
+      "source_location": "L188"
+    },
+    {
+      "id": "tests_test_cycle1_fixes_fillsgatingtests_test_matching_fill_advances_weight_and_cash_and_day",
+      "label": ".test_matching_fill_advances_weight_and_cash_and_day()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 8,
+      "community_name": "to_polygon",
+      "file_type": "code",
+      "norm_label": ".test_matching_fill_advances_weight_and_cash_and_day()",
+      "source_file": "tests/test_cycle1_fixes.py",
+      "source_location": "L115"
+    },
+    {
+      "id": "tests_test_cycle1_fixes_fillsgatingtests_test_mismatched_run_ts_does_not_advance",
+      "label": ".test_mismatched_run_ts_does_not_advance()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 8,
+      "community_name": "to_polygon",
+      "file_type": "code",
+      "norm_label": ".test_mismatched_run_ts_does_not_advance()",
+      "source_file": "tests/test_cycle1_fixes.py",
+      "source_location": "L128"
+    },
+    {
+      "id": "tests_test_cycle1_fixes_fillsgatingtests_test_partial_status_counts",
+      "label": ".test_partial_status_counts()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 8,
+      "community_name": "to_polygon",
+      "file_type": "code",
+      "norm_label": ".test_partial_status_counts()",
+      "source_file": "tests/test_cycle1_fixes.py",
+      "source_location": "L145"
+    },
+    {
+      "id": "tests_test_cycle1_fixes_fillsgatingtests_test_rejected_fill_does_not_change_weight_but_confirms_the_signal",
+      "label": ".test_rejected_fill_does_not_change_weight_but_confirms_the_signal()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 8,
+      "community_name": "to_polygon",
+      "file_type": "code",
+      "norm_label": ".test_rejected_fill_does_not_change_weight_but_confirms_the_signal()",
+      "source_file": "tests/test_cycle1_fixes.py",
+      "source_location": "L136"
+    },
+    {
+      "id": "tests_test_cycle1_fixes_fillsgatingtests_test_staging_a_signal_does_not_mark_invested",
+      "label": ".test_staging_a_signal_does_not_mark_invested()",
+      "_callable": true,
+      "_origin": "ast",
+      "community": 8,
+      "community_name": "to_polygon",
+      "file_type": "code",
+      "norm_label": ".test_staging_a_signal_does_not_mark_invested()",
+      "source_file": "tests/test_cycle1_fixes.py",
+      "source_location": "L153"
     },
     {
       "id": "tests_test_cycle1_fixes_tickermappingtests_test_class_share_yahoo_polygon_and_capital",
@@ -4976,18 +5036,6 @@
       "source_location": "L49"
     },
     {
-      "id": "entry_signal_tool_guardar_estado",
-      "label": "guardar_estado()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 9,
-      "community_name": "portfolio_vix.py",
-      "file_type": "code",
-      "norm_label": "guardar_estado()",
-      "source_file": "entry_signal_tool.py",
-      "source_location": "L120"
-    },
-    {
       "id": "portfolio_vix_bjerksund_stensland_call",
       "label": "bjerksund_stensland_call()",
       "_callable": true,
@@ -5024,18 +5072,6 @@
       "source_location": "L146"
     },
     {
-      "id": "portfolio_vix_clamp_iv",
-      "label": "clamp_iv()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 9,
-      "community_name": "portfolio_vix.py",
-      "file_type": "code",
-      "norm_label": "clamp_iv()",
-      "source_file": "portfolio_vix.py",
-      "source_location": "L1007"
-    },
-    {
       "id": "portfolio_vix_crr_american",
       "label": "crr_american()",
       "_callable": true,
@@ -5046,18 +5082,6 @@
       "norm_label": "crr_american()",
       "source_file": "portfolio_vix.py",
       "source_location": "L238"
-    },
-    {
-      "id": "portfolio_vix_deamericanizer_init",
-      "label": ".__init__()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 9,
-      "community_name": "portfolio_vix.py",
-      "file_type": "code",
-      "norm_label": ".__init__()",
-      "source_file": "portfolio_vix.py",
-      "source_location": "L447"
     },
     {
       "id": "portfolio_vix_deamericanizer_transform",
@@ -5132,30 +5156,6 @@
       "source_location": "L182"
     },
     {
-      "id": "portfolio_vix_polygonmarketloader_chain",
-      "label": "._chain()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 9,
-      "community_name": "portfolio_vix.py",
-      "file_type": "code",
-      "norm_label": "._chain()",
-      "source_file": "portfolio_vix.py",
-      "source_location": "L1210"
-    },
-    {
-      "id": "portfolio_vix_polygonmarketloader_init",
-      "label": ".__init__()",
-      "_callable": true,
-      "_origin": "ast",
-      "community": 9,
-      "community_name": "portfolio_vix.py",
-      "file_type": "code",
-      "norm_label": ".__init__()",
-      "source_file": "portfolio_vix.py",
-      "source_location": "L1046"
-    },
-    {
       "id": "portfolio_vix_portfolio_tickers",
       "label": "portfolio_tickers()",
       "_callable": true,
@@ -5213,39 +5213,6 @@
       "norm_label": "active_management.py",
       "source_file": "active_management.py",
       "source_location": "L1"
-    },
-    {
-      "id": "gex_utils",
-      "label": "gex_utils.py",
-      "_origin": "ast",
-      "community": 0,
-      "community_name": "active_management.py",
-      "file_type": "code",
-      "norm_label": "gex_utils.py",
-      "source_file": "gex_utils.py",
-      "source_location": "L1"
-    },
-    {
-      "id": "gex_utils_rationale_1",
-      "label": "Shared gamma-exposure helpers for the options scripts. The gamma flip (zero-\u2026",
-      "_origin": "ast",
-      "community": 0,
-      "community_name": "active_management.py",
-      "file_type": "rationale",
-      "norm_label": "shared gamma-exposure helpers for the options scripts. the gamma flip (zero-...",
-      "source_file": "gex_utils.py",
-      "source_location": "L1"
-    },
-    {
-      "id": "gex_utils_rationale_14",
-      "label": "Strike where cumulative net GEX first changes sign, or NaN if it never does.\u2026",
-      "_origin": "ast",
-      "community": 0,
-      "community_name": "active_management.py",
-      "file_type": "rationale",
-      "norm_label": "strike where cumulative net gex first changes sign, or nan if it never does....",
-      "source_file": "gex_utils.py",
-      "source_location": "L14"
     },
     {
       "id": "any",
@@ -5512,6 +5479,17 @@
       "source_location": ""
     },
     {
+      "id": "americanengine",
+      "label": "AmericanEngine",
+      "_origin": "ast",
+      "community": 12,
+      "community_name": ".__init__",
+      "file_type": "code",
+      "norm_label": "americanengine",
+      "source_file": "",
+      "source_location": ""
+    },
+    {
       "id": "portfolio_vix_py_dataframe",
       "label": "DataFrame",
       "_origin": "ast",
@@ -5523,11 +5501,116 @@
       "source_location": ""
     },
     {
+      "id": "gex_utils",
+      "label": "gex_utils.py",
+      "_origin": "ast",
+      "community": 15,
+      "community_name": "gamma_flip_level",
+      "file_type": "code",
+      "norm_label": "gex_utils.py",
+      "source_file": "gex_utils.py",
+      "source_location": "L1"
+    },
+    {
+      "id": "gex_utils_rationale_1",
+      "label": "Shared gamma-exposure helpers for the options scripts. The gamma flip (zero-\u2026",
+      "_origin": "ast",
+      "community": 15,
+      "community_name": "gamma_flip_level",
+      "file_type": "rationale",
+      "norm_label": "shared gamma-exposure helpers for the options scripts. the gamma flip (zero-...",
+      "source_file": "gex_utils.py",
+      "source_location": "L1"
+    },
+    {
+      "id": "gex_utils_rationale_14",
+      "label": "Strike where cumulative net GEX first changes sign, or NaN if it never does.\u2026",
+      "_origin": "ast",
+      "community": 15,
+      "community_name": "gamma_flip_level",
+      "file_type": "rationale",
+      "norm_label": "strike where cumulative net gex first changes sign, or nan if it never does....",
+      "source_file": "gex_utils.py",
+      "source_location": "L14"
+    },
+    {
+      "id": "agents",
+      "label": "AGENTS.md",
+      "_origin": "ast",
+      "community": 17,
+      "community_name": "Working with the graphify knowledge graph",
+      "file_type": "document",
+      "node_kind": "page",
+      "norm_label": "agents.md",
+      "source_file": "AGENTS.md",
+      "source_location": "L1"
+    },
+    {
+      "id": "agents_freshness_check",
+      "label": "Freshness check",
+      "_origin": "ast",
+      "community": 17,
+      "community_name": "Working with the graphify knowledge graph",
+      "file_type": "document",
+      "node_kind": "heading",
+      "norm_label": "freshness check",
+      "source_file": "AGENTS.md",
+      "source_location": "L20"
+    },
+    {
+      "id": "agents_git_hygiene",
+      "label": "Git hygiene",
+      "_origin": "ast",
+      "community": 17,
+      "community_name": "Working with the graphify knowledge graph",
+      "file_type": "document",
+      "node_kind": "heading",
+      "norm_label": "git hygiene",
+      "source_file": "AGENTS.md",
+      "source_location": "L30"
+    },
+    {
+      "id": "agents_navigating",
+      "label": "Navigating",
+      "_origin": "ast",
+      "community": 17,
+      "community_name": "Working with the graphify knowledge graph",
+      "file_type": "document",
+      "node_kind": "heading",
+      "norm_label": "navigating",
+      "source_file": "AGENTS.md",
+      "source_location": "L7"
+    },
+    {
+      "id": "agents_verify_before_asserting",
+      "label": "Verify before asserting",
+      "_origin": "ast",
+      "community": 17,
+      "community_name": "Working with the graphify knowledge graph",
+      "file_type": "document",
+      "node_kind": "heading",
+      "norm_label": "verify before asserting",
+      "source_file": "AGENTS.md",
+      "source_location": "L13"
+    },
+    {
+      "id": "agents_working_with_the_graphify_knowledge_graph",
+      "label": "Working with the graphify knowledge graph",
+      "_origin": "ast",
+      "community": 17,
+      "community_name": "Working with the graphify knowledge graph",
+      "file_type": "document",
+      "node_kind": "heading",
+      "norm_label": "working with the graphify knowledge graph",
+      "source_file": "AGENTS.md",
+      "source_location": "L1"
+    },
+    {
       "id": "claude",
       "label": "CLAUDE.md",
       "_origin": "ast",
       "community": 18,
-      "community_name": "CLAUDE.md",
+      "community_name": "Working with the graphify knowledge graph",
       "file_type": "document",
       "node_kind": "page",
       "norm_label": "claude.md",
@@ -5535,14 +5618,62 @@
       "source_location": "L1"
     },
     {
-      "id": "claude_graphify",
-      "label": "graphify",
+      "id": "claude_freshness_check",
+      "label": "Freshness check",
       "_origin": "ast",
       "community": 18,
-      "community_name": "CLAUDE.md",
+      "community_name": "Working with the graphify knowledge graph",
       "file_type": "document",
       "node_kind": "heading",
-      "norm_label": "graphify",
+      "norm_label": "freshness check",
+      "source_file": "CLAUDE.md",
+      "source_location": "L20"
+    },
+    {
+      "id": "claude_git_hygiene",
+      "label": "Git hygiene",
+      "_origin": "ast",
+      "community": 18,
+      "community_name": "Working with the graphify knowledge graph",
+      "file_type": "document",
+      "node_kind": "heading",
+      "norm_label": "git hygiene",
+      "source_file": "CLAUDE.md",
+      "source_location": "L30"
+    },
+    {
+      "id": "claude_navigating",
+      "label": "Navigating",
+      "_origin": "ast",
+      "community": 18,
+      "community_name": "Working with the graphify knowledge graph",
+      "file_type": "document",
+      "node_kind": "heading",
+      "norm_label": "navigating",
+      "source_file": "CLAUDE.md",
+      "source_location": "L7"
+    },
+    {
+      "id": "claude_verify_before_asserting",
+      "label": "Verify before asserting",
+      "_origin": "ast",
+      "community": 18,
+      "community_name": "Working with the graphify knowledge graph",
+      "file_type": "document",
+      "node_kind": "heading",
+      "norm_label": "verify before asserting",
+      "source_file": "CLAUDE.md",
+      "source_location": "L13"
+    },
+    {
+      "id": "claude_working_with_the_graphify_knowledge_graph",
+      "label": "Working with the graphify knowledge graph",
+      "_origin": "ast",
+      "community": 18,
+      "community_name": "Working with the graphify knowledge graph",
+      "file_type": "document",
+      "node_kind": "heading",
+      "norm_label": "working with the graphify knowledge graph",
       "source_file": "CLAUDE.md",
       "source_location": "L1"
     },
@@ -5569,47 +5700,14 @@
       "source_location": "L754"
     },
     {
-      "id": "datetime",
-      "label": "datetime",
-      "_origin": "ast",
-      "community": 2,
-      "community_name": "test_cycle1_fixes.py",
-      "file_type": "code",
-      "norm_label": "datetime",
-      "source_file": "",
-      "source_location": ""
-    },
-    {
-      "id": "tests_test_cycle1_fixes",
-      "label": "test_cycle1_fixes.py",
-      "_origin": "ast",
-      "community": 2,
-      "community_name": "test_cycle1_fixes.py",
-      "file_type": "code",
-      "norm_label": "test_cycle1_fixes.py",
-      "source_file": "tests/test_cycle1_fixes.py",
-      "source_location": "L1"
-    },
-    {
       "id": "tests_test_pipeline_io",
       "label": "test_pipeline_io.py",
       "_origin": "ast",
       "community": 2,
-      "community_name": "test_cycle1_fixes.py",
+      "community_name": "test_pipeline_io.py",
       "file_type": "code",
       "norm_label": "test_pipeline_io.py",
       "source_file": "tests/test_pipeline_io.py",
-      "source_location": "L1"
-    },
-    {
-      "id": "tests_test_cycle1_fixes_rationale_1",
-      "label": "No-network tests for ticker mapping, fills gating, Polygon backoff, and GEX\u2026",
-      "_origin": "ast",
-      "community": 2,
-      "community_name": "test_cycle1_fixes.py",
-      "file_type": "rationale",
-      "norm_label": "no-network tests for ticker mapping, fills gating, polygon backoff, and gex...",
-      "source_file": "tests/test_cycle1_fixes.py",
       "source_location": "L1"
     },
     {
@@ -5617,7 +5715,7 @@
       "label": "Unit tests for pipeline_io. No network.",
       "_origin": "ast",
       "community": 2,
-      "community_name": "test_cycle1_fixes.py",
+      "community_name": "test_pipeline_io.py",
       "file_type": "rationale",
       "norm_label": "unit tests for pipeline_io. no network.",
       "source_file": "tests/test_pipeline_io.py",
@@ -5655,6 +5753,17 @@
       "norm_label": "exec only the named top-level functions/assignments of a script.",
       "source_file": "tests/test_review_fixes.py",
       "source_location": "L20"
+    },
+    {
+      "id": "tickers_rationale_165",
+      "label": "Dividend yield as a fraction (0.0045 = 0.45%) from a yfinance ``.info``.\u2026",
+      "_origin": "ast",
+      "community": 20,
+      "community_name": "test_review_fixes.py",
+      "file_type": "rationale",
+      "norm_label": "dividend yield as a fraction (0.0045 = 0.45%) from a yfinance ``.info``....",
+      "source_file": "tickers.py",
+      "source_location": "L165"
     },
     {
       "id": "entry_signal_tool_rationale_566",
@@ -5701,37 +5810,70 @@
       "source_location": "L1"
     },
     {
-      "id": "pipeline_io_rationale_121",
-      "label": "Read PORTFOLIO_FILE, validate weights, and return weights plus metadata.\u2026",
+      "id": "datetime",
+      "label": "datetime",
       "_origin": "ast",
       "community": 23,
-      "community_name": "json",
-      "file_type": "rationale",
-      "norm_label": "read portfolio_file, validate weights, and return weights plus metadata....",
+      "community_name": "pipeline_io.py",
+      "file_type": "code",
+      "norm_label": "datetime",
+      "source_file": "",
+      "source_location": ""
+    },
+    {
+      "id": "pipeline_io",
+      "label": "pipeline_io.py",
+      "_origin": "ast",
+      "community": 23,
+      "community_name": "pipeline_io.py",
+      "file_type": "code",
+      "norm_label": "pipeline_io.py",
       "source_file": "pipeline_io.py",
-      "source_location": "L121"
+      "source_location": "L1"
+    },
+    {
+      "id": "pipeline_io_rationale_1",
+      "label": "Shared portfolio input and signal output for the Portfolio-Manager scripts.\u2026",
+      "_origin": "ast",
+      "community": 23,
+      "community_name": "pipeline_io.py",
+      "file_type": "rationale",
+      "norm_label": "shared portfolio input and signal output for the portfolio-manager scripts....",
+      "source_file": "pipeline_io.py",
+      "source_location": "L1"
+    },
+    {
+      "id": "pipeline_io_rationale_355",
+      "label": "Advance entry state only when ``payload['signal_run_ts']`` matches. Returns\u2026",
+      "_origin": "ast",
+      "community": 23,
+      "community_name": "pipeline_io.py",
+      "file_type": "rationale",
+      "norm_label": "advance entry state only when ``payload['signal_run_ts']`` matches. returns...",
+      "source_file": "pipeline_io.py",
+      "source_location": "L355"
+    },
+    {
+      "id": "pipeline_io_rationale_429",
+      "label": "Remember the signal that is waiting for fills. Does not mark invested.",
+      "_origin": "ast",
+      "community": 23,
+      "community_name": "pipeline_io.py",
+      "file_type": "rationale",
+      "norm_label": "remember the signal that is waiting for fills. does not mark invested.",
+      "source_file": "pipeline_io.py",
+      "source_location": "L429"
     },
     {
       "id": "pipeline_io_rationale_517",
       "label": "Parse ``ENTRY_INVESTED_PCT`` / ``--invested-pct``. Returns\u2026",
       "_origin": "ast",
       "community": 23,
-      "community_name": "json",
+      "community_name": "pipeline_io.py",
       "file_type": "rationale",
       "norm_label": "parse ``entry_invested_pct`` / ``--invested-pct``. returns...",
       "source_file": "pipeline_io.py",
       "source_location": "L517"
-    },
-    {
-      "id": "pipeline_io_rationale_64",
-      "label": "Drop dust weights and rescale so 6-decimal-place weights sum to 1.",
-      "_origin": "ast",
-      "community": 23,
-      "community_name": "json",
-      "file_type": "rationale",
-      "norm_label": "drop dust weights and rescale so 6-decimal-place weights sum to 1.",
-      "source_file": "pipeline_io.py",
-      "source_location": "L64"
     },
     {
       "id": "runtimeerror",
@@ -5781,7 +5923,7 @@
       "id": "polygon_client_rationale_176",
       "label": "Devuelve el JSON de la respuesta o lanza PolygonError. Nunca devuelve None.",
       "_origin": "ast",
-      "community": 25,
+      "community": 26,
       "community_name": "PolygonClient",
       "file_type": "rationale",
       "norm_label": "devuelve el json de la respuesta o lanza polygonerror. nunca devuelve none.",
@@ -5792,23 +5934,12 @@
       "id": "polygon_client_rationale_215",
       "label": "Sigue next_url y devuelve todos los `results`. Si una pagina falla se lanza\u2026",
       "_origin": "ast",
-      "community": 25,
+      "community": 26,
       "community_name": "PolygonClient",
       "file_type": "rationale",
       "norm_label": "sigue next_url y devuelve todos los `results`. si una pagina falla se lanza...",
       "source_file": "polygon_client.py",
       "source_location": "L215"
-    },
-    {
-      "id": "polygon_client_rationale_44",
-      "label": "La paginacion alcanzo el tope de paginas y quedaban resultados por pedir.",
-      "_origin": "ast",
-      "community": 25,
-      "community_name": "PolygonClient",
-      "file_type": "rationale",
-      "norm_label": "la paginacion alcanzo el tope de paginas y quedaban resultados por pedir.",
-      "source_file": "polygon_client.py",
-      "source_location": "L44"
     },
     {
       "id": "tests_test_review_fixes_rationale_36",
@@ -5866,17 +5997,6 @@
       "source_location": "L1386"
     },
     {
-      "id": "tickers_rationale_165",
-      "label": "Dividend yield as a fraction (0.0045 = 0.45%) from a yfinance ``.info``.\u2026",
-      "_origin": "ast",
-      "community": 3,
-      "community_name": "portfolio_gex_field.py",
-      "file_type": "rationale",
-      "norm_label": "dividend yield as a fraction (0.0045 = 0.45%) from a yfinance ``.info``....",
-      "source_file": "tickers.py",
-      "source_location": "L165"
-    },
-    {
       "id": "pipeline_io_rationale_445",
       "label": "Next cycle day from the last *executed* state. Does not write the file.",
       "_origin": "ast",
@@ -5899,33 +6019,22 @@
       "source_location": "L459"
     },
     {
-      "id": "pipeline_io",
-      "label": "pipeline_io.py",
+      "id": "pipeline_io_rationale_121",
+      "label": "Read PORTFOLIO_FILE, validate weights, and return weights plus metadata.\u2026",
       "_origin": "ast",
       "community": 4,
-      "community_name": "pipeline_io.py",
-      "file_type": "code",
-      "norm_label": "pipeline_io.py",
-      "source_file": "pipeline_io.py",
-      "source_location": "L1"
-    },
-    {
-      "id": "pipeline_io_rationale_1",
-      "label": "Shared portfolio input and signal output for the Portfolio-Manager scripts.\u2026",
-      "_origin": "ast",
-      "community": 4,
-      "community_name": "pipeline_io.py",
+      "community_name": "export_signals",
       "file_type": "rationale",
-      "norm_label": "shared portfolio input and signal output for the portfolio-manager scripts....",
+      "norm_label": "read portfolio_file, validate weights, and return weights plus metadata....",
       "source_file": "pipeline_io.py",
-      "source_location": "L1"
+      "source_location": "L121"
     },
     {
       "id": "pipeline_io_rationale_183",
       "label": "Convert numpy, pandas and non-finite floats so ``json`` can emit null.",
       "_origin": "ast",
       "community": 4,
-      "community_name": "pipeline_io.py",
+      "community_name": "export_signals",
       "file_type": "rationale",
       "norm_label": "convert numpy, pandas and non-finite floats so ``json`` can emit null.",
       "source_file": "pipeline_io.py",
@@ -5936,7 +6045,7 @@
       "label": "Write ``<script>.json`` and a timestamped copy. Returns the latest path.\u2026",
       "_origin": "ast",
       "community": 4,
-      "community_name": "pipeline_io.py",
+      "community_name": "export_signals",
       "file_type": "rationale",
       "norm_label": "write ``<script>.json`` and a timestamped copy. returns the latest path....",
       "source_file": "pipeline_io.py",
@@ -5947,7 +6056,7 @@
       "label": "Prefer ``<script>_fills.json``; otherwise the newest ``fills_*.json``.",
       "_origin": "ast",
       "community": 4,
-      "community_name": "pipeline_io.py",
+      "community_name": "export_signals",
       "file_type": "rationale",
       "norm_label": "prefer ``<script>_fills.json``; otherwise the newest ``fills_*.json``.",
       "source_file": "pipeline_io.py",
@@ -5958,33 +6067,22 @@
       "label": "Read a fills document or return None. Never raises.",
       "_origin": "ast",
       "community": 4,
-      "community_name": "pipeline_io.py",
+      "community_name": "export_signals",
       "file_type": "rationale",
       "norm_label": "read a fills document or return none. never raises.",
       "source_file": "pipeline_io.py",
       "source_location": "L311"
     },
     {
-      "id": "pipeline_io_rationale_355",
-      "label": "Advance entry state only when ``payload['signal_run_ts']`` matches. Returns\u2026",
+      "id": "pipeline_io_rationale_64",
+      "label": "Drop dust weights and rescale so 6-decimal-place weights sum to 1.",
       "_origin": "ast",
       "community": 4,
-      "community_name": "pipeline_io.py",
+      "community_name": "export_signals",
       "file_type": "rationale",
-      "norm_label": "advance entry state only when ``payload['signal_run_ts']`` matches. returns...",
+      "norm_label": "drop dust weights and rescale so 6-decimal-place weights sum to 1.",
       "source_file": "pipeline_io.py",
-      "source_location": "L355"
-    },
-    {
-      "id": "pipeline_io_rationale_429",
-      "label": "Remember the signal that is waiting for fills. Does not mark invested.",
-      "_origin": "ast",
-      "community": 4,
-      "community_name": "pipeline_io.py",
-      "file_type": "rationale",
-      "norm_label": "remember the signal that is waiting for fills. does not mark invested.",
-      "source_file": "pipeline_io.py",
-      "source_location": "L429"
+      "source_location": "L64"
     },
     {
       "id": "portfolio_risk_score_leverage",
@@ -6031,6 +6129,28 @@
       "source_location": "L136"
     },
     {
+      "id": "polygon_client_rationale_44",
+      "label": "La paginacion alcanzo el tope de paginas y quedaban resultados por pedir.",
+      "_origin": "ast",
+      "community": 7,
+      "community_name": "polygon_client.py",
+      "file_type": "rationale",
+      "norm_label": "la paginacion alcanzo el tope de paginas y quedaban resultados por pedir.",
+      "source_file": "polygon_client.py",
+      "source_location": "L44"
+    },
+    {
+      "id": "tests_test_cycle1_fixes",
+      "label": "test_cycle1_fixes.py",
+      "_origin": "ast",
+      "community": 8,
+      "community_name": "to_polygon",
+      "file_type": "code",
+      "norm_label": "test_cycle1_fixes.py",
+      "source_file": "tests/test_cycle1_fixes.py",
+      "source_location": "L1"
+    },
+    {
       "id": "tickers",
       "label": "tickers.py",
       "_origin": "ast",
@@ -6039,6 +6159,17 @@
       "file_type": "code",
       "norm_label": "tickers.py",
       "source_file": "tickers.py",
+      "source_location": "L1"
+    },
+    {
+      "id": "tests_test_cycle1_fixes_rationale_1",
+      "label": "No-network tests for ticker mapping, fills gating, Polygon backoff, and GEX\u2026",
+      "_origin": "ast",
+      "community": 8,
+      "community_name": "to_polygon",
+      "file_type": "rationale",
+      "norm_label": "no-network tests for ticker mapping, fills gating, polygon backoff, and gex...",
+      "source_file": "tests/test_cycle1_fixes.py",
       "source_location": "L1"
     },
     {
@@ -6139,17 +6270,6 @@
       "norm_label": "capital.com epic: verified (see ``_capital_verified``) or a best guess....",
       "source_file": "tickers.py",
       "source_location": "L96"
-    },
-    {
-      "id": "americanengine",
-      "label": "AmericanEngine",
-      "_origin": "ast",
-      "community": 9,
-      "community_name": "portfolio_vix.py",
-      "file_type": "code",
-      "norm_label": "americanengine",
-      "source_file": "",
-      "source_location": ""
     },
     {
       "id": "portfolio_vix",
@@ -6775,6 +6895,18 @@
       "type": "external"
     },
     {
+      "id": "pandas",
+      "label": "pandas",
+      "_origin": "semantic",
+      "community": 0,
+      "community_name": "active_management.py",
+      "external": true,
+      "file_type": "concept",
+      "norm_label": "pandas",
+      "source_file": "",
+      "type": "external"
+    },
+    {
       "id": "plotly_graph_objects",
       "label": "plotly_graph_objects",
       "_origin": "semantic",
@@ -6811,6 +6943,18 @@
       "type": "external"
     },
     {
+      "id": "string",
+      "label": "string",
+      "_origin": "semantic",
+      "community": 1,
+      "community_name": "fundamental_analysis.py",
+      "external": true,
+      "file_type": "concept",
+      "norm_label": "string",
+      "source_file": "",
+      "type": "external"
+    },
+    {
       "id": "time",
       "label": "time",
       "_origin": "semantic",
@@ -6839,7 +6983,7 @@
       "label": "contextlib",
       "_origin": "semantic",
       "community": 2,
-      "community_name": "test_cycle1_fixes.py",
+      "community_name": "test_pipeline_io.py",
       "external": true,
       "file_type": "concept",
       "norm_label": "contextlib",
@@ -6851,7 +6995,7 @@
       "label": "io",
       "_origin": "semantic",
       "community": 2,
-      "community_name": "test_cycle1_fixes.py",
+      "community_name": "test_pipeline_io.py",
       "external": true,
       "file_type": "concept",
       "norm_label": "io",
@@ -6863,7 +7007,7 @@
       "label": "pathlib",
       "_origin": "semantic",
       "community": 2,
-      "community_name": "test_cycle1_fixes.py",
+      "community_name": "test_pipeline_io.py",
       "external": true,
       "file_type": "concept",
       "norm_label": "pathlib",
@@ -6875,7 +7019,7 @@
       "label": "stat",
       "_origin": "semantic",
       "community": 2,
-      "community_name": "test_cycle1_fixes.py",
+      "community_name": "test_pipeline_io.py",
       "external": true,
       "file_type": "concept",
       "norm_label": "stat",
@@ -6887,22 +7031,10 @@
       "label": "tempfile",
       "_origin": "semantic",
       "community": 2,
-      "community_name": "test_cycle1_fixes.py",
+      "community_name": "test_pipeline_io.py",
       "external": true,
       "file_type": "concept",
       "norm_label": "tempfile",
-      "source_file": "",
-      "type": "external"
-    },
-    {
-      "id": "unittest",
-      "label": "unittest",
-      "_origin": "semantic",
-      "community": 2,
-      "community_name": "test_cycle1_fixes.py",
-      "external": true,
-      "file_type": "concept",
-      "norm_label": "unittest",
       "source_file": "",
       "type": "external"
     },
@@ -6911,7 +7043,7 @@
       "label": "zoneinfo",
       "_origin": "semantic",
       "community": 2,
-      "community_name": "test_cycle1_fixes.py",
+      "community_name": "test_pipeline_io.py",
       "external": true,
       "file_type": "concept",
       "norm_label": "zoneinfo",
@@ -6967,14 +7099,38 @@
       "type": "external"
     },
     {
-      "id": "json",
-      "label": "json",
+      "id": "unittest",
+      "label": "unittest",
       "_origin": "semantic",
-      "community": 23,
-      "community_name": "json",
+      "community": 22,
+      "community_name": "test_signal_shapes.py",
       "external": true,
       "file_type": "concept",
-      "norm_label": "json",
+      "norm_label": "unittest",
+      "source_file": "",
+      "type": "external"
+    },
+    {
+      "id": "copy",
+      "label": "copy",
+      "_origin": "semantic",
+      "community": 23,
+      "community_name": "pipeline_io.py",
+      "external": true,
+      "file_type": "concept",
+      "norm_label": "copy",
+      "source_file": "",
+      "type": "external"
+    },
+    {
+      "id": "decimal",
+      "label": "decimal",
+      "_origin": "semantic",
+      "community": 23,
+      "community_name": "pipeline_io.py",
+      "external": true,
+      "file_type": "concept",
+      "norm_label": "decimal",
       "source_file": "",
       "type": "external"
     },
@@ -7027,38 +7183,14 @@
       "type": "external"
     },
     {
-      "id": "string",
-      "label": "string",
-      "_origin": "semantic",
-      "community": 3,
-      "community_name": "portfolio_gex_field.py",
-      "external": true,
-      "file_type": "concept",
-      "norm_label": "string",
-      "source_file": "",
-      "type": "external"
-    },
-    {
-      "id": "copy",
-      "label": "copy",
+      "id": "json",
+      "label": "json",
       "_origin": "semantic",
       "community": 4,
-      "community_name": "pipeline_io.py",
+      "community_name": "export_signals",
       "external": true,
       "file_type": "concept",
-      "norm_label": "copy",
-      "source_file": "",
-      "type": "external"
-    },
-    {
-      "id": "decimal",
-      "label": "decimal",
-      "_origin": "semantic",
-      "community": 4,
-      "community_name": "pipeline_io.py",
-      "external": true,
-      "file_type": "concept",
-      "norm_label": "decimal",
+      "norm_label": "json",
       "source_file": "",
       "type": "external"
     },
@@ -7067,22 +7199,10 @@
       "label": "os",
       "_origin": "semantic",
       "community": 4,
-      "community_name": "pipeline_io.py",
+      "community_name": "export_signals",
       "external": true,
       "file_type": "concept",
       "norm_label": "os",
-      "source_file": "",
-      "type": "external"
-    },
-    {
-      "id": "pandas",
-      "label": "pandas",
-      "_origin": "semantic",
-      "community": 5,
-      "community_name": "portfolio_risk_score_leverage.py",
-      "external": true,
-      "file_type": "concept",
-      "norm_label": "pandas",
       "source_file": "",
       "type": "external"
     },
@@ -19605,14 +19725,113 @@
       "weight": 1.0
     },
     {
+      "source": "agents",
+      "target": "agents_working_with_the_graphify_knowledge_graph",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "AGENTS.md",
+      "source_location": "L1",
+      "weight": 1.0
+    },
+    {
+      "source": "agents_working_with_the_graphify_knowledge_graph",
+      "target": "agents_verify_before_asserting",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "AGENTS.md",
+      "source_location": "L13",
+      "weight": 1.0
+    },
+    {
+      "source": "agents_working_with_the_graphify_knowledge_graph",
+      "target": "agents_freshness_check",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "AGENTS.md",
+      "source_location": "L20",
+      "weight": 1.0
+    },
+    {
+      "source": "agents_working_with_the_graphify_knowledge_graph",
+      "target": "agents_git_hygiene",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "AGENTS.md",
+      "source_location": "L30",
+      "weight": 1.0
+    },
+    {
+      "source": "agents_working_with_the_graphify_knowledge_graph",
+      "target": "agents_navigating",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "AGENTS.md",
+      "source_location": "L7",
+      "weight": 1.0
+    },
+    {
       "source": "claude",
-      "target": "claude_graphify",
+      "target": "claude_working_with_the_graphify_knowledge_graph",
       "relation": "contains",
       "_origin": "ast",
       "confidence": "EXTRACTED",
       "confidence_score": 1.0,
       "source_file": "CLAUDE.md",
       "source_location": "L1",
+      "weight": 1.0
+    },
+    {
+      "source": "claude_working_with_the_graphify_knowledge_graph",
+      "target": "claude_verify_before_asserting",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "CLAUDE.md",
+      "source_location": "L13",
+      "weight": 1.0
+    },
+    {
+      "source": "claude_working_with_the_graphify_knowledge_graph",
+      "target": "claude_freshness_check",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "CLAUDE.md",
+      "source_location": "L20",
+      "weight": 1.0
+    },
+    {
+      "source": "claude_working_with_the_graphify_knowledge_graph",
+      "target": "claude_git_hygiene",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "CLAUDE.md",
+      "source_location": "L30",
+      "weight": 1.0
+    },
+    {
+      "source": "claude_working_with_the_graphify_knowledge_graph",
+      "target": "claude_navigating",
+      "relation": "contains",
+      "_origin": "ast",
+      "confidence": "EXTRACTED",
+      "confidence_score": 1.0,
+      "source_file": "CLAUDE.md",
+      "source_location": "L7",
       "weight": 1.0
     },
     {
@@ -25348,5 +25567,5 @@
       "source_file": "README.md"
     }
   ],
-  "built_at_commit": "26abb0f345dab01371ee57ef86022f1869135b71"
+  "built_at_commit": "8ec6588ef8e8942a17ce79f9cc470dd606a226bf"
 }
