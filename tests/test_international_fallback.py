@@ -108,14 +108,27 @@ class ResolverTierTests(unittest.TestCase):
         self.assertEqual(warns, info["warnings"])
 
     def test_proxy_from_exchange_suffix(self):
-        for ticker, etf in (("7203.T", "EWJ"), ("VALE3.SA", "EWZ"), ("SAP.DE", "EWG"),
-                            ("0700.HK", "EWH"), ("600519.SS", "MCHI"), ("2330.TW", "EWT"),
-                            ("BNS.TO", "EWC")):
+        for ticker, etf in (("BNS.TO", "EWC"), ("ABC.V", "EWC"),
+                            ("7203.T", "EWJ"),
+                            ("SAP.DE", "EWG"), ("BMW.F", "EWG"),
+                            ("AIR.PA", "EWQ"),
+                            ("SAN.MC", "EWP"),
+                            ("HSBA.L", "EWU"), ("VOD.IL", "EWU")):
             info = resolve_instrument(ticker)
             self.assertEqual(info["tier"], "proxy", ticker)
             self.assertEqual(info["proxy_etf"], etf, ticker)
             self.assertIsNone(info["capital_epic"], ticker)
             self.assertEqual(info["analysis_ticker"], ticker)
+            self.assertIsNone(options_underlying(ticker))
+
+    def test_only_universe_countries_have_a_proxy(self):
+        self.assertEqual(set(tickers._PROXY_ETF_BY_SUFFIX.values()),
+                         {"EWC", "EWJ", "EWG", "EWQ", "EWP", "EWU"})
+        for ticker in ("VALE3.SA", "0700.HK", "BHP.AX", "600519.SS", "2330.TW", "NESN.SW",
+                       "ASML.AS", "ENI.MI", "ABC.CN"):
+            info = resolve_instrument(ticker)
+            self.assertEqual(info["tier"], "none", ticker)
+            self.assertIsNone(info["proxy_etf"], ticker)
             self.assertIsNone(options_underlying(ticker))
 
     def test_no_adr_no_proxy_is_none(self):
@@ -356,7 +369,7 @@ class RiskScoreFallbackTests(unittest.TestCase):
 
         def fake_chain(symbol, hv, horizon, api_key, spot_fallback=np.nan, rf_annual=0):
             calls.append((symbol, spot_fallback))
-            if symbol == "EWZ":
+            if symbol == "EWG":
                 raise NoOptionData("no option data returned")
             return {"ticker": symbol, "expiration": None, "days_to_expiry": 30, "spot": 50.0,
                     "atm_iv": 0.2, "hv_annual": hv, "iv_hv_ratio": 1.0, "expected_move_usd": 1.0,
@@ -365,29 +378,29 @@ class RiskScoreFallbackTests(unittest.TestCase):
                     "max_pain_strike": 50.0}
 
         ns = self._namespace(fake_chain)
-        tickers_ = ["GLD", "RY.TO", "7203.T", "VALE3.SA", "EDP.LS"]
-        weights = {"GLD": 0.4, "RY.TO": 0.2, "7203.T": 0.2, "VALE3.SA": 0.1, "EDP.LS": 0.1}
+        tickers_ = ["GLD", "RY.TO", "7203.T", "SAP.DE", "EDP.LS"]
+        weights = {"GLD": 0.4, "RY.TO": 0.2, "7203.T": 0.2, "SAP.DE": 0.1, "EDP.LS": 0.1}
         module = ns["run_options_module"](
             tickers_, {tk: 0.2 for tk in tickers_}, weights, 21, "key",
             spot_by_asset={tk: 100.0 for tk in tickers_},
         )
         self.assertEqual(calls[0], ("GLD", 100.0))
-        self.assertEqual([c[0] for c in calls], ["GLD", "RY", "EWJ", "EWZ"])
+        self.assertEqual([c[0] for c in calls], ["GLD", "RY", "EWJ", "EWG"])
         self.assertTrue(all(np.isnan(c[1]) for c in calls[1:]))
         self.assertEqual(set(module["by_asset"]), {"GLD", "RY.TO", "7203.T"})
         self.assertEqual(module["by_asset"]["RY.TO"]["ticker"], "RY.TO")
         self.assertEqual(module["by_asset"]["7203.T"]["proxy_etf"], "EWJ")
         self.assertEqual(list(module["summary"]["Activo"]), ["GLD", "RY.TO", "7203.T"])
         excluded = {item["ticker"]: item for item in module["excluded"]}
-        self.assertEqual(excluded["VALE3.SA"]["tier"], "none")
-        self.assertIn("proxy EWZ", excluded["VALE3.SA"]["reason"])
+        self.assertEqual(excluded["SAP.DE"]["tier"], "none")
+        self.assertIn("proxy EWG", excluded["SAP.DE"]["reason"])
         self.assertEqual(excluded["EDP.LS"]["tier"], "none")
-        self.assertEqual(module["instruments"]["VALE3.SA"]["tier"], "none")
+        self.assertEqual(module["instruments"]["SAP.DE"]["tier"], "none")
 
         prices = pd.DataFrame({tk: _closes().values for tk in tickers_}, index=_closes().index)
         signals, caps = ns["fallback_components"](module["instruments"], prices, weights)
-        self.assertEqual(set(signals), {"7203.T", "VALE3.SA", "EDP.LS"})
-        self.assertEqual(caps, {"VALE3.SA": 0.05, "EDP.LS": 0.05})
+        self.assertEqual(set(signals), {"7203.T", "SAP.DE", "EDP.LS"})
+        self.assertEqual(caps, {"SAP.DE": 0.05, "EDP.LS": 0.05})
         module["price_signals"], module["weight_caps"] = signals, caps
 
         summary = pd.DataFrame([
@@ -473,10 +486,10 @@ class GexVixWarningTests(unittest.TestCase):
 
         yahoo = vix.YahooMarketLoader(verbose=False)
         with mock.patch.object(vix.yf, "Ticker", FakeTicker), self.assertWarns(RuntimeWarning):
-            yahoo.load(["RY.TO", "VALE3.SA"])
+            yahoo.load(["RY.TO", "SAP.DE"])
         self.assertEqual(symbols, ["RY"])
         self.assertEqual(yahoo.excluded[1]["tier"], "proxy")
-        self.assertEqual(yahoo.excluded[1]["proxy_etf"], "EWZ")
+        self.assertEqual(yahoo.excluded[1]["proxy_etf"], "EWG")
 
 
 if __name__ == "__main__":

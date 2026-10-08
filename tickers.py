@@ -61,27 +61,18 @@ _ADR_TABLE = {
 }
 
 # Country ETF whose US options stand in for a listing without options or ADR.
-# Mapped from the Yahoo exchange suffix. Suffixes left out (``.LS``, ``.PR``)
-# have no liquid US-listed country ETF and fall to tier ``none``.
+# Mapped from the Yahoo exchange suffix. Only the six countries in the universe
+# are mapped (Canada, Japan, Germany, France, Spain, UK); they were verified on
+# Polygon on 2026-10-08 (options with greeks, IV and OI). Every other suffix
+# falls to tier ``none`` (staggered entry + weight cap).
 _PROXY_ETF_BY_SUFFIX = {
-    ".TO": "EWC", ".V": "EWC", ".CN": "EWC", ".NE": "EWC",
+    ".TO": "EWC", ".V": "EWC",
     ".T": "EWJ",
-    ".SA": "EWZ",
     ".DE": "EWG", ".F": "EWG", ".BE": "EWG", ".MU": "EWG", ".HM": "EWG",
     ".DU": "EWG", ".SG": "EWG",
-    ".L": "EWU", ".IL": "EWU",
     ".PA": "EWQ",
-    ".SW": "EWL",
-    ".AX": "EWA",
-    ".HK": "EWH",
-    ".SS": "MCHI", ".SZ": "MCHI",
-    ".NS": "INDA", ".BO": "INDA",
-    ".MX": "EWW",
-    ".KS": "EWY", ".KQ": "EWY",
-    ".TW": "EWT", ".TWO": "EWT",
-    ".AS": "EWN", ".MC": "EWP", ".MI": "EWI", ".ST": "EWD", ".BR": "EWK",
-    ".CO": "EDEN", ".HE": "EFNL", ".OL": "NORW", ".IR": "EIRL", ".WA": "EPOL",
-    ".VI": "EWO", ".JO": "EZA", ".SR": "KSA", ".NZ": "ENZL", ".TA": "EIS",
+    ".MC": "EWP",
+    ".L": "EWU", ".IL": "EWU",
 }
 
 # Tier ``none``: the target weight is capped at ``factor`` x target and, if set,
