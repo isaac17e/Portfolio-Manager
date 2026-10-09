@@ -11,7 +11,7 @@ import os
 import json
 import plotly.graph_objects as go
 
-from gex_utils import gamma_flip_level
+from gex_utils import zero_gamma_profile
 from polygon_client import NO_OPTION_DATA, NoOptionData, PolygonClient, failure_reason
 from pipeline_io import (
     MIN_OPTION_DAYS,
@@ -27,6 +27,7 @@ from pipeline_io import (
     portfolio_key,
     resolve_cycle_day,
     resolve_horizon,
+    resolve_risk_free_rate,
     signal_cycle_number,
     stage_pending_entry,
     tranche_lock,
@@ -41,6 +42,9 @@ load_dotenv()
 API_KEY = os.environ.get("POLYGON_API_KEY")
 
 BASE_URL = "https://api.polygon.io"
+
+# Solo para el perfil de zero-gamma (gamma Black-Scholes en la grilla de spots).
+RISK_FREE_RATE = resolve_risk_free_rate(0.046)  # env RISK_FREE_RATE
 
 # Peso objetivo de cada activo dentro del portafolio total 
 PESOS_OBJETIVO = {
@@ -371,7 +375,7 @@ def parse_chain(chain):
 
 # ---------------- CALCULO DE INDICADORES ----------------
 
-def calcular_gex_y_zero_gamma(df_chain, spot):
+def calcular_gex_y_zero_gamma(df_chain, spot, hoy=None):
     df = df_chain.dropna(subset=["gamma", "oi"]).copy()
     if df.empty:
         return np.nan, np.nan
@@ -380,15 +384,22 @@ def calcular_gex_y_zero_gamma(df_chain, spot):
     gex_por_strike = df.groupby("strike")["gex_strike"].sum().sort_index()
     gex_total = gex_por_strike.sum()
 
-    # Cruce de signo del GEX acumulado (gex_utils.py: ignora strikes sin
-    # exposicion y detecta el cruce en cualquier direccion).
-    zero_gamma = gamma_flip_level(gex_por_strike.index, gex_por_strike.values)
+    # Zero-gamma level (gex_utils.zero_gamma_profile): cero del GEX de estos
+    # mismos contratos re-evaluado en una grilla de spots de +/-30%, con la IV
+    # de cada contrato (sticky strike), T = dias al vencimiento / 365,
+    # RISK_FREE_RATE y sin dividendos (el script no usa ninguno). Antes era el
+    # cruce del GEX acumulado por strike, que no es el zero-gamma.
+    hoy = hoy or datetime.now(timezone.utc).date()
+    dias = pd.to_datetime(df["vencimiento"], errors="coerce").dt.date.map(
+        lambda v: (v - hoy).days if pd.notna(v) else np.nan)
+    zg = zero_gamma_profile(df["strike"], (df["tipo"] == "call").to_numpy(), df["oi"],
+                            pd.to_numeric(df["iv"], errors="coerce"),
+                            dias.to_numpy(dtype=float) / 365.0, spot, RISK_FREE_RATE)
+    zero_gamma = zg["zero_gamma_level"]
 
-    if pd.isna(zero_gamma):
-        # Sin cruce de signo real dentro de la ventana: no hay nivel de
-        # zero-gamma confiable que reportar (antes esto devolvia por error
-        # la strike de mayor concentracion de gamma, un "wall", como si
-        # fuera el flip).
+    if zero_gamma is None:
+        # Sin cruce dentro de la grilla (o sin contratos con IV): no hay nivel
+        # de zero-gamma que reportar; el percentil queda neutro (50).
         return gex_total, np.nan
 
     distancia_zero_gamma = (spot - zero_gamma) / spot

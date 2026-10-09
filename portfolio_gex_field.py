@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 from pipeline_io import (
     MIN_OPTION_DAYS, export_signals, load_portfolio, resolve_horizon, resolve_risk_free_rate,
 )
-from gex_utils import gamma_flip_crossings, gamma_flip_level
+from gex_utils import downsample_profile, gamma_flip_crossings, gamma_flip_level, zero_gamma_profile
 from polygon_client import NO_OPTION_DATA, PolygonClient, PolygonError, failure_reason
 from tickers import (
     adr_warnings, dividend_yield_from_info, exclusion_warnings, options_exclusion, options_underlying,
@@ -29,6 +29,8 @@ from tickers import (
 )
 import plotly.graph_objects as go
 import plotly.io as pio
+from plotly.subplots import make_subplots
+from viz_utils import show_or_save
 import yfinance as yf
 import warnings
 
@@ -476,6 +478,8 @@ def get_polygon_options_data(ticker, current_price, horizon_months=None,
                 "delta": delta if delta is not None else np.nan,
                 "moneyness": r["moneyness"],
                 "days_to_exp": (exp_date - today).days,
+                # Para el perfil de zero-gamma (mismo q que las griegas de arriba).
+                "dividend_yield": div_yield,
             })
         except Exception as e:
             print(f"⚠️  [{ticker}] Contrato omitido por error de parseo: {e}")
@@ -505,25 +509,55 @@ def get_polygon_options_data(ticker, current_price, horizon_months=None,
 # BLOQUE 4: GEX NETO
 # ============================================================
 
-def gamma_regime(total_gex, spot, gamma_flip):
-    """Regimen gamma y su contraste con el flip.
+def gamma_regime(total_gex, spot, zero_gamma=None):
+    """Regimen gamma a partir del perfil de zero-gamma.
 
-    ``regime`` es el signo del GEX neto en el spot: la suma del GEX por strike,
-    con gammas evaluadas al spot actual (> 0 positivo / estable). Es la medida
-    directa y la que siempre existe. ``regime_by_flip`` es la convencion spot vs
-    flip (spot >= flip: positivo); None sin flip. Si ambas difieren,
-    ``regime_conflict`` es True y la senal lo reporta en vez de elegir una.
+    Con perfil (``zero_gamma``, salida de gex_utils.zero_gamma_profile) el
+    regimen es el signo de GEX_total(spot) en ese perfil
+    (``regime_basis: "zero_gamma_grid"``). Con un solo cruce coincide por
+    construccion con "spot > zero_gamma_level -> positivo"; con varios, el
+    signo en el spot es lo que decide y la senal guarda los niveles mas
+    cercanos por debajo y por encima.
 
-    El flip de este script es el cruce del GEX acumulado por strike, no el cero
-    de un perfil de GEX recalculado a otros spots: con OI mayormente fuera del
-    dinero y GEX neto positivo suele quedar por encima del spot, asi que el
-    conflicto es frecuente y no indica por si solo un error de datos.
+    ``regime_by_zero_gamma`` es esa convencion (spot >= nivel mas cercano:
+    positivo) y ``regime_conflict`` es True si difiere del signo en el spot.
+    Solo pasa si el cruce mas cercano es descendente (GEX positivo por debajo
+    y negativo por encima, p. ej. calls bajo el spot y puts sobre el), que la
+    convencion no contempla, o en un empate numerico en el propio nivel.
+
+    Sin perfil (ningun contrato con IV y T validos) se cae al signo del GEX
+    neto por strike en el spot (``regime_basis: "net_gex_at_spot"``).
     """
-    regime = REGIME_POSITIVE if total_gex > 0 else REGIME_NEGATIVE
-    if gamma_flip is None or spot is None or not np.isfinite(gamma_flip):
-        return {"regime": regime, "regime_by_flip": None, "regime_conflict": False}
-    by_flip = REGIME_POSITIVE if spot >= gamma_flip else REGIME_NEGATIVE
-    return {"regime": regime, "regime_by_flip": by_flip, "regime_conflict": by_flip != regime}
+    zg = zero_gamma or {}
+    gex_spot = zg.get("gex_at_spot")
+    if gex_spot is None or not np.isfinite(gex_spot):
+        return {"regime": REGIME_POSITIVE if total_gex > 0 else REGIME_NEGATIVE,
+                "regime_basis": "net_gex_at_spot", "regime_by_zero_gamma": None,
+                "regime_conflict": False}
+    regime = REGIME_POSITIVE if gex_spot > 0 else REGIME_NEGATIVE
+    level = zg.get("zero_gamma_level")
+    if level is None or spot is None:
+        return {"regime": regime, "regime_basis": "zero_gamma_grid",
+                "regime_by_zero_gamma": None, "regime_conflict": False}
+    by_level = REGIME_POSITIVE if spot >= level else REGIME_NEGATIVE
+    return {"regime": regime, "regime_basis": "zero_gamma_grid",
+            "regime_by_zero_gamma": by_level, "regime_conflict": by_level != regime}
+
+
+def perfil_zero_gamma(df, current_price):
+    """GEX re-evaluado en la grilla de spots con los mismos contratos que ``df``.
+
+    Misma convencion que el GEX en el spot: calls +, puts -, OI * 100 * S^2 *
+    0.01; IV propia de cada contrato (sticky strike), T_eff = max(dias/365,
+    1 hora) como en get_polygon_options_data, RISK_FREE_RATE y el dividend
+    yield con que se calcularon las griegas.
+    """
+    n = len(df)
+    columna = lambda c: df[c].to_numpy(dtype=float) if c in df.columns else np.full(n, np.nan)
+    T_eff = np.maximum(columna("days_to_exp") / 365.0, 1 / 365.0 / 24)
+    q = df["dividend_yield"].fillna(0.0).to_numpy(dtype=float) if "dividend_yield" in df.columns else 0.0
+    return zero_gamma_profile(df["strike"], (df["type"] == "call").to_numpy(), df["open_interest"],
+                              columna("implied_volatility"), T_eff, current_price, RISK_FREE_RATE, q)
 
 
 def calculate_gex_and_surface_forces(df_options, current_price, label=""):
@@ -540,26 +574,32 @@ def calculate_gex_and_surface_forces(df_options, current_price, label=""):
     df_gex.rename(columns={"gex_signed": "net_gex"}, inplace=True)
     df_gex["cumulative_gex"] = df_gex["net_gex"].cumsum()
 
-    # Cruce de signo del GEX acumulado (gex_utils.py). Antes esta copia no
-    # ignoraba los strikes sin exposicion y marcaba un flip falso en el borde.
-    # Con varios cruces se toma el mas cercano al spot dentro de
-    # +/-FLIP_MAX_DISTANCE_PCT; antes ganaba el primero desde el strike mas
-    # bajo, que depende de donde empieza la ventana de strikes.
-    gamma_flip = None
+    # Strike-balance level: cruce de signo del GEX acumulado por strike
+    # (gex_utils.py), el mas cercano al spot dentro de +/-FLIP_MAX_DISTANCE_PCT.
+    # Antes se reportaba como gamma flip; no es el zero-gamma (ver abajo).
+    strike_balance = None
     n_crossings = 0
     try:
         n_crossings = len(gamma_flip_crossings(df_gex["strike"], df_gex["net_gex"]))
-        flip = gamma_flip_level(df_gex["strike"], df_gex["net_gex"], spot=current_price,
-                                max_distance_pct=FLIP_MAX_DISTANCE_PCT)
-        if np.isfinite(flip):
-            gamma_flip = float(flip)
-        elif n_crossings:
-            print(f"ℹ️  [{label}] {n_crossings} cruce(s) de signo del GEX acumulado, ninguno a "
-                  f"±{FLIP_MAX_DISTANCE_PCT:.0%} del spot.")
-        else:
-            print(f"ℹ️  [{label}] No se detectó cruce de signo en el GEX acumulado en esta ventana.")
+        level = gamma_flip_level(df_gex["strike"], df_gex["net_gex"], spot=current_price,
+                                 max_distance_pct=FLIP_MAX_DISTANCE_PCT)
+        if np.isfinite(level):
+            strike_balance = float(level)
     except Exception as e:
-        print(f"⚠️  [{label}] Error calculando Gamma Flip Point: {e}")
+        print(f"⚠️  [{label}] Error calculando el strike-balance level: {e}")
+
+    # Zero-gamma level: cero de GEX_total(S) re-evaluado en la grilla de spots.
+    try:
+        zg = perfil_zero_gamma(df, current_price)
+    except Exception as e:
+        print(f"⚠️  [{label}] Error calculando el perfil de zero-gamma: {e}")
+        zg = {}
+    zero_gamma = zg.get("zero_gamma_level")
+    if zg.get("n_skipped"):
+        print(f"ℹ️  [{label}] {zg['n_skipped']} contrato(s) con OI sin IV o T válidos quedan fuera del perfil de zero-gamma.")
+    if zg.get("zero_gamma_status") == "no_crossing_in_grid":
+        print(f"ℹ️  [{label}] Sin cruce de zero-gamma a ±{zg['grid_half_width']:.0%} del spot "
+              f"(perfil {zg['grid_sign']}).")
 
     try:
         call_wall = df_gex.loc[df_gex["net_gex"].idxmax(), "strike"] if df_gex["net_gex"].max() > 0 else None
@@ -571,23 +611,40 @@ def calculate_gex_and_surface_forces(df_options, current_price, label=""):
     total_gex = df_gex["net_gex"].sum()
     metrics = {
         "total_gex": total_gex,
-        "gamma_flip": gamma_flip,
-        "flip_crossings": n_crossings,
+        "zero_gamma_level": zero_gamma,
+        "zero_gamma_crossings": zg.get("zero_gamma_crossings", []),
+        "zero_gamma_status": zg.get("zero_gamma_status"),
+        "zero_gamma_below": zg.get("zero_gamma_below"),
+        "zero_gamma_above": zg.get("zero_gamma_above"),
+        "zero_gamma_grid_sign": zg.get("grid_sign"),
+        "zero_gamma_contracts": zg.get("n_contracts"),
+        "zero_gamma_skipped": zg.get("n_skipped"),
+        "gex_at_spot_grid": zg.get("gex_at_spot"),
+        "gex_profile": {"spot": zg.get("grid", np.array([])), "gex": zg.get("gex", np.array([]))},
+        # Alias obsoleto (una version): antes era el cruce del GEX acumulado.
+        "gamma_flip": zero_gamma,
+        "strike_balance_level": strike_balance,
+        "strike_balance_crossings": n_crossings,
         "call_wall": call_wall,
         "put_wall": put_wall,
-        **gamma_regime(total_gex, current_price, gamma_flip),
+        **gamma_regime(total_gex, current_price, zg),
     }
 
-    print(f"📐 [{label}] GEX Total: {metrics['total_gex']:,.0f} | "
-          f"Gamma Flip: {gamma_flip:.2f}" if gamma_flip is not None else f"📐 [{label}] GEX Total: {metrics['total_gex']:,.0f} | Gamma Flip: no detectado")
+    print(f"📐 [{label}] GEX Total: {total_gex:,.0f} | Zero Gamma: "
+          + (f"{zero_gamma:.2f}" if zero_gamma is not None else "no detectado")
+          + " | Strike balance: "
+          + (f"{strike_balance:.2f}" if strike_balance is not None else "no detectado"))
     print(f"🧱 [{label}] Call Wall: {call_wall} | Put Wall: {put_wall} | Régimen: {metrics['regime']}")
+    gex_grid = metrics["gex_at_spot_grid"]
+    if gex_grid is not None and total_gex != 0 and np.sign(gex_grid) != np.sign(total_gex):
+        print(f"⚠️  [{label}] GEX en el spot con gammas de la cadena {total_gex:,.0f} y con gammas "
+              f"Black-Scholes del perfil {gex_grid:,.0f} tienen distinto signo (régimen cerca de cero).")
     if metrics["regime_conflict"]:
-        print(f"⚠️  [{label}] Conflicto de régimen: GEX neto en el spot {total_gex:,.0f} "
-              f"({metrics['regime']}) pero spot {current_price:.2f} "
-              f"{'>=' if current_price >= gamma_flip else '<'} flip {gamma_flip:.2f} "
-              f"({metrics['regime_by_flip']}).")
+        print(f"⚠️  [{label}] Conflicto de régimen: GEX en el spot ({metrics['regime']}) pero spot "
+              f"{current_price:.2f} vs zero gamma {zero_gamma:.2f} ({metrics['regime_by_zero_gamma']}): "
+              "el cruce más cercano es descendente.")
 
-    return df_gex, gamma_flip, metrics
+    return df_gex, zero_gamma, metrics
 
 
 def calculate_gex_split(df_options, current_price, near_term_days_cutoff=NEAR_TERM_DAYS_CUTOFF):
@@ -1097,7 +1154,7 @@ def get_holdings_reference_lines(portfolio_data, sigma_range=SIGMA_RANGE):
         if not price or not expected_move or expected_move <= 0:
             continue
 
-        for key, label in (("gamma_flip", "Gamma Flip"), ("call_wall", "Call Wall"), ("put_wall", "Put Wall")):
+        for key, label in (("zero_gamma_level", "Zero Gamma"), ("call_wall", "Call Wall"), ("put_wall", "Put Wall")):
             strike_val = metrics.get(key)
             if strike_val is None:
                 continue
@@ -1112,7 +1169,7 @@ def get_holdings_reference_lines(portfolio_data, sigma_range=SIGMA_RANGE):
                 "strike": strike_val, "weight": data.get("weight_normalized", data.get("weight")),
             })
 
-    print(f"\nℹ️  {len(lines)} líneas de referencia (Gamma Flip/Call Wall/Put Wall) dentro de ±{sigma_range}σ.")
+    print(f"\nℹ️  {len(lines)} líneas de referencia (Zero Gamma/Call Wall/Put Wall) dentro de ±{sigma_range}σ.")
     return lines
 
 
@@ -1186,7 +1243,7 @@ def plot_3d_portfolio_field(X, Y, Z, current_state, reference_lines, portfolio_d
     composite_force = surface_data["composite_force"] if surface_data else None
     grid_y_full = surface_data["grid_y"] if surface_data else np.array([0.0, 1.0])
 
-    line_colors = {"Gamma Flip": "orange", "Call Wall": "blue", "Put Wall": "red"}
+    line_colors = {"Zero Gamma": "orange", "Call Wall": "blue", "Put Wall": "red"}
     max_weight = max((ref.get("weight") or 0.0 for ref in reference_lines), default=0.0) or 1.0
     seen_labels = set()
     for ref in reference_lines:
@@ -1243,6 +1300,52 @@ def plot_3d_portfolio_field(X, Y, Z, current_state, reference_lines, portfolio_d
         plot_bgcolor="#0b0d10",
         font=dict(color="#d8dee5"),
     )
+    return fig
+
+
+def plot_zero_gamma_profiles(portfolio_data):
+    """GEX estructural re-evaluado en la grilla de spots, un panel por holding.
+
+    Marca el spot, el zero-gamma level (y los demas cruces) y, punteado, el
+    strike-balance level para ver en que difieren.
+    """
+    perfiles = {}
+    for ticker, data in (portfolio_data or {}).items():
+        metrics = data.get("metrics_structural") or {}
+        perfil = metrics.get("gex_profile") or {}
+        if len(perfil.get("spot", [])):
+            perfiles[ticker] = (data, metrics, perfil)
+    if not perfiles:
+        return None
+
+    cols = min(3, len(perfiles))
+    rows = int(np.ceil(len(perfiles) / cols))
+    fig = make_subplots(rows=rows, cols=cols, subplot_titles=[
+        f"{tk} | {m.get('regime')}" for tk, (_, m, _) in perfiles.items()])
+    for i, (ticker, (data, metrics, perfil)) in enumerate(perfiles.items()):
+        r, c = i // cols + 1, i % cols + 1
+        fig.add_trace(go.Scatter(x=perfil["spot"], y=np.asarray(perfil["gex"]) / 1e6, mode="lines",
+                                 line=dict(color="#1565C0"), showlegend=False,
+                                 hovertemplate="Spot %{x:.2f}: %{y:.2f} $MM<extra></extra>"),
+                      row=r, col=c)
+        fig.add_hline(y=0, line_color="gray", line_width=0.5, row=r, col=c)
+        fig.add_vline(x=data["price"], line_color="black", annotation_text=f"Spot: {data['price']:.2f}",
+                      annotation_position="top left", row=r, col=c)
+        zero_gamma = metrics.get("zero_gamma_level")
+        for cruce in metrics.get("zero_gamma_crossings") or []:
+            etiqueta = (dict(annotation_text=f"Zero gamma: {cruce:.2f}", annotation_position="bottom right")
+                        if cruce == zero_gamma else {})
+            fig.add_vline(x=cruce, line_color="#C62828", line_dash="dash" if etiqueta else "dot",
+                          row=r, col=c, **etiqueta)
+        balance = metrics.get("strike_balance_level")
+        if balance is not None:
+            fig.add_vline(x=balance, line_color="gray", line_dash="dot",
+                          annotation_text=f"Strike balance: {balance:.2f}",
+                          annotation_position="top right", row=r, col=c)
+        fig.update_xaxes(title_text="Spot", row=r, col=c)
+        fig.update_yaxes(title_text="GEX ($MM por 1%)", row=r, col=c)
+    fig.update_layout(title="GEX estructural vs spot (sticky strike) y zero-gamma level",
+                      template="plotly_white", height=380 * rows, showlegend=False)
     return fig
 
 
@@ -1395,19 +1498,35 @@ def _senal_gex(result, excluded=None):
     holdings = []
     for ticker, data in portfolio_data.items():
         metrics = data.get("metrics_structural") or {}
+        price = data.get("price")
+        zero_gamma = metrics.get("zero_gamma_level")
+        perfil = metrics.get("gex_profile") or {}
         holdings.append({
             "ticker": ticker,
             "analysis_ticker": data.get("analysis_ticker", ticker),
             "weight": data.get("weight_normalized", data.get("weight")),
-            "price": data.get("price"),
+            "price": price,
             "expected_move": data.get("expected_move"),
             "total_gex": metrics.get("total_gex"),
+            "gex_at_spot_grid": metrics.get("gex_at_spot_grid"),
             "regime": metrics.get("regime"),
-            "regime_basis": "net_gex_at_spot",
-            "regime_by_flip": metrics.get("regime_by_flip"),
+            "regime_basis": metrics.get("regime_basis", "net_gex_at_spot"),
+            "regime_by_zero_gamma": metrics.get("regime_by_zero_gamma"),
             "regime_conflict": bool(metrics.get("regime_conflict", False)),
+            "zero_gamma_level": zero_gamma,
+            "zero_gamma_distance_pct": ((price - zero_gamma) / price
+                                        if zero_gamma is not None and price else None),
+            "zero_gamma_crossings": metrics.get("zero_gamma_crossings"),
+            "zero_gamma_below": metrics.get("zero_gamma_below"),
+            "zero_gamma_above": metrics.get("zero_gamma_above"),
+            "zero_gamma_status": metrics.get("zero_gamma_status"),
+            "zero_gamma_grid_sign": metrics.get("zero_gamma_grid_sign"),
+            "zero_gamma_skipped": metrics.get("zero_gamma_skipped"),
+            "gex_profile_grid": downsample_profile({"grid": perfil.get("spot"), "gex": perfil.get("gex")}),
+            # Obsoleto, se retira en la proxima version: igual a zero_gamma_level.
             "gamma_flip": metrics.get("gamma_flip"),
-            "flip_crossings": metrics.get("flip_crossings"),
+            "strike_balance_level": metrics.get("strike_balance_level"),
+            "strike_balance_crossings": metrics.get("strike_balance_crossings"),
             "call_wall": metrics.get("call_wall"),
             "put_wall": metrics.get("put_wall"),
             "expiry_window_days": data.get("expiry_window_days"),
@@ -1497,6 +1616,9 @@ def run_live(refresh_seconds=REFRESH_SECONDS, max_iterations=MAX_ITERATIONS,
                     write_portfolio_html_shell(output_dir, output_filename, DATA_JSON_FILENAME,
                                                 refresh_seconds, rotate_camera)
                     shell_escrito = True
+                    # El perfil de zero-gamma se muestra una vez, no en cada refresco.
+                    show_or_save(plot_zero_gamma_profiles(result["portfolio_data"]),
+                                 "portfolio_gex_field", "zero_gamma")
                     if open_browser:
                         webbrowser.open(page_url)
         else:
@@ -1533,6 +1655,7 @@ def run_headless(output_path=OUTPUT_HTML_PATH):
     if result is None:
         print("❌ No se escribió el HTML: ningún holding tiene datos válidos.")
         return
+    show_or_save(plot_zero_gamma_profiles(result["portfolio_data"]), "portfolio_gex_field", "zero_gamma")
 
     output_dir = os.path.dirname(os.path.abspath(output_path)) or "."
     output_filename = os.path.basename(output_path)

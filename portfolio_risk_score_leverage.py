@@ -89,7 +89,7 @@ print(
 # =============================================================================
 # BLOQUE 2: UTILIDADES Y CONEXION A LA API
 # =============================================================================
-from gex_utils import gamma_flip_level
+from gex_utils import gamma_flip_level, zero_gamma_profile
 from polygon_client import (
     NO_OPTION_DATA, NoOptionData, PolygonClient, PolygonError, PolygonNotFound, failure_reason,
 )
@@ -587,12 +587,28 @@ def compute_gex_profile(chain):
     pivot["GEX_neto"] = pivot["GEX_call"] + pivot["GEX_put"]
     return pivot.sort_values("strike").reset_index(drop=True)
 
-def compute_zero_gamma_level(gex_profile):
-    # Cruce de signo del GEX acumulado (gex_utils.py ignora los strikes sin
-    # exposicion, que generaban un cruce espurio en el borde de la ventana).
+def compute_strike_balance_level(gex_profile):
+    # Cruce de signo del GEX acumulado por strike (gex_utils.py ignora los
+    # strikes sin exposicion). Es un balance de strikes, no el zero-gamma.
     if len(gex_profile) < 2:
         return np.nan
     return gamma_flip_level(gex_profile["strike"], gex_profile["GEX_neto"])
+
+def compute_zero_gamma_level(chain, days_to_expiry, rf_annual):
+    """Zero-gamma level (gex_utils.zero_gamma_profile) de los contratos del GEX.
+
+    Mismos contratos que compute_gex_profile (gamma y OI presentes), IV de cada
+    contrato (sticky strike), T = days_to_expiry / 365 y sin dividendos, como
+    bs_gamma. NaN si no hay cruce en la grilla de +/-30% o no hay contratos con IV.
+    """
+    spot = chain["spot"].median(skipna=True)
+    df = chain.dropna(subset=["gamma", "open_interest"])
+    if pd.isna(spot) or df.empty or days_to_expiry is None:
+        return np.nan
+    zg = zero_gamma_profile(df["strike"], (df["contract_type"] == "call").to_numpy(),
+                            df["open_interest"], df["iv"], np.full(len(df), days_to_expiry / 365),
+                            spot, rf_annual)
+    return np.nan if zg["zero_gamma_level"] is None else zg["zero_gamma_level"]
 
 def compute_max_pain(chain):
     strikes = sorted(chain["strike"].unique())
@@ -704,7 +720,8 @@ def run_options_module_for_ticker(ticker, hv_annual, target_days, api_key,
     exp_move = compute_expected_move(chain, exp_info["days_to_expiry"])
     pcr = compute_put_call_ratio(chain)
     gex = compute_gex_profile(chain)
-    zero_gamma = compute_zero_gamma_level(gex)
+    zero_gamma = compute_zero_gamma_level(chain, exp_info["days_to_expiry"], rf_annual)
+    strike_balance = compute_strike_balance_level(gex)
     max_pain = compute_max_pain(chain)
 
     iv_hv_ratio = (
@@ -727,6 +744,7 @@ def run_options_module_for_ticker(ticker, hv_annual, target_days, api_key,
         "pcr_oi": pcr["PCR_OI"],
         "gex_profile": gex,
         "zero_gamma_level": zero_gamma,
+        "strike_balance_level": strike_balance,
         "max_pain_strike": max_pain["max_pain_strike"],
         "notional_concentration": max_pain["notional_concentration"]
     }

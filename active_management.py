@@ -13,7 +13,7 @@ from scipy.stats import norm
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from gex_utils import gamma_flip_level
+from gex_utils import gamma_flip_level, zero_gamma_profile
 from polygon_client import NoOptionData, PolygonClient, PolygonError, failure_reason
 from pipeline_io import (
     MIN_OPTION_DAYS, export_signals, load_portfolio, pick_expiration, resolve_horizon,
@@ -345,9 +345,21 @@ def calculate_gex(chain, spot_price):
     )
     gex_by_strike["cum_gex"] = gex_by_strike["net_gex"].cumsum()
 
-    # Cruce de signo del GEX acumulado (gex_utils.py ignora los strikes sin
-    # exposicion, que generaban un flip espurio en el borde de la ventana).
-    flip_level = gamma_flip_level(gex_by_strike["strike"], gex_by_strike["net_gex"])
+    # Strike-balance level: cruce de signo del GEX acumulado por strike
+    # (gex_utils.py). Se conserva como referencia; ya no es el flip.
+    strike_balance = gamma_flip_level(gex_by_strike["strike"], gex_by_strike["net_gex"])
+
+    # Flip = zero-gamma level: cero del GEX re-evaluado en una grilla de spots
+    # (+/-30%) con los mismos contratos, la IV de cada uno (sticky strike), T con
+    # la convencion de calculate_vanna_charm, risk_free_rate y dividend_yield.
+    today = date.today()
+    T_years = df["expiration"].map(
+        lambda e: max((datetime.strptime(e, "%Y-%m-%d").date() - today).days, 1) / 365
+        if isinstance(e, str) else np.nan).to_numpy(dtype=float)
+    zg = zero_gamma_profile(df["strike"], (df["type"] == "call").to_numpy(), df["open_interest"],
+                            df["iv"] if "iv" in df.columns else np.full(len(df), np.nan),
+                            T_years, spot_price, risk_free_rate, dividend_yield)
+    flip_level = np.nan if zg["zero_gamma_level"] is None else zg["zero_gamma_level"]
 
     total_gex = gex_by_strike["net_gex"].sum()
     total_abs_gex = gex_by_strike["net_gex"].abs().sum()
@@ -357,6 +369,12 @@ def calculate_gex(chain, spot_price):
         "total_gex": total_gex,
         "total_abs_gex": total_abs_gex,
         "gex_flip_level": flip_level,
+        "gex_strike_balance_level": strike_balance,
+        "zero_gamma_status": zg["zero_gamma_status"],
+        "zero_gamma_grid_sign": zg["grid_sign"],
+        "zero_gamma_crossings": zg["zero_gamma_crossings"],
+        "gex_profile_spot": zg["grid"],
+        "gex_profile": zg["gex"],
         "gex_regime": "POSITIVO" if total_gex >= 0 else "NEGATIVO",
         "liquidity_confidence": "BAJA" if total_abs_gex < gex_liquidity_min_notional else "NORMAL",
     }
@@ -599,11 +617,21 @@ def calculate_tactical_score(analysis):
     score = 0.0
     reasons = []
 
+    # El flip es el zero-gamma level (gex_utils.zero_gamma_profile). Sin cruce en
+    # la grilla de +/-30% el nivel esta a mas de 30% del spot, donde la distancia
+    # ya satura el tope (30% * score_flip_scale > score_flip_cap): se suma el
+    # tope con el signo del perfil (todo positivo: +, todo negativo: -).
+    signo_sin_cruce = None
+    if gex is not None and gex.get("zero_gamma_status") == "no_crossing_in_grid":
+        signo_sin_cruce = {"all_positive": 1, "all_negative": -1}.get(gex.get("zero_gamma_grid_sign"))
     if gex is not None and pd.notna(gex["gex_flip_level"]):
         dist_pct = (spot - gex["gex_flip_level"]) / spot
         flip_points = max(min(dist_pct * score_flip_scale, score_flip_cap), -score_flip_cap)
         score += flip_points
-        reasons.append(f"Spot {spot:.2f} vs Flip {gex['gex_flip_level']:.2f} ({dist_pct*100:.1f}% dist.)")
+        reasons.append(f"Spot {spot:.2f} vs Zero Gamma {gex['gex_flip_level']:.2f} ({dist_pct*100:.1f}% dist.)")
+    elif signo_sin_cruce:
+        score += signo_sin_cruce * score_flip_cap
+        reasons.append(f"Sin zero gamma a ±30% del spot (perfil {gex['zero_gamma_grid_sign']})")
 
     if gex is not None and pd.notna(gex["total_gex"]):
         gex_points = score_gex_weight if gex["total_gex"] > 0 else -score_gex_weight
@@ -661,11 +689,12 @@ def calculate_tactical_score(analysis):
 
     score = max(min(score, 100), -100)
 
-    max_pain_break = gex is not None and pd.notna(gex["gex_flip_level"]) and spot < gex["gex_flip_level"]
+    max_pain_break = ((gex is not None and pd.notna(gex["gex_flip_level"]) and spot < gex["gex_flip_level"])
+                      or signo_sin_cruce == -1)
     aggressive_put_sweep = flow is not None and flow["sweep_bias"] == "PUT_SWEEP_DOMINANTE"
     if max_pain_break and aggressive_put_sweep and gex is not None and gex["total_gex"] < 0:
         score = min(score, score_override_cap)
-        reasons.append("OVERRIDE: precio bajo Flip Level + GEX negativo + Put Sweep agresivo")
+        reasons.append("OVERRIDE: precio bajo Zero Gamma + GEX negativo + Put Sweep agresivo")
 
     if score >= score_threshold_aumentar:
         action = "AUMENTAR"
@@ -1753,7 +1782,7 @@ def plot_gamma_profiles(analyses):
 
         if pd.notna(flip):
             fig.add_vline(x=flip, line_color=gamma_profile_colors["flip"], line_dash="dash",
-                          annotation_text=f"Flip: {flip:.2f}", annotation_position="bottom left",
+                          annotation_text=f"Zero Gamma: {flip:.2f}", annotation_position="bottom left",
                           annotation_font_color=gamma_profile_colors["flip"], row=r, col=c)
 
         if em is not None:

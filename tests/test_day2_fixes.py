@@ -199,7 +199,7 @@ class GexExpiryFallbackTests(unittest.TestCase):
 
 
 # ------------------------------------------------------------------------------
-# 3. Flip root selection and regime conflict
+# 3. Strike-balance root selection and regime
 # ------------------------------------------------------------------------------
 
 class FlipRootTests(unittest.TestCase):
@@ -229,42 +229,52 @@ class FlipRootTests(unittest.TestCase):
         self.assertAlmostEqual(gamma_flip_level([140, 145, 150], [1, -3, 5], spot=100.0), 140 + 5 / 3)
 
     def test_regime_definition(self):
+        # Regime from the zero-gamma profile (tests/test_zero_gamma.py covers the grid).
         pos, neg = gex.REGIME_POSITIVE, gex.REGIME_NEGATIVE
-        self.assertEqual(gex.gamma_regime(5.0, 105.0, 100.0),
-                         {"regime": pos, "regime_by_flip": pos, "regime_conflict": False})
-        self.assertEqual(gex.gamma_regime(-5.0, 95.0, 100.0),
-                         {"regime": neg, "regime_by_flip": neg, "regime_conflict": False})
-        # AVGO day 2: net GEX positive, spot 362.55 below flip 399.74.
-        self.assertEqual(gex.gamma_regime(21_899_385.0, 362.55, 399.74),
-                         {"regime": pos, "regime_by_flip": neg, "regime_conflict": True})
+
+        def zg(at_spot, level):
+            return {"gex_at_spot": at_spot, "zero_gamma_level": level}
+
+        self.assertEqual(gex.gamma_regime(5.0, 105.0, zg(5.0, 100.0)),
+                         {"regime": pos, "regime_basis": "zero_gamma_grid",
+                          "regime_by_zero_gamma": pos, "regime_conflict": False})
+        self.assertEqual(gex.gamma_regime(-5.0, 95.0, zg(-5.0, 100.0))["regime_conflict"], False)
+        # The profile decides, not the strike sum: AVGO day 2 had net GEX > 0 at spot.
+        self.assertEqual(gex.gamma_regime(21_899_385.0, 362.55, zg(2e7, 340.0))["regime"], pos)
+        # Only a downward nearest crossing (positive below, negative above) conflicts.
+        self.assertTrue(gex.gamma_regime(-5.0, 105.0, zg(-5.0, 100.0))["regime_conflict"])
+        # No crossing in the grid: sign at spot, nothing to compare.
+        self.assertEqual(gex.gamma_regime(1.0, 100.0, zg(3.0, None)),
+                         {"regime": pos, "regime_basis": "zero_gamma_grid",
+                          "regime_by_zero_gamma": None, "regime_conflict": False})
+        # No profile at all (no IV): falls back to net GEX at spot.
         self.assertEqual(gex.gamma_regime(-1.0, 100.0, None),
-                         {"regime": neg, "regime_by_flip": None, "regime_conflict": False})
+                         {"regime": neg, "regime_basis": "net_gex_at_spot",
+                          "regime_by_zero_gamma": None, "regime_conflict": False})
 
     def _profile(self):
-        # gamma 1, OI = |net| -> net GEX per strike proportional to NET.
+        # gamma 1, OI = |net| -> net GEX per strike proportional to NET. No IV:
+        # the zero-gamma profile cannot be built.
         rows = [{"strike": float(k), "type": "call" if n > 0 else "put", "open_interest": abs(n),
                  "gamma": 1.0} for k, n in zip(self.STRIKES, self.NET)]
         return pd.DataFrame(rows)
 
-    def test_field_uses_nearest_flip_and_flags_conflict(self):
+    def test_field_keeps_the_nearest_strike_balance_level(self):
         with mock.patch("builtins.print"):
-            _, flip, metrics = gex.calculate_gex_and_surface_forces(self._profile(), 102.0, "t")
-        self.assertAlmostEqual(flip, 100.0)
-        self.assertEqual(metrics["flip_crossings"], 2)
+            _, flip, metrics = gex.calculate_gex_and_surface_forces(self._profile(), 98.0, "t")
+        self.assertAlmostEqual(metrics["strike_balance_level"], 100.0)
+        self.assertEqual(metrics["strike_balance_crossings"], 2)
+        self.assertIsNone(flip)
+        self.assertIsNone(metrics["zero_gamma_level"])
+        self.assertEqual(metrics["zero_gamma_status"], "no_valid_contracts")
         self.assertEqual(metrics["regime"], gex.REGIME_POSITIVE)
         self.assertFalse(metrics["regime_conflict"])
 
-        with mock.patch("builtins.print"):
-            _, flip, metrics = gex.calculate_gex_and_surface_forces(self._profile(), 98.0, "t")
-        self.assertAlmostEqual(flip, 100.0)
-        self.assertEqual(metrics["regime"], gex.REGIME_POSITIVE)
-        self.assertEqual(metrics["regime_by_flip"], gex.REGIME_NEGATIVE)
-        self.assertTrue(metrics["regime_conflict"])
-
         holding = gex._senal_gex({"portfolio_data": {"X": {"metrics_structural": metrics}}})["holdings"][0]
-        self.assertTrue(holding["regime_conflict"])
+        self.assertFalse(holding["regime_conflict"])
         self.assertEqual(holding["regime_basis"], "net_gex_at_spot")
-        self.assertEqual(holding["flip_crossings"], 2)
+        self.assertEqual(holding["strike_balance_crossings"], 2)
+        self.assertIsNone(holding["gamma_flip"])
 
 
 if __name__ == "__main__":

@@ -77,11 +77,11 @@ class GammaFlipTests(unittest.TestCase):
         self.assertIsNone(flip)
         self.assertIsNone(metrics["gamma_flip"])
 
-    def test_risk_score_zero_gamma_uses_the_filter(self):
-        ns = _load_functions("portfolio_risk_score_leverage.py", {"compute_zero_gamma_level"},
+    def test_risk_score_strike_balance_uses_the_filter(self):
+        ns = _load_functions("portfolio_risk_score_leverage.py", {"compute_strike_balance_level"},
                              {"np": np, "gamma_flip_level": gamma_flip_level})
         profile = pd.DataFrame({"strike": _STRIKES, "GEX_neto": [o * 0.05 for o in _OI]})
-        self.assertTrue(np.isnan(ns["compute_zero_gamma_level"](profile)))
+        self.assertTrue(np.isnan(ns["compute_strike_balance_level"](profile)))
 
 
 class EntryPercentileTests(unittest.TestCase):

@@ -14,7 +14,7 @@ from scipy.stats import norm
 
 import entry_signal_tool as est
 import pipeline_io
-from gex_utils import gamma_flip_level
+from gex_utils import gamma_flip_level, zero_gamma_profile
 from polygon_client import NO_OPTION_DATA, NoOptionData, PolygonError, PolygonNotFound, failure_reason
 from tests.test_international_fallback import _load_functions
 from tickers import resolve_instrument
@@ -22,7 +22,7 @@ from tickers import resolve_instrument
 _RISK_FUNCS = {
     "bs_price", "bs_gamma", "implied_vol_bisection", "fill_missing_iv_greeks", "compute_atm_iv",
     "compute_expected_move", "compute_put_call_ratio", "compute_gex_profile",
-    "compute_zero_gamma_level", "compute_max_pain", "spot_paridad_put_call", "spot_listado_us",
+    "compute_zero_gamma_level", "compute_strike_balance_level", "compute_max_pain", "spot_paridad_put_call", "spot_listado_us",
     "run_options_module_for_ticker", "options_source", "run_options_module", "_senal_riesgo",
     "_fallback_warnings", "pct",
 }
@@ -58,6 +58,7 @@ class AdrSpotFallbackTests(unittest.TestCase):
         self.logs = []
         return _load_functions("portfolio_risk_score_leverage.py", _RISK_FUNCS, {
             "np": np, "pd": pd, "norm": norm, "gamma_flip_level": gamma_flip_level,
+            "zero_gamma_profile": zero_gamma_profile,
             "log_info": self.logs.append, "log_warn": self.logs.append, "log_error": self.logs.append,
             "yahoo_closes": yahoo,
             "get_target_expiration": lambda tk, h, key: {"expiration": "2026-11-07", "days_to_expiry": DIAS},
