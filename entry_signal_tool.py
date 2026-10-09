@@ -11,7 +11,7 @@ import os
 import json
 import plotly.graph_objects as go
 
-from gex_utils import zero_gamma_profile
+from gex_utils import ZERO_GAMMA_DEF, ZERO_GAMMA_DEF_LEGACY, zero_gamma_profile
 from polygon_client import NO_OPTION_DATA, NoOptionData, PolygonClient, failure_reason
 from pipeline_io import (
     MIN_OPTION_DAYS,
@@ -131,8 +131,50 @@ def _portafolio_del_estado():
 # Si ya corriste el script hoy con el mismo portafolio, se reemplaza esa fila en vez de duplicarla
 def cargar_historial():
     if os.path.exists(HIST_PATH):
-        return pd.read_csv(HIST_PATH, parse_dates=["fecha"])
+        return _normalizar_definiciones(pd.read_csv(HIST_PATH, parse_dates=["fecha"]))
     return pd.DataFrame()
+
+# Un valor del historial solo es comparable con los de su misma definicion.
+# columna -> columna que guarda su definicion; si se redefine el nivel detras de
+# una columna basta subir la constante vigente (y dejar la anterior como heredada).
+DEFINICION_POR_COLUMNA = {"dist_zero_gamma": "zero_gamma_def"}
+DEFINICION_VIGENTE = {"zero_gamma_def": ZERO_GAMMA_DEF}
+DEFINICION_HEREDADA = {"zero_gamma_def": ZERO_GAMMA_DEF_LEGACY}
+
+def _normalizar_definiciones(hist_df):
+    # Los archivos anteriores no traen la columna de definicion: sus filas son de
+    # la definicion heredada. Las demas columnas no se tocan; la nueva va al final.
+    if hist_df.empty:
+        return hist_df
+    hist_df = hist_df.copy()
+    for col_def, heredada in DEFINICION_HEREDADA.items():
+        if col_def not in hist_df.columns:
+            hist_df[col_def] = heredada
+        else:
+            vacia = hist_df[col_def].isna() | (hist_df[col_def].astype(str).str.strip() == "")
+            hist_df[col_def] = hist_df[col_def].where(~vacia, heredada)
+    return hist_df
+
+def _filas_misma_definicion(hist_df, columna):
+    """Filas del historial cuyo valor de ``columna`` tiene la definicion vigente.
+
+    Las columnas sin definicion registrada devuelven todas las filas. Si falta la
+    columna de definicion (historial armado a mano) todo cuenta como heredado.
+    """
+    col_def = DEFINICION_POR_COLUMNA.get(columna)
+    if col_def is None or hist_df.empty:
+        return hist_df
+    if col_def not in hist_df.columns:
+        return hist_df.iloc[0:0]
+    return hist_df[hist_df[col_def] == DEFINICION_VIGENTE[col_def]]
+
+def _etiquetar_definiciones(df):
+    # Toda fila nueva se calcula con la definicion vigente, tambien las de proxy
+    # y las sin distancia (NaN). Las columnas nuevas quedan al final.
+    df = df.copy()
+    for col_def, vigente in DEFINICION_VIGENTE.items():
+        df[col_def] = vigente
+    return df
 
 # ---------------- ESTADO DEL CICLO Y DE LAS ENTRADAS ----------------
 
@@ -244,7 +286,8 @@ def evaluar_flujo_opciones(ticker, hist_df):
         else:
             detalles.append("smart money desfavorable (put/call >= 1)")
 
-    dist_zg = hist_ticker["dist_zero_gamma"].dropna().abs()
+    # Solo filas con la misma definicion de zero-gamma que la de hoy.
+    dist_zg = _filas_misma_definicion(hist_ticker, "dist_zero_gamma")["dist_zero_gamma"].dropna().abs()
     if len(dist_zg) >= 2:
         señales_totales += 1
         if dist_zg.iloc[-1] < dist_zg.iloc[0]:
@@ -496,7 +539,8 @@ def percentile_historico(hist_df, ticker, columna, valor_actual, absoluto=False)
     # y comparar un valor absoluto contra una serie con signo sesga el percentil.
     if hist_df.empty or valor_actual is None or pd.isna(valor_actual):
         return 50.0
-    serie = hist_df[hist_df["ticker"] == ticker][columna].dropna()
+    base = _filas_misma_definicion(hist_df, columna)
+    serie = base[base["ticker"] == ticker][columna].dropna()
     if len(serie) < 5:
         return 50.0
     if absoluto:
@@ -996,6 +1040,7 @@ def correr_entry_signal(cycle_day=None, invested_pct=None, force_new_tranche=Fal
     df_nuevo = pd.DataFrame(filas_nuevas)
     if df_nuevo.empty:
         return pd.DataFrame(), hist_df, _contexto(estado, warnings, excluded, dia_ciclo, ciclo)
+    df_nuevo = _etiquetar_definiciones(df_nuevo)
 
     hist_actualizado = pd.concat([hist_df, df_nuevo], ignore_index=True)
     # Si el mismo ticker ya tiene una fila con la fecha de hoy, se queda solo la mas reciente

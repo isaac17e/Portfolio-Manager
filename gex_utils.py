@@ -18,6 +18,13 @@ from __future__ import annotations
 import numpy as np
 from scipy.optimize import brentq
 
+# Tag stored next to persisted ``dist_zero_gamma`` values (entry_signal_history.csv)
+# so a distance is only compared with distances built the same way. Bump
+# ZERO_GAMMA_DEF whenever the level behind that distance is redefined.
+ZERO_GAMMA_DEF = "zero_gamma_grid"
+# Rows written before the spot-grid zero-gamma used the cumulative per-strike crossing.
+ZERO_GAMMA_DEF_LEGACY = "strike_balance"
+
 # Spot grid for the GEX profile: spot * (1 +/- ZERO_GAMMA_GRID_HALF_WIDTH) in
 # ZERO_GAMMA_GRID_POINTS evenly spaced points. An odd count puts the current
 # spot on the centre node. 181 points over +/-30% is a 0.33% step; each

@@ -89,7 +89,8 @@ class EntryPercentileTests(unittest.TestCase):
         import entry_signal_tool as es
 
         hist = pd.DataFrame({"ticker": "X",
-                             "dist_zero_gamma": [-0.05, -0.04, -0.06, -0.03, -0.05, -0.04, -0.05, -0.06]})
+                             "dist_zero_gamma": [-0.05, -0.04, -0.06, -0.03, -0.05, -0.04, -0.05, -0.06],
+                             "zero_gamma_def": "zero_gamma_grid"})
         # |-0.045| sits in the middle of the |history| (0.03..0.06), not at the top.
         self.assertEqual(es.percentile_historico(hist, "X", "dist_zero_gamma", -0.045, absoluto=True), 37.5)
         # The signed comparison is unchanged when absoluto is not requested.
