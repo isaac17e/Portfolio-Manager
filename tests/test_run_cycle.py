@@ -263,7 +263,7 @@ class SuccessPathTests(CycleTestCase):
         gex = json.loads(Path(os.path.join(result["signals"], "portfolio_gex_field.json")).read_text(encoding="utf-8"))
         entry = json.loads(Path(os.path.join(result["signals"], "entry_signal_tool.json")).read_text(encoding="utf-8"))
         self.assertEqual(gex["data"]["headless_env"], "1")
-        self.assertIsNone(entry["data"]["headless_env"])
+        self.assertEqual(entry["data"]["headless_env"], "1")
         self.assertFalse(os.path.exists(result["state"]))
 
     def test_steps_subset_follows_canonical_order(self):
@@ -785,7 +785,11 @@ class PortfolioAndCliTests(CycleTestCase):
         self.assertEqual(gex_env["PORTFOLIO_FILE"], "/p.json")
         self.assertEqual(gex_env["SIGNALS_OUT_DIR"], "/signals")
         self.assertEqual(gex_env["ENTRY_CYCLE_DAY"], "2")
-        self.assertEqual(entry_env["HEADLESS"], "0")
+        # Every step is headless, even with HEADLESS=0 in the parent: a plotly
+        # fig.show() without a browser waits forever.
+        for script in run_cycle.DAILY_STEPS + run_cycle.WEEKLY_STEPS:
+            with mock.patch.dict(os.environ, {"HEADLESS": "0"}):
+                self.assertEqual(run_cycle.step_environment("/p.json", "/s", script)["HEADLESS"], "1")
         self.assertEqual(entry_env["ENTRY_INVESTED_PCT"], "40")
         self.assertEqual(entry_env["ENTRY_CYCLE_DAY"], "2")
 

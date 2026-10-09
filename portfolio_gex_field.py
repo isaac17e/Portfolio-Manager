@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 from pipeline_io import (
     MIN_OPTION_DAYS, export_signals, load_portfolio, resolve_horizon, resolve_risk_free_rate,
 )
-from gex_utils import gamma_flip_level
+from gex_utils import gamma_flip_crossings, gamma_flip_level
 from polygon_client import NO_OPTION_DATA, PolygonClient, PolygonError, failure_reason
 from tickers import (
     adr_warnings, dividend_yield_from_info, exclusion_warnings, options_exclusion, options_underlying,
@@ -54,6 +54,11 @@ MAX_DIVIDEND_YIELD = 0.25
 GREEK_BUMP_PCT = 0.01
 MIN_TOTAL_VOL = 1e-3
 NEAR_TERM_DAYS_CUTOFF = 7
+# El gamma flip es el cruce del GEX acumulado mas cercano al spot dentro de
+# +/- este porcentaje; uno mas lejos sale del borde de la ventana de strikes.
+FLIP_MAX_DISTANCE_PCT = 0.30
+REGIME_POSITIVE = "Positive Gamma (estable)"
+REGIME_NEGATIVE = "Negative Gamma (inestable)"
 
 MACRO_LOOKBACK_PERIOD = "1y"
 MACRO_TICKERS = {
@@ -111,6 +116,17 @@ HORIZON = resolve_horizon(_PORTFOLIO_META, DEFAULT_HORIZON_DAYS, mode="remaining
 GEX_HORIZON_DAYS = HORIZON["days"]
 GEX_HORIZON_MONTHS = (TIME_HORIZON_MONTHS if HORIZON["source"] == "default"
                       else GEX_HORIZON_DAYS / 30.44)
+# Si hasta el horizonte no hay un campo gamma utilizable (p. ej. quedan 30 dias
+# y el unico vencimiento mensual en ellos tiene <= NEAR_TERM_DAYS_CUTOFF dias,
+# que el GEX estructural descarta), la ventana se amplia por estos plazos hasta
+# encontrar uno, en vez de excluir el ticker.
+GEX_FALLBACK_WINDOWS_DAYS = (DEFAULT_HORIZON_DAYS, 90, 120, 180)
+
+
+def ventanas_vencimiento(horizon_days):
+    """Plazos (dias) a probar en orden: el horizonte y los de respaldo mayores."""
+    horizon_days = int(horizon_days)
+    return [horizon_days] + [d for d in GEX_FALLBACK_WINDOWS_DAYS if d > horizon_days]
 
 
 def _horizonte(horizon_months=None, horizon_days=None):
@@ -308,12 +324,13 @@ def get_current_price(ticker):
 
 
 def get_polygon_options_data(ticker, current_price, horizon_months=None,
-                              strike_range_pct=None, horizon_days=None):
+                              strike_range_pct=None, horizon_days=None, retry_default=True):
     """Cadena con vencimientos hasta ``horizon_days`` (dias calendario).
 
     Sin argumentos de horizonte usa el del portafolio (GEX_HORIZON_DAYS). Si a
     ese plazo Polygon no trae contratos y es menor que DEFAULT_HORIZON_DAYS, se
-    reintenta con el plazo por defecto.
+    reintenta con el plazo por defecto (salvo ``retry_default=False``: la
+    escalera de get_portfolio_chains ya amplia la ventana por su cuenta).
     """
     if current_price is None:
         print(f"❌ [{ticker}] No se puede extraer la cadena de opciones sin precio spot.")
@@ -324,7 +341,8 @@ def get_polygon_options_data(ticker, current_price, horizon_months=None,
         strike_range_pct = get_dynamic_strike_range(horizon_months)
 
     today = datetime.utcnow().date()
-    plazos = [horizon_days] + ([DEFAULT_HORIZON_DAYS] if horizon_days < DEFAULT_HORIZON_DAYS else [])
+    plazos = [horizon_days] + ([DEFAULT_HORIZON_DAYS]
+                               if retry_default and horizon_days < DEFAULT_HORIZON_DAYS else [])
 
     url = f"{BASE_URL}/v3/snapshot/options/{to_polygon(ticker)}"
     all_contracts = []
@@ -487,6 +505,27 @@ def get_polygon_options_data(ticker, current_price, horizon_months=None,
 # BLOQUE 4: GEX NETO
 # ============================================================
 
+def gamma_regime(total_gex, spot, gamma_flip):
+    """Regimen gamma y su contraste con el flip.
+
+    ``regime`` es el signo del GEX neto en el spot: la suma del GEX por strike,
+    con gammas evaluadas al spot actual (> 0 positivo / estable). Es la medida
+    directa y la que siempre existe. ``regime_by_flip`` es la convencion spot vs
+    flip (spot >= flip: positivo); None sin flip. Si ambas difieren,
+    ``regime_conflict`` es True y la senal lo reporta en vez de elegir una.
+
+    El flip de este script es el cruce del GEX acumulado por strike, no el cero
+    de un perfil de GEX recalculado a otros spots: con OI mayormente fuera del
+    dinero y GEX neto positivo suele quedar por encima del spot, asi que el
+    conflicto es frecuente y no indica por si solo un error de datos.
+    """
+    regime = REGIME_POSITIVE if total_gex > 0 else REGIME_NEGATIVE
+    if gamma_flip is None or spot is None or not np.isfinite(gamma_flip):
+        return {"regime": regime, "regime_by_flip": None, "regime_conflict": False}
+    by_flip = REGIME_POSITIVE if spot >= gamma_flip else REGIME_NEGATIVE
+    return {"regime": regime, "regime_by_flip": by_flip, "regime_conflict": by_flip != regime}
+
+
 def calculate_gex_and_surface_forces(df_options, current_price, label=""):
     if df_options is None or df_options.empty:
         print(f"❌ [{label}] No hay datos de opciones para calcular GEX.")
@@ -503,11 +542,20 @@ def calculate_gex_and_surface_forces(df_options, current_price, label=""):
 
     # Cruce de signo del GEX acumulado (gex_utils.py). Antes esta copia no
     # ignoraba los strikes sin exposicion y marcaba un flip falso en el borde.
+    # Con varios cruces se toma el mas cercano al spot dentro de
+    # +/-FLIP_MAX_DISTANCE_PCT; antes ganaba el primero desde el strike mas
+    # bajo, que depende de donde empieza la ventana de strikes.
     gamma_flip = None
+    n_crossings = 0
     try:
-        flip = gamma_flip_level(df_gex["strike"], df_gex["net_gex"])
+        n_crossings = len(gamma_flip_crossings(df_gex["strike"], df_gex["net_gex"]))
+        flip = gamma_flip_level(df_gex["strike"], df_gex["net_gex"], spot=current_price,
+                                max_distance_pct=FLIP_MAX_DISTANCE_PCT)
         if np.isfinite(flip):
             gamma_flip = float(flip)
+        elif n_crossings:
+            print(f"ℹ️  [{label}] {n_crossings} cruce(s) de signo del GEX acumulado, ninguno a "
+                  f"±{FLIP_MAX_DISTANCE_PCT:.0%} del spot.")
         else:
             print(f"ℹ️  [{label}] No se detectó cruce de signo en el GEX acumulado en esta ventana.")
     except Exception as e:
@@ -520,17 +568,24 @@ def calculate_gex_and_surface_forces(df_options, current_price, label=""):
         print(f"⚠️  [{label}] Error calculando Call/Put Wall: {e}")
         call_wall, put_wall = None, None
 
+    total_gex = df_gex["net_gex"].sum()
     metrics = {
-        "total_gex": df_gex["net_gex"].sum(),
+        "total_gex": total_gex,
         "gamma_flip": gamma_flip,
+        "flip_crossings": n_crossings,
         "call_wall": call_wall,
         "put_wall": put_wall,
-        "regime": "Positive Gamma (estable)" if df_gex["net_gex"].sum() > 0 else "Negative Gamma (inestable)",
+        **gamma_regime(total_gex, current_price, gamma_flip),
     }
 
     print(f"📐 [{label}] GEX Total: {metrics['total_gex']:,.0f} | "
           f"Gamma Flip: {gamma_flip:.2f}" if gamma_flip is not None else f"📐 [{label}] GEX Total: {metrics['total_gex']:,.0f} | Gamma Flip: no detectado")
     print(f"🧱 [{label}] Call Wall: {call_wall} | Put Wall: {put_wall} | Régimen: {metrics['regime']}")
+    if metrics["regime_conflict"]:
+        print(f"⚠️  [{label}] Conflicto de régimen: GEX neto en el spot {total_gex:,.0f} "
+              f"({metrics['regime']}) pero spot {current_price:.2f} "
+              f"{'>=' if current_price >= gamma_flip else '<'} flip {gamma_flip:.2f} "
+              f"({metrics['regime_by_flip']}).")
 
     return df_gex, gamma_flip, metrics
 
@@ -683,6 +738,15 @@ def _reusar_ultimo_dato(ticker, motivo, max_age_seconds=STALE_DATA_MAX_SECONDS):
     return dict(guardado["data"], stale_seconds=edad)
 
 
+def campo_gamma_utilizable(df_gex_structural, expected_move):
+    """GEX estructural con exposicion en algun strike y movimiento esperado > 0."""
+    if df_gex_structural is None or df_gex_structural.empty:
+        return False
+    if not (df_gex_structural["net_gex"] != 0).any():
+        return False
+    return expected_move is not None and bool(np.isfinite(expected_move)) and expected_move > 0
+
+
 def get_portfolio_chains(holdings, horizon_months=None, horizon_days=None):
     global _LAST_EXCLUDED
     horizon_months, horizon_days = _horizonte(horizon_months, horizon_days)
@@ -724,43 +788,47 @@ def get_portfolio_chains(holdings, horizon_months=None, horizon_days=None):
             note(ticker, "no spot price returned")
             continue
 
+        # Escalera de vencimientos: primero hasta el horizonte; si ahi no hay un
+        # campo gamma utilizable, el siguiente plazo de GEX_FALLBACK_WINDOWS_DAYS.
+        # Se excluye solo si ningun plazo lo da.
+        hubo_cadena = False
+        ventana = None
         try:
-            df_opts = get_polygon_options_data(simbolo, price, horizon_months=horizon_months,
-                                               horizon_days=horizon_days)
+            for plazo in ventanas_vencimiento(horizon_days):
+                df_opts = get_polygon_options_data(simbolo, price, horizon_months=horizon_months,
+                                                   horizon_days=plazo, retry_default=False)
+                if df_opts.empty:
+                    if simbolo in _ULTIMO_FALLO_CADENA:
+                        break  # fallo de API: no se insiste con plazos mayores
+                    continue
+                hubo_cadena = True
+                split = calculate_gex_split(df_opts, price)
+                df_gex_structural = split.get("structural", {}).get("df_gex")
+                metrics_structural = split.get("structural", {}).get("metrics")
+                expected_move = calculate_expected_move(df_opts, price, horizon_months=horizon_months)
+                if campo_gamma_utilizable(df_gex_structural, expected_move):
+                    ventana = plazo
+                    break
+                print(f"⚠️  [{ticker}] Sin campo gamma utilizable con vencimientos hasta {plazo} días; "
+                      "se amplía la ventana.")
         except Exception as exc:
             note(ticker, failure_reason(exc))
             print(f"   ({exc})")
             continue
-        if df_opts.empty:
+        if ventana is None:
+            fallo_api = _ULTIMO_FALLO_CADENA.pop(simbolo, None)
+            if hubo_cadena and fallo_api is None:
+                note(ticker, "no usable gamma field")
+                continue
             reutilizado = _reusar_ultimo_dato(ticker, "sin cadena de opciones en esta iteración")
             if reutilizado is not None:
                 portfolio_data[ticker] = reutilizado
                 continue
-            note(ticker, _ULTIMO_FALLO_CADENA.pop(simbolo, NO_OPTION_DATA))
+            note(ticker, fallo_api or NO_OPTION_DATA)
             continue
-
-        try:
-            split = calculate_gex_split(df_opts, price)
-        except Exception as exc:
-            note(ticker, failure_reason(exc))
-            print(f"   ({exc})")
-            continue
-        df_gex_structural = split.get("structural", {}).get("df_gex")
-        metrics_structural = split.get("structural", {}).get("metrics")
-
-        if df_gex_structural is None or df_gex_structural.empty:
-            note(ticker, "no usable gamma field")
-            continue
-
-        try:
-            expected_move = calculate_expected_move(df_opts, price, horizon_months=horizon_months)
-        except Exception as exc:
-            note(ticker, failure_reason(exc))
-            print(f"   ({exc})")
-            continue
-        if expected_move is None or np.isnan(expected_move) or expected_move <= 0:
-            note(ticker, "no usable gamma field")
-            continue
+        if ventana != horizon_days:
+            print(f"ℹ️  [{ticker}] Campo gamma con vencimientos hasta {ventana} días "
+                  f"(respaldo: el horizonte de {horizon_days} días no daba uno utilizable).")
 
         current_range_pct = get_dynamic_strike_range(horizon_months)
         coverage_sigma = current_range_pct / expected_move
@@ -774,7 +842,7 @@ def get_portfolio_chains(holdings, horizon_months=None, horizon_days=None):
             try:
                 df_opts_wide = get_polygon_options_data(simbolo, price, horizon_months=horizon_months,
                                                           strike_range_pct=required_range_pct,
-                                                          horizon_days=horizon_days)
+                                                          horizon_days=ventana, retry_default=False)
             except Exception as exc:
                 print(f"⚠️  [{ticker}] El re-fetch ampliado falló ({exc}); se conserva la ventana original.")
                 df_opts_wide = pd.DataFrame()
@@ -789,8 +857,7 @@ def get_portfolio_chains(holdings, horizon_months=None, horizon_days=None):
                     df_gex_structural_wide = None
                     expected_move_wide = None
 
-                if (df_gex_structural_wide is not None and not df_gex_structural_wide.empty
-                        and expected_move_wide and not np.isnan(expected_move_wide) and expected_move_wide > 0):
+                if campo_gamma_utilizable(df_gex_structural_wide, expected_move_wide):
                     df_opts = df_opts_wide
                     df_gex_structural = df_gex_structural_wide
                     metrics_structural = metrics_structural_wide
@@ -810,6 +877,10 @@ def get_portfolio_chains(holdings, horizon_months=None, horizon_days=None):
             "df_gex_structural": df_gex_structural,
             "metrics_structural": metrics_structural,
             "expected_move": expected_move,
+            "expiry_window_days": ventana,
+            "expirations": sorted(df_opts.loc[df_opts["days_to_exp"] > NEAR_TERM_DAYS_CUTOFF,
+                                              "expiration"].unique().tolist()),
+            "expiry_fallback": ventana != horizon_days,
         }
         _ultimo_dato_valido[ticker] = {"t": time.time(), "data": dict(portfolio_data[ticker])}
 
@@ -1332,9 +1403,16 @@ def _senal_gex(result, excluded=None):
             "expected_move": data.get("expected_move"),
             "total_gex": metrics.get("total_gex"),
             "regime": metrics.get("regime"),
+            "regime_basis": "net_gex_at_spot",
+            "regime_by_flip": metrics.get("regime_by_flip"),
+            "regime_conflict": bool(metrics.get("regime_conflict", False)),
             "gamma_flip": metrics.get("gamma_flip"),
+            "flip_crossings": metrics.get("flip_crossings"),
             "call_wall": metrics.get("call_wall"),
             "put_wall": metrics.get("put_wall"),
+            "expiry_window_days": data.get("expiry_window_days"),
+            "expirations": data.get("expirations"),
+            "expiry_fallback": data.get("expiry_fallback"),
         })
     return {
         "macro_y": state.get("y"),

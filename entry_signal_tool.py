@@ -33,6 +33,7 @@ from pipeline_io import (
 )
 from price_signals import price_indicators, price_scores, yahoo_closes
 from tickers import exclusion_warnings, no_options_weight_cap, resolve_instrument, to_polygon
+from viz_utils import show_or_save
 
 # ---------------- CONFIGURACION ----------------
 from dotenv import load_dotenv
@@ -1194,9 +1195,7 @@ def main(argv=None):
                 prepared_date=cycle_today().isoformat() if produjo_tramo else None,
                 tranche={key: data[key] for key in ("entries", "waiting", "cycle_day", "cycle")},
             ))
-    fig_resumen = graficar_resumen(resumen)
-    if fig_resumen is not None:
-        fig_resumen.show()
+    show_or_save(graficar_resumen(resumen), "entry_signal_tool", "resumen")
 
 
 if __name__ == "__main__":

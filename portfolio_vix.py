@@ -25,6 +25,7 @@ from tickers import (
     adr_warnings, dividend_yield_from_info, exclusion_warnings, options_exclusion, options_underlying,
     to_polygon, to_yahoo,
 )
+from viz_utils import headless
 from scipy.interpolate import CubicSpline
 from scipy.optimize import brentq, least_squares
 from scipy.stats import norm
@@ -1861,7 +1862,10 @@ class ReportPlotter:
         out_html = os.path.abspath(html_file)
         fig.write_html(out_html, include_plotlyjs="cdn", full_html=True)
 
-        if show:
+        if show and headless():
+            # viz_utils: sin pantalla fig.show() espera un navegador para siempre.
+            print(f"[figures] headless: figure not shown, HTML at {out_html}")
+        elif show:
             try:
                 fig.show()
             except Exception:  # noqa: BLE001

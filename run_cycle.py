@@ -3,8 +3,9 @@
 Daily mode validates the portfolio file, checks that the America/Bogota date
 (or ``--date``) is an NYSE session (``--force`` skips this), and runs, in order,
 ``fundamental_analysis``, ``portfolio_risk_score_leverage``,
-``portfolio_gex_field`` (``--once`` and ``HEADLESS=1``), ``portfolio_vix``
-(``--no-show``), and ``entry_signal_tool``. Weekly mode runs only
+``portfolio_gex_field`` (``--once``), ``portfolio_vix`` (``--no-show``), and
+``entry_signal_tool``. Every step gets ``HEADLESS=1``: figures are written to
+HTML (``viz_utils``) instead of shown. Weekly mode runs only
 ``active_management``, and only on the first NYSE session of the ISO week
 that has not already succeeded.
 
@@ -447,8 +448,9 @@ def step_environment(
         env["CYCLE_DATE"] = as_of.isoformat()
     if force_new_tranche and script == "entry_signal_tool":
         env["ENTRY_FORCE_NEW_TRANCHE"] = "1"
-    if script == "portfolio_gex_field":
-        env["HEADLESS"] = "1"
+    # Every step: no figure window and no plotly fig.show(), which waits forever
+    # without a browser. The figures go to HTML (viz_utils.show_or_save).
+    env["HEADLESS"] = "1"
     return env
 
 
@@ -1083,8 +1085,7 @@ def _print_plan(mode: str, as_of: date, portfolio: dict, steps: list[str], signa
             extra += f" {pipeline_io.HORIZON_ENV}={env[pipeline_io.HORIZON_ENV]}"
         if env.get("ENTRY_FORCE_NEW_TRANCHE"):
             extra += f" ENTRY_FORCE_NEW_TRANCHE={env['ENTRY_FORCE_NEW_TRANCHE']}"
-        if script == "portfolio_gex_field":
-            extra += f" HEADLESS={env['HEADLESS']}"
+        extra += f" HEADLESS={env['HEADLESS']}"
         print(f"    env {extra}")
 
 

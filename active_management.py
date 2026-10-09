@@ -20,6 +20,7 @@ from pipeline_io import (
     resolve_risk_free_rate,
 )
 from tickers import adr_warnings, exclusion_warnings, options_exclusion, options_underlying, to_polygon
+from viz_utils import show_or_save
 
 # ============================================================================
 # BLOQUE 1: PARAMETROS CONFIGURABLES
@@ -2080,13 +2081,8 @@ export_signals(
     warnings=exclusion_warnings(_senal_activa.get("excluded")) + adr_warnings(list(portfolio.keys())),
 )
 
-if resultado["gamma_plot"] is not None:
-    resultado["gamma_plot"].show()
-
-resultado["allocation_plot"].show()
-
-if resultado["risk_plot"] is not None:
-    resultado["risk_plot"].show()
+for _nombre in ("gamma_plot", "allocation_plot", "risk_plot"):
+    show_or_save(resultado[_nombre], "active_management", _nombre)
 
 print("\n-- Tabla de Rebalanceo (data.frame crudo) --")
 print(resultado["tabla_rebalanceo"])

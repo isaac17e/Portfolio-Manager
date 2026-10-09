@@ -13,6 +13,7 @@ from price_signals import price_indicators, yahoo_closes
 from tickers import (
     adr_warnings, exclusion_warnings, no_options_weight_cap, resolve_instrument, to_polygon, to_yahoo,
 )
+from viz_utils import show_or_save
 
 portfolio = {
     "XLU": 0.12,
@@ -1094,9 +1095,8 @@ def run_reporting_module(expost_results, options_module, leverage_results,
         )
     }
 
-    for p in plots.values():
-        if p is not None:
-            p.show()
+    for name, p in plots.items():
+        show_or_save(p, "portfolio_risk_score_leverage", name)
 
     return plots
 
