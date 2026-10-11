@@ -16,8 +16,8 @@ from plotly.subplots import make_subplots
 from gex_utils import gamma_flip_level, zero_gamma_profile
 from polygon_client import NoOptionData, PolygonClient, PolygonError, failure_reason
 from pipeline_io import (
-    MIN_OPTION_DAYS, export_signals, load_portfolio, pick_expiration, resolve_horizon,
-    resolve_risk_free_rate,
+    MIN_OPTION_DAYS, announce_signals_dir, export_signals, load_portfolio,
+    optimizer_history_path, pick_expiration, resolve_horizon, resolve_risk_free_rate,
 )
 from tickers import adr_warnings, exclusion_warnings, options_exclusion, options_underlying, to_polygon
 from viz_utils import show_or_save
@@ -37,6 +37,7 @@ portfolio = {"GLD": 0.18,
 
 _PORTFOLIO_META = load_portfolio(portfolio)
 portfolio = _PORTFOLIO_META["weights"]
+announce_signals_dir("active_management", _PORTFOLIO_META)
 
 # Horizonte en dias calendario: lo que queda hasta horizon_end del portafolio
 # (run_cycle lo pasa en PORTFOLIO_HORIZON_DAYS; suelto se lee del JSON). Sin
@@ -167,7 +168,10 @@ guardrail_acciones_receptoras = ("AUMENTAR", "MANTENER")
 guardrail_max_weight_growth   = 1.35   # un receptor no crece mas de 35% sobre su peso tactico
 
 # --- historial de riesgo y regimen (persistencia entre corridas) ---
-risk_history_path      = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portfolio_risk_history.csv")
+risk_history_legacy_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portfolio_risk_history.csv")
+# Un archivo por optimizador: dos portafolios que corren el mismo dia no se pisan la fila
+# ni mezclan sus percentiles. Por optimizador y no por portafolio: la historia cruza ciclos.
+risk_history_path      = optimizer_history_path(_PORTFOLIO_META, risk_history_legacy_path)
 risk_regime_min_history = 20   # corridas minimas antes de confiar en un percentil
 risk_regime_alto_pct    = 80   # percentil de vol_portafolio por encima del cual se marca estres
 risk_regime_bajo_pct    = 20   # percentil de ratio_diversificacion por debajo del cual se marca colapso
@@ -1504,6 +1508,9 @@ def apply_diversification_guardrail(tabla_rebalanceo, risk_inputs,
 def cargar_historial_riesgo():
     if os.path.exists(risk_history_path):
         return pd.read_csv(risk_history_path, parse_dates=["fecha"])
+    if os.path.exists(risk_history_legacy_path):
+        # Primera corrida con archivo por optimizador: se parte del historial compartido.
+        return pd.read_csv(risk_history_legacy_path, parse_dates=["fecha"])
     return pd.DataFrame()
 
 
@@ -2111,7 +2118,7 @@ export_signals(
 )
 
 for _nombre in ("gamma_plot", "allocation_plot", "risk_plot"):
-    show_or_save(resultado[_nombre], "active_management", _nombre)
+    show_or_save(resultado[_nombre], "active_management", _nombre, portfolio=_PORTFOLIO_META)
 
 print("\n-- Tabla de Rebalanceo (data.frame crudo) --")
 print(resultado["tabla_rebalanceo"])

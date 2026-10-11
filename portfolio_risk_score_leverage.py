@@ -6,8 +6,8 @@ import pandas as pd
 from datetime import date
 
 from pipeline_io import (
-    MIN_OPTION_DAYS, export_signals, load_portfolio, pick_expiration, resolve_horizon,
-    resolve_risk_free_rate,
+    MIN_OPTION_DAYS, announce_signals_dir, export_signals, load_portfolio, pick_expiration,
+    resolve_horizon, resolve_risk_free_rate,
 )
 from price_signals import price_indicators, yahoo_closes
 from tickers import (
@@ -35,6 +35,7 @@ portfolio = {
 
 _PORTFOLIO_META = load_portfolio(portfolio)
 portfolio = _PORTFOLIO_META["weights"]
+announce_signals_dir("portfolio_risk_score_leverage", _PORTFOLIO_META)
 
 total_weight = sum(portfolio.values())
 if abs(total_weight - 1) > 1e-6:
@@ -1114,7 +1115,7 @@ def run_reporting_module(expost_results, options_module, leverage_results,
     }
 
     for name, p in plots.items():
-        show_or_save(p, "portfolio_risk_score_leverage", name)
+        show_or_save(p, "portfolio_risk_score_leverage", name, portfolio=_PORTFOLIO_META)
 
     return plots
 

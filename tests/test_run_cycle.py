@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+import pipeline_io
 import run_cycle
 
 
@@ -110,7 +111,7 @@ payload = {
     "data": data,
     "warnings": ["watch " + script],
 }
-out_dir = os.environ["SIGNALS_OUT_DIR"]
+out_dir = os.environ.get("SIGNALS_DIR_EXACT") or os.environ["SIGNALS_OUT_DIR"]
 os.makedirs(out_dir, exist_ok=True)
 path = os.path.join(out_dir, script + ".json")
 with open(path, "w", encoding="utf-8") as handle:
@@ -154,8 +155,8 @@ class CycleTestCase(unittest.TestCase):
 
     def invoke(self, *args, env=None, payload=None, timeout="30", write_portfolio=True):
         portfolio_path = os.path.join(self.tmp, "portfolio.json")
+        body = _portfolio() if payload is None else payload
         if write_portfolio:
-            body = _portfolio() if payload is None else payload
             Path(portfolio_path).write_text(json.dumps(body), encoding="utf-8")
         signals = os.path.join(self.tmp, "signals")
         summary = os.path.join(self.tmp, "summary")
@@ -187,8 +188,13 @@ class CycleTestCase(unittest.TestCase):
             "stdout": stdout.getvalue(),
             "stderr": stderr.getvalue(),
             "portfolio": os.path.abspath(portfolio_path),
-            "signals": os.path.abspath(signals),
+            # "signals": the portfolio's own folder, where the steps write; "signals_base": its parent.
+            "signals": pipeline_io.portfolio_signals_dir(body, os.path.abspath(signals)),
+            "signals_base": os.path.abspath(signals),
             "summary": os.path.abspath(summary),
+            "summary_folder": os.path.join(os.path.abspath(summary), pipeline_io.portfolio_key(
+                {"portfolio_optimizer": body.get("optimizer"), "portfolio_run_ts": body.get("run_ts")}
+            ) or ""),
             "state": os.path.abspath(state),
             "log": log_path,
         }
@@ -199,7 +205,7 @@ class CycleTestCase(unittest.TestCase):
             return json.load(handle)
 
     def assert_summary_files(self, result):
-        names = os.listdir(result["summary"])
+        names = os.listdir(result["summary_folder"])
         self.assertIn("cycle_summary_latest.json", names)
         self.assertIn("cycle_summary_latest.txt", names)
         self.assertTrue(any(
@@ -301,7 +307,7 @@ class FailureTests(CycleTestCase):
         self.assertIn("portfolio_risk_score_leverage", text)
 
     def test_stale_signal_file_is_rejected(self):
-        result_dir = os.path.join(self.tmp, "signals")
+        result_dir = os.path.join(self.tmp, "signals", "black_litterman_20261005T164012")
         os.makedirs(result_dir)
         portfolio_path = os.path.abspath(os.path.join(self.tmp, "portfolio.json"))
         stale = {

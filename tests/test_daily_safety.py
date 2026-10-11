@@ -65,7 +65,8 @@ class EntryTrancheLockTests(unittest.TestCase):
         return self.signal()
 
     def signal(self):
-        return json.loads((self.signals / "entry_signal_tool.json").read_text(encoding="utf-8"))
+        folder = self.signals / "black_litterman_20261005T164012"  # per-portfolio folder
+        return json.loads((folder / "entry_signal_tool.json").read_text(encoding="utf-8"))
 
     def state(self):
         path = pipeline_io.entry_state_path(META)
@@ -188,7 +189,8 @@ class EntryTrancheLockTests(unittest.TestCase):
         step_start = run_cycle._now_bogota()
         self.run_entry(DAY1)
         payload = run_cycle.verify_signal(
-            str(self.signals / "entry_signal_tool.json"), "entry_signal_tool",
+            str(self.signals / "black_litterman_20261005T164012" / "entry_signal_tool.json"),
+            "entry_signal_tool",
             META["portfolio_source"], META["portfolio_run_ts"], step_start,
         )
         scalars, warnings, excluded = {}, {}, {}

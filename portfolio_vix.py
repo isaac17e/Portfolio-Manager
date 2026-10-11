@@ -18,7 +18,8 @@ from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 from pipeline_io import (
-    MIN_OPTION_DAYS, export_signals, load_portfolio, resolve_horizon, resolve_risk_free_rate,
+    MIN_OPTION_DAYS, announce_signals_dir, artifact_path, export_signals, load_portfolio,
+    prepare_artifact_path, resolve_horizon, resolve_risk_free_rate,
 )
 from polygon_client import NoOptionData, PolygonClient, failure_reason
 from tickers import (
@@ -1859,7 +1860,10 @@ class ReportPlotter:
         if fig is None:
             fig = ReportPlotter.build_figure(fits_by_asset, breakdown, metrics, corr, source)
 
-        out_html = os.path.abspath(html_file)
+        if html_file == OUTPUT_HTML:
+            # Nombre por defecto: carpeta del portafolio (artifacts/); un --html explicito se respeta.
+            html_file = artifact_path(_PORTFOLIO_META, OUTPUT_HTML, os.getcwd())
+        out_html = os.path.abspath(prepare_artifact_path(html_file, os.getcwd()))
         fig.write_html(out_html, include_plotlyjs="cdn", full_html=True)
 
         if show and headless():
@@ -2237,6 +2241,7 @@ def _parse_args() -> VIXConfig:
 
 if __name__ == "__main__":
     warnings.simplefilter("always", RuntimeWarning)
+    announce_signals_dir("portfolio_vix", _PORTFOLIO_META)
     cfg = _parse_args()
     pesos_txt = (
         "equiponderado"

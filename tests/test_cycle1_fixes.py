@@ -220,8 +220,9 @@ class FillsGatingTests(unittest.TestCase):
                         "portfolio_vix", {"excluded": [{"ticker": "RY.TO", "reason": "no US-listed options"}]},
                         meta, warnings=["RY.TO: no US-listed options"],
                     )
-            plain = json.loads((Path(tmp) / "entry_signal_tool.json").read_text(encoding="utf-8"))
-            flagged = json.loads((Path(tmp) / "portfolio_vix.json").read_text(encoding="utf-8"))
+            folder = Path(tmp) / "hardcoded_fallback"
+            plain = json.loads((folder / "entry_signal_tool.json").read_text(encoding="utf-8"))
+            flagged = json.loads((folder / "portfolio_vix.json").read_text(encoding="utf-8"))
         self.assertNotIn("warnings", plain)
         self.assertEqual(flagged["warnings"], ["RY.TO: no US-listed options"])
         self.assertEqual(flagged["data"]["excluded"][0]["ticker"], "RY.TO")

@@ -16,7 +16,9 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-from pipeline_io import export_signals, load_portfolio
+from pipeline_io import (
+    announce_signals_dir, artifact_path, export_signals, load_portfolio, prepare_artifact_path,
+)
 from tickers import to_yahoo
 
 try:
@@ -1347,9 +1349,14 @@ def exportar_html(
         tk_json=_json([str(row["Ticker"]) for row, _, _ in tickers]),
     )
 
+    script_dir = Path(__file__).resolve().parent
+    if path == OUTPUT_HTML:
+        # Nombre por defecto: carpeta del portafolio (artifacts/); una ruta explicita se respeta.
+        path = artifact_path(_PORTFOLIO_META, OUTPUT_HTML, str(script_dir))
     ruta = Path(path)
     if not ruta.is_absolute():
-        ruta = Path(__file__).resolve().parent / ruta
+        ruta = script_dir / ruta
+    ruta = Path(prepare_artifact_path(str(ruta), str(script_dir)))
     ruta.write_text(contenido, encoding="utf-8")
     print(f"Reporte HTML: {ruta}")
     if abrir:
@@ -1391,6 +1398,7 @@ def _senal_fundamental(df: pd.DataFrame) -> Dict[str, Any]:
 # BLOQUE 8: EJECUCIÓN
 # ==============================================================================
 if __name__ == "__main__":
+    announce_signals_dir("fundamental_analysis", _PORTFOLIO_META)
     df_resultado = analizar_cartera(PORTFOLIO_TICKERS)
 
     pd.set_option("display.width", 200)

@@ -42,7 +42,7 @@ Most scripts take a portfolio as a `ticker: weight` dictionary at the top of the
    - **Euler risk attribution** (contribution to total risk per asset);
    - a **concentration guardrail** that shifts weight away from any asset whose risk contribution exceeds 1.5× the equal-share level.
 5. **Rebalancing**: freed capital goes to cash up to a 30% cap, and the rest is distributed among "Increase" names in proportion to their score. Portfolio weights do not have to add up to 1: whatever is missing is existing cash and becomes the starting weight of the `CASH` row, so current and suggested cash are compared on the same basis. Weights above 1 are normalized with a warning.
-6. **Risk regime history**: each run is appended to `portfolio_risk_history.csv`. After 20 runs, portfolio volatility and the diversification ratio are compared with their own percentiles to flag stress or diversification collapse.
+6. **Risk regime history**: each run is appended to `portfolio_risk_history_<optimizer>.csv` next to the script (one file per optimizer, so two portfolios run the same day do not overwrite each other's row; the first run seeds it from a legacy `portfolio_risk_history.csv`, which stays in use with `SIGNALS_PER_PORTFOLIO=0`). After 20 runs, portfolio volatility and the diversification ratio are compared with their own percentiles to flag stress or diversification collapse.
 
 **Output**: an executive summary with the rationale per asset, gamma profile charts, current vs. suggested allocation and a risk attribution chart.
 
@@ -92,7 +92,7 @@ python portfolio_vix.py --tickers SPY QQQ GLD --weights 0.5 0.3 0.2 \
     --source polygon --vol-method svi --corr-method ewma --american-engine bs1993
 ```
 
-**Output**: `portfolio_vix_report.html` with the smiles per asset, the variance strip weights and the risk attribution.
+**Output**: `portfolio_vix_report.html` (in the portfolio's `artifacts/` folder, see [Per-portfolio signal folders](#per-portfolio-signal-folders)) with the smiles per asset, the variance strip weights and the risk attribution.
 
 ## `portfolio_gex_field.py` — 3D portfolio gamma field
 
@@ -102,7 +102,7 @@ A live visualization of where the portfolio sits in terms of dealer positioning 
 - **Y axis**: macro/liquidity/volatility stress, built from the 1-year percentile ranks of VIX (50%), the 10-year yield (25%) and the dollar index (25%).
 - **Z**: a potential surface in which macro stress amplifies negative-gamma (risk) zones more than it deepens positive-gamma (stable) zones. The script marks the portfolio's current state, the gradient and reference lines for each holding.
 
-**Pipeline mode is headless:** one calculation, then exit. It writes `portfolio_gex_field.html` and `portfolio_gex_field_data.json` and does not open a browser or start the local server.
+**Pipeline mode is headless:** one calculation, then exit. It writes `portfolio_gex_field.html` and `portfolio_gex_field_data.json` (both in the portfolio's `artifacts/` folder, see [Per-portfolio signal folders](#per-portfolio-signal-folders)) and does not open a browser or start the local server.
 
 ```bash
 python portfolio_gex_field.py --once
@@ -114,7 +114,7 @@ Without `--once` / `HEADLESS=1` / `GEX_ONCE=1` it still loops, refreshing every 
 
 ### Figures
 
-Without a browser, Plotly's `fig.show()` starts a local server and waits forever. `entry_signal_tool`, `portfolio_risk_score_leverage` and `active_management` hand their figures to `viz_utils.show_or_save`, and `portfolio_vix` checks the same rule before opening its report. When `HEADLESS` is `1`/`true`/`yes`/`on`, or it is unset and there is no display (Linux without `DISPLAY`/`WAYLAND_DISPLAY`) or the run is not interactive (no terminal, outside IPython/Jupyter), nothing is shown. Each figure is written with `fig.write_html` (no kaleido needed) to `FIGURES_DIR` (default `<PIPELINE_DIR>/figures`) as `<script>_<figure>_<YYYYMMDDTHHMMSS>.html`, and the path is printed. `HEADLESS=0` always shows. `portfolio_vix` keeps writing its report to its usual HTML path.
+Without a browser, Plotly's `fig.show()` starts a local server and waits forever. `entry_signal_tool`, `portfolio_risk_score_leverage` and `active_management` hand their figures to `viz_utils.show_or_save`, and `portfolio_vix` checks the same rule before opening its report. When `HEADLESS` is `1`/`true`/`yes`/`on`, or it is unset and there is no display (Linux without `DISPLAY`/`WAYLAND_DISPLAY`) or the run is not interactive (no terminal, outside IPython/Jupyter), nothing is shown. Each figure is written with `fig.write_html` (no kaleido needed) to `FIGURES_DIR` (default `<signals dir>/figures`, the portfolio's own folder; `<PIPELINE_DIR>/figures` with `SIGNALS_PER_PORTFOLIO=0`) as `<script>_<figure>_<YYYYMMDDTHHMMSS>.html`, and the path is printed. `HEADLESS=0` always shows. `portfolio_vix` writes its report to `<signals dir>/artifacts/portfolio_vix_report.html` (`--html` overrides).
 
 ## `fundamental_analysis.py` — Fundamental scorecard
 
@@ -128,7 +128,7 @@ Uses Yahoo Finance financial statements to grade each ticker as green / neutral 
 
 The number of green signals gives a global rating: **Global Green Light** (≥ 9), **Medium Quality** (≥ 6) or **Global Alert**. All thresholds are editable in the `UMBRALES` dictionary.
 
-**Output**: `reporte_fundamental.html`, with summary cards, a signal matrix and charts of the last 4 fiscal years and 5 quarters.
+**Output**: `reporte_fundamental.html` (in the portfolio's `artifacts/` folder, see [Per-portfolio signal folders](#per-portfolio-signal-folders)), with summary cards, a signal matrix and charts of the last 4 fiscal years and 5 quarters.
 
 ## Options horizon per script
 
@@ -201,7 +201,7 @@ python run_cycle.py --portfolio /workspace/pipeline/portfolio/portfolio_latest.j
 
 Idempotent entry tranches: `entry_signal_tool` prepares at most one tranche per America/Bogota day (see [Same-day lock](#same-day-lock)), so a second daily run the same day does not open the next cycle day. `run_cycle` exports its date to every step as `CYCLE_DATE`, each step's horizon as `PORTFOLIO_HORIZON_DAYS` (full term for the entry tool, days left to `horizon_end` for risk, GEX, VIX and active management; unset when the portfolio has no horizon; recorded per step as `horizon_days` in the cycle summary), and otherwise passes the environment through unchanged (`RISK_FREE_RATE`, `ENTRY_CYCLE_DAY`, ...).
 
-Weekly mode runs only `active_management`. Schedule that command every day; the script decides whether today is the session to run. Today is the America/Bogota date (override with `--date YYYY-MM-DD`). It runs when that date is an NYSE session, it is the first NYSE session of its ISO week, and the weekly cycle has not already succeeded in that week. A Monday holiday (Labor Day, Memorial Day) therefore runs on the next session of that week, which is Tuesday. Columbus Day does not close the NYSE, so that week stays on Monday. The last success is stored in `/workspace/pipeline/state/weekly_last_run.json` and is updated only after every weekly step succeeds.
+Weekly mode runs only `active_management`. Schedule that command every day; the script decides whether today is the session to run. Today is the America/Bogota date (override with `--date YYYY-MM-DD`). It runs when that date is an NYSE session, it is the first NYSE session of its ISO week, and the weekly cycle has not already succeeded in that week. A Monday holiday (Labor Day, Memorial Day) therefore runs on the next session of that week, which is Tuesday. Columbus Day does not close the NYSE, so that week stays on Monday. The last success is stored per portfolio in `/workspace/pipeline/state/weekly_last_run_<optimizer>_<stamp>.json` and is updated only after every weekly step succeeds, so the weekly cycle of a minimum-variance and of a quadratic-utility portfolio are both due on the same Monday. `--weekly-state` / `WEEKLY_STATE_FILE` name one file shared by every portfolio (the old behaviour); `SIGNALS_PER_PORTFOLIO=0` goes back to the single `weekly_last_run.json`.
 
 If today is after the portfolio's `horizon_end`, weekly mode writes a summary with status `skipped_after_horizon` and exits 0. A null `horizon_end` still runs, and the summary carries a warning. `--force` skips the due check and still honors `horizon_end`.
 
@@ -212,9 +212,9 @@ python run_cycle.py --weekly --portfolio /workspace/pipeline/portfolio/portfolio
 | Flag / env | Default | Role |
 |---|---|---|
 | `--portfolio` / `PORTFOLIO_FILE` | `/workspace/pipeline/portfolio/portfolio_latest.json` | Portfolio JSON. Each step receives this path as `PORTFOLIO_FILE`. |
-| `--signals-dir` / `SIGNALS_OUT_DIR` | `/workspace/pipeline/signals` | Where each step must write `<script>.json`. The flag wins over the env var. |
-| `--summary-dir` / `CYCLE_SUMMARY_DIR` | `/workspace/pipeline` | `cycle_summary_latest.json`, `cycle_summary_latest.txt`, and timestamped copies `cycle_summary_<YYYYMMDDTHHMMSS>.json` / `.txt`. |
-| `--weekly-state` / `WEEKLY_STATE_FILE` | `/workspace/pipeline/state/weekly_last_run.json` | Last successful weekly run date. |
+| `--signals-dir` / `SIGNALS_OUT_DIR` | `/workspace/pipeline/signals` | Base of the signal folders. Each step writes `<script>.json` to `<base>/<optimizer>_<stamp>/` (see [Per-portfolio signal folders](#per-portfolio-signal-folders)). The flag wins over the env var. `SIGNALS_DIR_EXACT` in the environment overrides the folder. |
+| `--summary-dir` / `CYCLE_SUMMARY_DIR` | `/workspace/pipeline` | Base of the summaries: `<dir>/<optimizer>_<stamp>/cycle_summary_latest.json`, `cycle_summary_latest.txt`, and timestamped copies `cycle_summary_<YYYYMMDDTHHMMSS>.json` / `.txt`. A top-level `<dir>/cycle_summary_latest.json` / `.txt` copy holds the last cycle of any portfolio (it names its `portfolio` and `signals_dir`); read the per-portfolio one. |
+| `--weekly-state` / `WEEKLY_STATE_FILE` | `/workspace/pipeline/state/weekly_last_run_<optimizer>_<stamp>.json` | Last successful weekly run date. A file given here is shared by every portfolio. |
 | `--timeout` / `CYCLE_STEP_TIMEOUT` | `1800` | Seconds allowed for each step. |
 | `--weekly` | off | Only `active_management`, plus the calendar and horizon checks. |
 | `--date YYYY-MM-DD` | today in America/Bogota | Date used for the horizon, the NYSE session check and the weekly due check. Also exported to the steps as `CYCLE_DATE`. |
@@ -225,7 +225,7 @@ python run_cycle.py --weekly --portfolio /workspace/pipeline/portfolio/portfolio
 
 The portfolio file must be schema version 1, with `run_ts`, `optimizer`, weights that sum to about 1 (absolute tolerance `0.0001`), and the same names in `tickers` and `weights`. `horizon_end` is `YYYY-MM-DD` or null.
 
-A step is accepted only when it exits 0 and `<SIGNALS_OUT_DIR>/<script>.json` was written during the step (file mtime and the file's `run_ts` are at or after the step start, America/Bogota). `portfolio_source` must equal the portfolio path and `portfolio_run_ts` must equal the portfolio's `run_ts`. `portfolio_source: "hardcoded_fallback"` is a failure. The cycle stops at the first failure and does not read later files. The summary is still written, with `status: failed` and `failing_step` set to that script. The error includes the step name, the exit code, and the tail of stderr.
+`run_cycle` computes the signals folder once from the portfolio file and passes it to every step as `SIGNALS_DIR_EXACT` (`SIGNALS_OUT_DIR` stays the base, which anchors `PIPELINE_DIR`); it prints it (`[cycle] signals dir = ...`) and records it as `signals_dir` in the summary. A step is accepted only when it exits 0 and `<signals dir>/<script>.json` was written during the step (file mtime and the file's `run_ts` are at or after the step start, America/Bogota). `portfolio_source` must equal the portfolio path and `portfolio_run_ts` must equal the portfolio's `run_ts`. `portfolio_source: "hardcoded_fallback"` is a failure. The cycle stops at the first failure and does not read later files. The summary is still written, with `status: failed` and `failing_step` set to that script. The error includes the step name, the exit code, and the tail of stderr.
 
 The summary's `scalars` include `target_leverage`, `risk_score`, `vix_portfolio`, `n_entries`, and `entries` when those steps ran. `signal_warnings` and `excluded` collect each signal file's `warnings` and `data.excluded`. Timestamps are America/Bogota ISO-8601. Writes are atomic (`*.tmp` then `os.replace`).
 
@@ -242,7 +242,9 @@ Each script also writes a JSON signal (contract section 4) through `pipeline_io.
 | Env | Default |
 |---|---|
 | `PORTFOLIO_FILE` | `/workspace/pipeline/portfolio/portfolio_latest.json` |
-| `SIGNALS_OUT_DIR` | `/workspace/pipeline/signals` |
+| `SIGNALS_OUT_DIR` | `/workspace/pipeline/signals` (the base; signals go to `<base>/<optimizer>_<stamp>/`) |
+| `SIGNALS_PER_PORTFOLIO` | `1`. `0` = flat legacy layout, signals directly in `SIGNALS_OUT_DIR` |
+| `SIGNALS_DIR_EXACT` | unset. When set, every script writes its signals exactly here (no subfolder) |
 | `EXECUTIONS_DIR` | `/workspace/pipeline/executions` |
 | `POLYGON_CALLS_PER_MINUTE` | `100` |
 | `PIPELINE_DIR` | parent of `SIGNALS_OUT_DIR` (`/workspace/pipeline`) |
@@ -254,12 +256,51 @@ Each script also writes a JSON signal (contract section 4) through `pipeline_io.
 | `PORTFOLIO_HORIZON_DAYS` | unset = read from `PORTFOLIO_FILE`, else each script's default (`run_cycle` sets it per step, see [Options horizon per script](#options-horizon-per-script)) |
 | `RISK_FREE_RATE` | unset = each script's own default (see [Risk-free rate](#risk-free-rate)) |
 | `HEADLESS` or `GEX_ONCE` | unset (`run_cycle` sets `HEADLESS=1` for every step) |
-| `FIGURES_DIR` | `<PIPELINE_DIR>/figures` (headless figure HTML) |
+| `FIGURES_DIR` | `<signals dir>/figures` (headless figure HTML; `<PIPELINE_DIR>/figures` with `SIGNALS_PER_PORTFOLIO=0`) |
 | `ENTRY_STAGGER_PCT` | `0.20` (tier `none`: share of the target bought per cycle day) |
 | `NO_OPTIONS_WEIGHT_CAP_FACTOR` | `0.5` (tier `none`: target weight x factor) |
 | `NO_OPTIONS_WEIGHT_CAP` | unset (tier `none`: optional absolute weight cap) |
 
 CLI equivalents: `entry_signal_tool.py --cycle-day`, `--invested-pct` and `--force-new-tranche` (env is used when the flag is omitted). `portfolio_gex_field.py --once` is the same switch as `HEADLESS=1` or `GEX_ONCE=1`.
+
+### Per-portfolio signal folders
+
+Two portfolios run the same day (say minimum variance and quadratic utility) must not overwrite each other's `*_latest` files, so every script writes under a folder named after its portfolio, `<optimizer>_<YYYYMMDDTHHMMSS>` (the `run_ts` stamp, the same key as the entry state and the fills file):
+
+```
+/workspace/pipeline/
+  signals/
+    minimum_variance_20261008T112902/
+      fundamental_analysis.json  fundamental_analysis_<stamp>.json
+      portfolio_risk_score_leverage.json   portfolio_gex_field.json
+      portfolio_vix.json   entry_signal_tool.json   active_management.json
+      artifacts/   portfolio_gex_field.html  portfolio_gex_field_data.json
+                   portfolio_vix_report.html  reporte_fundamental.html
+      figures/     <script>_<figure>_<stamp>.html
+    quadratic_utility_20261008T121253/
+      ...same files...
+  minimum_variance_20261008T112902/    run_cycle summaries (CYCLE_SUMMARY_DIR, default /workspace/pipeline)
+    cycle_summary_latest.json, .txt, cycle_summary_<stamp>.json, .txt
+  quadratic_utility_20261008T121253/
+    ...
+  cycle_summary_latest.json, .txt      last cycle of any portfolio
+  state/
+    entry_state_<optimizer>_<stamp>.json          (unchanged)
+    weekly_last_run_<optimizer>_<stamp>.json
+  executions/fills_<optimizer>_<stamp>.json       (unchanged)
+```
+
+The folder is resolved in one place, `pipeline_io.resolve_signals_dir`, by every script and by `run_cycle`:
+
+1. `SIGNALS_DIR_EXACT` set: used as is (no subfolder).
+2. else `SIGNALS_PER_PORTFOLIO` is not `0` (the default): `<SIGNALS_OUT_DIR>/<optimizer>_<stamp>`.
+3. else the flat legacy folder `SIGNALS_OUT_DIR`.
+
+A portfolio without `optimizer` and `run_ts` (the hardcoded fallback) goes to `<SIGNALS_OUT_DIR>/hardcoded_fallback/`. With `SIGNALS_PER_PORTFOLIO=0` everything goes back to the old layout: flat signals, flat summaries, one `weekly_last_run.json`, figures in `<PIPELINE_DIR>/figures`, side reports next to where they used to be written, one `portfolio_risk_history.csv`. Each script prints `[signals] <script>: output dir = ...` first, and `run_cycle` prints it and stores it as `signals_dir` in the summary.
+
+Side outputs (`portfolio_gex_field.html` and `portfolio_gex_field_data.json`, `portfolio_vix_report.html`, `reporte_fundamental.html`) keep their file names and go to `<signals dir>/artifacts/`, unless the script is given an explicit path (`portfolio_vix.py --html`). If that folder cannot be created the report falls back to its old location with a warning. `entry_signal_history.csv` is per ticker and day, not per portfolio, and stays shared next to the script.
+
+**Executor agent (ARES):** read signals from `/workspace/pipeline/signals/<optimizer>_<stamp>/<script>.json` (for example `/workspace/pipeline/signals/minimum_variance_20261008T112902/entry_signal_tool.json`), where `<optimizer>_<stamp>` is built from the `optimizer` and `run_ts` of the portfolio file being executed (`fills_<optimizer>_<stamp>.json` uses the same key). `/workspace/pipeline/signals/<script>.json` is no longer written. Do not poll the top-level `cycle_summary_latest.json` for a given portfolio; read `<summary dir>/<optimizer>_<stamp>/cycle_summary_latest.json`, or its `signals_dir` field.
 
 ### Risk-free rate
 
@@ -291,7 +332,7 @@ Options scripts (`active_management`, `entry_signal_tool`, `portfolio_risk_score
 
 Typical reasons: `no US-listed options (exchange suffix .TO)`, `no option data returned` (sometimes with a detail in parentheses), and for the gamma field `no usable gamma field` or `no spot price returned`. A ticker that failed for another cause says so: `api error: ...` (Polygon still failing after the retries, e.g. HTTP 429 or 5xx) or `error: <Exception>: ...` (a code error), so it is not mistaken for a ticker without options. `portfolio_risk_score_leverage` also reports `no price history returned` (that ticker leaves the whole analysis) and `no polygon api key`. Other scripts omit `warnings` when they have nothing to flag. Existing envelope fields are unchanged.
 
-`load_portfolio` drops weights below `1e-6`, renormalizes the rest so the 6-decimal-place weights sum to 1, and returns those weights plus `portfolio_source`, `portfolio_run_ts` and `portfolio_optimizer`. `export_signals` writes `<script>.json` and `<script>_YYYYMMDDTHHMMSS.json` (America/Bogota). The write is atomic (`*.tmp` then `os.replace`). If the directory cannot be created or written, the script warns and continues. `NaN` / `±Inf` become JSON `null`; numpy and pandas values are converted.
+`load_portfolio` drops weights below `1e-6`, renormalizes the rest so the 6-decimal-place weights sum to 1, and returns those weights plus `portfolio_source`, `portfolio_run_ts` and `portfolio_optimizer`. `export_signals` writes `<script>.json` and `<script>_YYYYMMDDTHHMMSS.json` (America/Bogota) into the portfolio's signal folder (see [Per-portfolio signal folders](#per-portfolio-signal-folders)). The write is atomic (`*.tmp` then `os.replace`). If the directory cannot be created or written, the script warns and continues. `NaN` / `±Inf` become JSON `null`; numpy and pandas values are converted.
 
 Envelope:
 
@@ -313,7 +354,7 @@ Envelope:
 `data` by script:
 
 - **`entry_signal_tool`** — buys only, highest conviction first. `entries[]`: `order`, `ticker`, `action` (`"BUY"`), `target_weight`, `tranche_weight` (today's slice of the portfolio), `signal` (`high_conviction` ≥ 75, `medium_conviction` 40–75, `low_conviction`, or `cycle_close` on a day-5 buy), `score`, `reason`. Tickers with no buy today are `waiting[]` (`ticker`, `score`, `reason`). Also `signal` (`new_tranche`, or `already_prepared_today` — see [Same-day lock](#same-day-lock)), `cycle_day`, `cycle`, and `excluded`.
-- **`active_management`** — `rebalances[]`: `ticker`, `action` (`BUY` / `SELL` / `HOLD` from the sign of `target_weight - current_weight`; `CASH` is included, and `BUY` there means a larger cash reserve), `current_weight`, `target_weight`, `delta_weight`, `reason`, `tactical_action` (`AUMENTAR`, `RECORTAR`, `LIQUIDAR`, `MANTENER`, `RESERVA_TACTICA`). `regime` is `normal`, `insufficient_history`, `stress`, `diversification_collapse`, or `stress+diversification_collapse`. Also `regime_state`, `regime_alerts`, `vol_portfolio`, `diversification_ratio`, `risk_free_rate`, and `excluded`. `portfolio_risk_history.csv` stays an observation log of volatility and diversification. It is not an execution ledger and is not gated on fills.
+- **`active_management`** — `rebalances[]`: `ticker`, `action` (`BUY` / `SELL` / `HOLD` from the sign of `target_weight - current_weight`; `CASH` is included, and `BUY` there means a larger cash reserve), `current_weight`, `target_weight`, `delta_weight`, `reason`, `tactical_action` (`AUMENTAR`, `RECORTAR`, `LIQUIDAR`, `MANTENER`, `RESERVA_TACTICA`). `regime` is `normal`, `insufficient_history`, `stress`, `diversification_collapse`, or `stress+diversification_collapse`. Also `regime_state`, `regime_alerts`, `vol_portfolio`, `diversification_ratio`, `risk_free_rate`, and `excluded`. `portfolio_risk_history_<optimizer>.csv` stays an observation log of volatility and diversification. It is not an execution ledger and is not gated on fills.
 - **`portfolio_risk_score_leverage`** — `target_leverage` and `risk_score` are the weight-weighted means of the per-asset leverage (2x–5x) and risk score (0–100). `components`: `score_weights` (`hv`, `cvar`, `iv`, `gex_pcr`), `leverage_min`, `leverage_max`, `portfolio_iv`, `portfolio_iv_coverage` (`tickers_with_iv`, `tickers_without_iv`, `weight_coverage`), and `by_ticker[]` (`ticker`, `weight`, `risk_score`, `leverage`, `effective_exposure`, `hv`, `cvar`, `iv`, `gex_total`, `pcr_oi`). Also `risk_free_rate` and `excluded`. `portfolio_iv` is the weighted ATM IV over the tickers that have one (weights renormalised); a ticker without IV is listed in `portfolio_iv_coverage` and in `warnings` instead of turning `portfolio_iv` into null. The chain's spot is Polygon's `underlying_asset.price`; the local price is a fallback only for tier `native`. For an `adr` / `proxy` symbol with no Polygon spot (options-only plan, no stock snapshots) the spot is the yfinance last close of the US symbol itself (`RY`, never `RY.TO` in CAD), then the put-call-parity forward of the same chain (`portfolio_vix.CBOEVarianceEngine.implied_forward`, discounted). Polygon stock endpoints are never called. The log names the source used.
 - **`portfolio_gex_field`** — one file per refresh, including the single `--once` run. Scalars: `macro_y`, `potential_z`, `grad_x`, `grad_y`, `grad_magnitude`, `n_holdings`. `holdings[]`: `ticker`, `weight`, `price`, `expected_move`, `total_gex`, `gex_at_spot_grid`, `regime`, `regime_basis`, `regime_by_zero_gamma`, `regime_conflict`, `zero_gamma_level`, `zero_gamma_distance_pct` ((spot − level) / spot), `zero_gamma_crossings`, `zero_gamma_below`, `zero_gamma_above`, `zero_gamma_status` (`ok`, `no_crossing_in_grid`, `no_valid_contracts`), `zero_gamma_grid_sign`, `zero_gamma_skipped`, `gex_profile_grid` (31 `[spot, gex]` points of the ±30% profile), `strike_balance_level`, `strike_balance_crossings` (sign changes of the cumulative GEX in the window), `gamma_flip` (**deprecated**, equal to `zero_gamma_level`; to be removed in the next release), `call_wall`, `put_wall`, `expiry_window_days`, `expirations` (structural expiries used), `expiry_fallback`. Also `risk_free_rate` and `excluded`.
 - **`portfolio_vix`** — `vix_portfolio`, `sigma_portfolio_30d`, `source`, `vol_method`, `corr_method`, `risk_free_rate`, `metrics` (the engine scalars: `VIX_portfolio`, `sigma_portfolio_30d`, `VIX_medio_ponderado`, `ratio_diversificacion`, `beneficio_diversificacion_pts`, `correlacion_implicita_media`) and `holdings[]` (`ticker`, `weight`, `vix`, `sigma_30d`, `mcr`, `ctr`, `ctr_vix_pts`, `ctr_pct`). Also `excluded`. `--tickers` / `--weights` and `EQUAL_WEIGHTS` replace `weights_used`. When nothing can be valued, `vix_portfolio` is null and `holdings` is empty; the process still writes the signal.

@@ -15,6 +15,7 @@ from gex_utils import ZERO_GAMMA_DEF, ZERO_GAMMA_DEF_LEGACY, zero_gamma_profile
 from polygon_client import NO_OPTION_DATA, NoOptionData, PolygonClient, failure_reason
 from pipeline_io import (
     MIN_OPTION_DAYS,
+    announce_signals_dir,
     apply_entry_fills,
     cycle_today,
     entry_state_path,
@@ -1205,6 +1206,7 @@ def _truthy(valor):
 
 
 def main(argv=None):
+    announce_signals_dir("entry_signal_tool", _PORTFOLIO_META)
     args = parse_entry_args(argv)
     cycle_day = args.cycle_day if args.cycle_day is not None else os.environ.get("ENTRY_CYCLE_DAY")
     invested = args.invested_pct if args.invested_pct is not None else os.environ.get("ENTRY_INVESTED_PCT")
@@ -1251,7 +1253,7 @@ def main(argv=None):
                 prepared_date=cycle_today().isoformat() if produjo_tramo else None,
                 tranche={key: data[key] for key in ("entries", "waiting", "cycle_day", "cycle")},
             ))
-    show_or_save(graficar_resumen(resumen), "entry_signal_tool", "resumen")
+    show_or_save(graficar_resumen(resumen), "entry_signal_tool", "resumen", portfolio=_PORTFOLIO_META)
 
 
 if __name__ == "__main__":

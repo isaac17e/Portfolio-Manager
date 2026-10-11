@@ -10,8 +10,9 @@ Every script hands its figures to ``show_or_save`` so the decision lives here:
   DISPLAY / WAYLAND_DISPLAY) or the run is not interactive (stdin or stdout
   not a terminal, outside IPython / Jupyter).
 
-The HTML goes to ``FIGURES_DIR``, else ``<pipeline dir>/figures`` (see
-``pipeline_io.pipeline_dir``), as ``<script>_<name>_<YYYYMMDDTHHMMSS>.html``.
+The HTML goes to ``FIGURES_DIR``, else ``<signals dir>/figures`` (the portfolio's
+own folder, see ``pipeline_io.resolve_signals_dir``; ``<pipeline dir>/figures`` in
+the flat legacy layout), as ``<script>_<name>_<YYYYMMDDTHHMMSS>.html``.
 ``fig.write_html`` needs no kaleido.
 """
 
@@ -21,7 +22,7 @@ import os
 import sys
 from datetime import datetime
 
-from pipeline_io import _file_token, pipeline_dir
+from pipeline_io import _file_token, default_figures_dir
 
 HEADLESS_ENV = "HEADLESS"
 FIGURES_DIR_ENV = "FIGURES_DIR"
@@ -56,29 +57,30 @@ def headless(env=None, interactive=None) -> bool:
     return not (_interactive() if interactive is None else interactive)
 
 
-def figures_dir(env=None) -> str:
+def figures_dir(env=None, portfolio=None) -> str:
     env = os.environ if env is None else env
-    return env.get(FIGURES_DIR_ENV) or os.path.join(pipeline_dir(), "figures")
+    return env.get(FIGURES_DIR_ENV) or default_figures_dir(portfolio, env)
 
 
-def figure_path(script: str, name: str = "", env=None, now=None) -> str:
+def figure_path(script: str, name: str = "", env=None, now=None, portfolio=None) -> str:
     stamp = (now or datetime.now()).strftime("%Y%m%dT%H%M%S")
     parts = [_file_token(script)] + ([_file_token(name)] if name else []) + [stamp]
-    return os.path.join(figures_dir(env), "_".join(parts) + ".html")
+    return os.path.join(figures_dir(env, portfolio), "_".join(parts) + ".html")
 
 
-def show_or_save(fig, script: str, name: str = "", env=None) -> str | None:
+def show_or_save(fig, script: str, name: str = "", env=None, portfolio=None) -> str | None:
     """``fig.show()``, or in headless mode write ``fig`` to HTML and return the path.
 
-    A figure that cannot be written is reported and skipped: a chart must not
-    fail the step whose signal is already exported.
+    ``portfolio`` is the script's portfolio meta; it picks the per-portfolio
+    figures folder. A figure that cannot be written is reported and skipped: a
+    chart must not fail the step whose signal is already exported.
     """
     if fig is None:
         return None
     if not headless(env):
         fig.show()
         return None
-    path = figure_path(script, name, env)
+    path = figure_path(script, name, env, portfolio=portfolio)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         fig.write_html(path, include_plotlyjs="cdn", full_html=True)

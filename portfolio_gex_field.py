@@ -19,7 +19,8 @@ from scipy.interpolate import interp1d
 from scipy.ndimage import gaussian_filter1d
 from datetime import datetime, timedelta
 from pipeline_io import (
-    MIN_OPTION_DAYS, export_signals, load_portfolio, resolve_horizon, resolve_risk_free_rate,
+    MIN_OPTION_DAYS, announce_signals_dir, artifact_path, export_signals, load_portfolio,
+    prepare_artifact_path, resolve_horizon, resolve_risk_free_rate,
 )
 from gex_utils import downsample_profile, gamma_flip_crossings, gamma_flip_level, zero_gamma_profile
 from polygon_client import NO_OPTION_DATA, PolygonClient, PolygonError, failure_reason
@@ -1567,15 +1568,28 @@ def run_once():
     }
 
 
+def _resolve_output(output_path):
+    """``(dir, filename)`` of the HTML shell; the data JSON goes next to it.
+
+    The default name lands in ``<signals dir>/artifacts`` (the portfolio's own
+    folder), or in the working directory in the flat legacy layout. An explicit
+    ``output_path`` is used as given. The folder is created.
+    """
+    if output_path == OUTPUT_HTML_PATH:
+        output_path = artifact_path(_PORTFOLIO_META, OUTPUT_HTML_PATH, os.getcwd())
+    output_path = prepare_artifact_path(output_path, os.getcwd())
+    return os.path.dirname(os.path.abspath(output_path)), os.path.basename(output_path)
+
+
 def run_live(refresh_seconds=REFRESH_SECONDS, max_iterations=MAX_ITERATIONS,
              rotate_camera=ROTATE_CAMERA, output_path=OUTPUT_HTML_PATH,
              open_browser=OPEN_BROWSER_ON_START):
+    announce_signals_dir("portfolio_gex_field", _PORTFOLIO_META)
     iteration = 0
     state_history = []
     shell_escrito = False
 
-    output_dir = os.path.dirname(os.path.abspath(output_path)) or "."
-    output_filename = os.path.basename(output_path)
+    output_dir, output_filename = _resolve_output(output_path)
     server_port = start_local_file_server(output_dir, LOCAL_SERVER_PORT)
     page_url = f"http://127.0.0.1:{server_port}/{output_filename}"
 
@@ -1618,7 +1632,7 @@ def run_live(refresh_seconds=REFRESH_SECONDS, max_iterations=MAX_ITERATIONS,
                     shell_escrito = True
                     # El perfil de zero-gamma se muestra una vez, no en cada refresco.
                     show_or_save(plot_zero_gamma_profiles(result["portfolio_data"]),
-                                 "portfolio_gex_field", "zero_gamma")
+                                 "portfolio_gex_field", "zero_gamma", portfolio=_PORTFOLIO_META)
                     if open_browser:
                         webbrowser.open(page_url)
         else:
@@ -1642,6 +1656,7 @@ def run_live(refresh_seconds=REFRESH_SECONDS, max_iterations=MAX_ITERATIONS,
 
 def run_headless(output_path=OUTPUT_HTML_PATH):
     """Un calculo, HTML + JSON, sin navegador ni servidor. Modo pipeline."""
+    announce_signals_dir("portfolio_gex_field", _PORTFOLIO_META)
     print("Modo pipeline (--once): un calculo, sin navegador.")
     result = run_once()
     excluded = list(_LAST_EXCLUDED)
@@ -1655,10 +1670,10 @@ def run_headless(output_path=OUTPUT_HTML_PATH):
     if result is None:
         print("❌ No se escribió el HTML: ningún holding tiene datos válidos.")
         return
-    show_or_save(plot_zero_gamma_profiles(result["portfolio_data"]), "portfolio_gex_field", "zero_gamma")
+    show_or_save(plot_zero_gamma_profiles(result["portfolio_data"]), "portfolio_gex_field", "zero_gamma",
+                 portfolio=_PORTFOLIO_META)
 
-    output_dir = os.path.dirname(os.path.abspath(output_path)) or "."
-    output_filename = os.path.basename(output_path)
+    output_dir, output_filename = _resolve_output(output_path)
     fig = plot_3d_portfolio_field(
         result["X"], result["Y"], result["Z"],
         result["current_state"], result["reference_lines"],

@@ -21,10 +21,22 @@ management steps. Without a horizon in the portfolio the variable is unset and
 each step keeps its own default.
 
 Each step is a subprocess of this interpreter (``sys.executable``). Stdin is
-``DEVNULL``. After a step exits 0, ``<SIGNALS_OUT_DIR>/<script>.json`` must
+``DEVNULL``. After a step exits 0, ``<signals dir>/<script>.json`` must
 have been written during that step, with ``portfolio_source`` equal to the
 portfolio path and ``portfolio_run_ts`` equal to the portfolio ``run_ts``.
 ``hardcoded_fallback`` is a failure. The first failure stops the cycle.
+
+Per-portfolio layout: the signals dir is computed once from the portfolio file
+(``pipeline_io.resolve_signals_dir``): ``<SIGNALS_OUT_DIR>/<optimizer>_<stamp>``
+by default, so two portfolios never overwrite each other's ``*_latest`` files.
+It is passed to every step as ``SIGNALS_DIR_EXACT`` (``SIGNALS_OUT_DIR`` stays
+the base, which anchors ``PIPELINE_DIR``). ``SIGNALS_DIR_EXACT`` in the
+environment overrides it; ``SIGNALS_PER_PORTFOLIO=0`` restores the flat layout.
+Summaries go to ``<summary dir>/<optimizer>_<stamp>/cycle_summary_*`` (plus a
+top-level ``cycle_summary_latest.json/.txt`` copy that names the last cycle of any
+portfolio), and the weekly state to
+``state/weekly_last_run_<optimizer>_<stamp>.json``, unless ``--weekly-state`` /
+``WEEKLY_STATE_FILE`` give one file.
 
 Exit codes:
     0  success, not due (weekly, or daily on a non-trading day), skipped
@@ -58,6 +70,7 @@ DEFAULT_PORTFOLIO_FILE = "/workspace/pipeline/portfolio/portfolio_latest.json"
 DEFAULT_SIGNALS_DIR = "/workspace/pipeline/signals"
 DEFAULT_SUMMARY_DIR = "/workspace/pipeline"
 DEFAULT_WEEKLY_STATE = "/workspace/pipeline/state/weekly_last_run.json"
+WEEKLY_STATE_DIR = os.path.dirname(DEFAULT_WEEKLY_STATE)
 
 DAILY_STEPS = [
     "fundamental_analysis",
@@ -182,18 +195,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--signals-dir",
         default=None,
-        help=f"signal output directory (env SIGNALS_OUT_DIR; default {DEFAULT_SIGNALS_DIR})",
+        help="signal base directory (env SIGNALS_OUT_DIR; default "
+        f"{DEFAULT_SIGNALS_DIR}); signals go to <base>/<optimizer>_<stamp>/ "
+        "unless SIGNALS_DIR_EXACT is set or SIGNALS_PER_PORTFOLIO=0",
     )
     parser.add_argument(
         "--summary-dir",
         default=None,
-        help=f"cycle summary directory (env CYCLE_SUMMARY_DIR; default {DEFAULT_SUMMARY_DIR})",
+        help="cycle summary base directory (env CYCLE_SUMMARY_DIR; default "
+        f"{DEFAULT_SUMMARY_DIR}); summaries go to <dir>/<optimizer>_<stamp>/",
     )
     parser.add_argument(
         "--weekly-state",
         default=None,
-        help="weekly last-success file "
-        f"(env WEEKLY_STATE_FILE; default {DEFAULT_WEEKLY_STATE})",
+        help="one weekly last-success file for every portfolio (env WEEKLY_STATE_FILE; "
+        f"default {WEEKLY_STATE_DIR}/weekly_last_run_<optimizer>_<stamp>.json)",
     )
     parser.add_argument(
         "--timeout",
@@ -421,6 +437,51 @@ def step_horizon_days(script: str, portfolio: dict, as_of: date) -> int | None:
     return pipeline_io.portfolio_horizon_days(portfolio, today=as_of, mode=mode)
 
 
+def resolve_cycle_signals(
+    portfolio: dict, signals_base: str, env: dict | None = None,
+) -> str:
+    """Signals dir of this cycle: ``pipeline_io.resolve_signals_dir`` for ``portfolio``
+    with ``signals_base`` as ``SIGNALS_OUT_DIR``. Computed once and used by every step."""
+    env = dict(os.environ if env is None else env)
+    env["SIGNALS_OUT_DIR"] = signals_base
+    return pipeline_io.resolve_signals_dir(portfolio, env)
+
+
+def summary_portfolio_dir(summary_dir: str, summary: dict) -> str | None:
+    """``<summary_dir>/<optimizer>_<stamp>``, or None for the flat layout or when
+    the portfolio could not be read (no optimizer / run_ts)."""
+    if not pipeline_io.per_portfolio_enabled():
+        return None
+    portfolio = summary.get("portfolio") or {}
+    key = pipeline_io.portfolio_key({
+        "portfolio_optimizer": portfolio.get("optimizer"),
+        "portfolio_run_ts": portfolio.get("run_ts"),
+    })
+    return os.path.join(summary_dir, key) if key else None
+
+
+def summary_latest_path(summary_dir: str, summary: dict) -> str:
+    return os.path.join(
+        summary_portfolio_dir(summary_dir, summary) or summary_dir, "cycle_summary_latest.json",
+    )
+
+
+def resolve_weekly_state_path(flag_value: str | None, portfolio: dict) -> str:
+    """The ``--weekly-state`` / ``WEEKLY_STATE_FILE`` file as given; otherwise
+    ``state/weekly_last_run_<optimizer>_<stamp>.json``, so the weekly due check is per
+    portfolio. ``SIGNALS_PER_PORTFOLIO=0``: the single legacy ``weekly_last_run.json``."""
+    explicit = _resolve_path(flag_value, "WEEKLY_STATE_FILE", "")
+    if explicit:
+        return explicit
+    key = pipeline_io.portfolio_key({
+        "portfolio_optimizer": portfolio.get("optimizer"),
+        "portfolio_run_ts": portfolio.get("run_ts"),
+    })
+    if key and pipeline_io.per_portfolio_enabled():
+        return os.path.join(WEEKLY_STATE_DIR, f"weekly_last_run_{key}.json")
+    return DEFAULT_WEEKLY_STATE
+
+
 def step_environment(
     portfolio_path: str,
     signals_dir: str,
@@ -428,8 +489,13 @@ def step_environment(
     as_of: date | None = None,
     force_new_tranche: bool = False,
     horizon_days: int | None = None,
+    signals_base: str | None = None,
 ) -> dict:
     """Parent environment plus the portfolio, signal locations and cycle date.
+
+    ``signals_dir`` is the resolved signals folder of the portfolio; it goes out
+    as ``SIGNALS_DIR_EXACT``. ``SIGNALS_OUT_DIR`` is ``signals_base`` (default
+    ``signals_dir``): it anchors ``PIPELINE_DIR`` and the entry state.
 
     Everything else (``RISK_FREE_RATE``, ``ENTRY_CYCLE_DAY``, ...) is inherited
     unchanged. ``CYCLE_DATE`` makes the steps use the same day as ``--date``.
@@ -438,7 +504,8 @@ def step_environment(
     """
     env = os.environ.copy()
     env["PORTFOLIO_FILE"] = portfolio_path
-    env["SIGNALS_OUT_DIR"] = signals_dir
+    env["SIGNALS_OUT_DIR"] = signals_base or signals_dir
+    env[pipeline_io.SIGNALS_DIR_EXACT_ENV] = signals_dir
     env["PYTHONUNBUFFERED"] = "1"
     if horizon_days is not None:
         env[pipeline_io.HORIZON_ENV] = str(int(horizon_days))
@@ -793,7 +860,10 @@ def run_steps(
     timeout: float,
     as_of: date | None = None,
     force_new_tranche: bool = False,
+    signals_base: str | None = None,
 ) -> dict:
+    """Run ``steps`` in order. ``signals_dir`` is where each step writes and where
+    its ``<script>.json`` is verified (see ``step_environment`` for ``signals_base``)."""
     records = []
     failed = None
     scalars: dict = {}
@@ -814,7 +884,7 @@ def run_steps(
             command,
             step_environment(
                 portfolio["path"], signals_dir, script, as_of, force_new_tranche,
-                horizon_days,
+                horizon_days, signals_base,
             ),
             timeout,
         )
@@ -897,6 +967,7 @@ def make_summary(
     not_due_reason: str | None = None,
     message: str | None = None,
     run_ts: datetime | None = None,
+    signals_dir: str | None = None,
 ) -> dict:
     stamp = run_ts or _now_bogota()
     return {
@@ -907,6 +978,7 @@ def make_summary(
         "as_of_date": as_of.isoformat(),
         "forced": bool(forced),
         "portfolio": _portfolio_view(portfolio),
+        "signals_dir": signals_dir,
         "failing_step": failing_step,
         "not_due_reason": not_due_reason,
         "message": message,
@@ -944,6 +1016,7 @@ def render_summary_text(summary: dict) -> str:
         f"optimizer: {portfolio.get('optimizer')}",
         f"portfolio_run_ts: {portfolio.get('run_ts')}",
         f"horizon_end: {portfolio.get('horizon_end')}",
+        f"signals_dir: {summary.get('signals_dir')}",
         "",
         "steps:",
     ]
@@ -1018,7 +1091,14 @@ def render_summary_text(summary: dict) -> str:
 
 
 def emit_summary(summary_dir: str, summary: dict) -> None:
-    os.makedirs(summary_dir, exist_ok=True)
+    """Write ``cycle_summary_latest`` and a timestamped copy, as .json and .txt.
+
+    Into ``<summary_dir>/<optimizer>_<stamp>/`` (see ``summary_portfolio_dir``),
+    plus a top-level ``cycle_summary_latest.json/.txt`` copy: the last cycle of any
+    portfolio, self-describing through its ``portfolio`` field. Without a portfolio
+    folder (flat layout, or an unreadable portfolio file) everything goes to
+    ``summary_dir``.
+    """
     run_at = datetime.fromisoformat(summary["run_ts"])
     stamp = run_at.strftime("%Y%m%dT%H%M%S")
     body = json.dumps(_json_safe(summary), indent=2, ensure_ascii=False, allow_nan=False) + "\n"
@@ -1030,8 +1110,14 @@ def emit_summary(summary_dir: str, summary: dict) -> None:
         f"cycle_summary_{stamp}.txt",
     )
     payloads = (body, body, text, text)
-    for name, payload in zip(names, payloads):
-        atomic_write(os.path.join(summary_dir, name), payload)
+    folder = summary_portfolio_dir(summary_dir, summary)
+    targets = [(folder or summary_dir, names, payloads)]
+    if folder:
+        targets.append((summary_dir, (names[0], names[2]), (body, text)))
+    for directory, dir_names, dir_payloads in targets:
+        os.makedirs(directory, exist_ok=True)
+        for name, payload in zip(dir_names, dir_payloads):
+            atomic_write(os.path.join(directory, name), payload)
 
 
 def write_weekly_state(path: str, as_of: date, portfolio: dict, run_ts: str) -> None:
@@ -1055,7 +1141,7 @@ def _preview_steps(steps: list[str]) -> list[dict]:
     return [_blank_step(script) for script in steps]
 
 
-def _print_plan(mode: str, as_of: date, portfolio: dict, steps: list[str], signals_dir: str, summary_dir: str, timeout: float, warnings: list[str], force_new_tranche: bool = False) -> None:
+def _print_plan(mode: str, as_of: date, portfolio: dict, steps: list[str], signals_dir: str, summary_dir: str, timeout: float, warnings: list[str], force_new_tranche: bool = False, signals_base: str | None = None) -> None:
     print(
         f"dry-run mode={mode} as_of={as_of.isoformat()} "
         f"optimizer={portfolio.get('optimizer')} "
@@ -1073,12 +1159,13 @@ def _print_plan(mode: str, as_of: date, portfolio: dict, steps: list[str], signa
         command = build_command(script)
         env = step_environment(
             portfolio["path"], signals_dir, script, as_of, force_new_tranche,
-            step_horizon_days(script, portfolio, as_of),
+            step_horizon_days(script, portfolio, as_of), signals_base,
         )
         print(f"  {index} {script}")
         print("    " + " ".join(command))
         extra = (
             f"PORTFOLIO_FILE={env['PORTFOLIO_FILE']} SIGNALS_OUT_DIR={env['SIGNALS_OUT_DIR']} "
+            f"{pipeline_io.SIGNALS_DIR_EXACT_ENV}={env[pipeline_io.SIGNALS_DIR_EXACT_ENV]} "
             f"CYCLE_DATE={env['CYCLE_DATE']}"
         )
         if env.get(pipeline_io.HORIZON_ENV):
@@ -1106,6 +1193,7 @@ def _calendar_failure(
     steps: list[str],
     cycle_warnings: list[str],
     summary_dir: str,
+    signals_dir: str | None = None,
 ) -> int:
     message = str(exc)
     summary = make_summary(
@@ -1118,6 +1206,7 @@ def _calendar_failure(
         warnings=cycle_warnings,
         error=message,
         message=message,
+        signals_dir=signals_dir,
     )
     _emit_or_report(summary_dir, summary)
     print(message, file=sys.stderr)
@@ -1133,6 +1222,7 @@ def _not_due(
     cycle_warnings: list[str],
     summary_dir: str,
     reason: str | None,
+    signals_dir: str | None = None,
 ) -> int:
     message = f"not_due: {reason} ({as_of.isoformat()})"
     if args.dry_run:
@@ -1148,6 +1238,7 @@ def _not_due(
         warnings=cycle_warnings,
         not_due_reason=reason,
         message=message,
+        signals_dir=signals_dir,
     )
     _emit_or_report(summary_dir, summary)
     print(message)
@@ -1174,9 +1265,8 @@ def main(argv: list[str] | None = None) -> int:
     as_of = args.date or _today_bogota()
     mode = "weekly" if args.weekly else "daily"
     portfolio_path = os.path.abspath(args.portfolio)
-    signals_dir = _resolve_path(args.signals_dir, "SIGNALS_OUT_DIR", DEFAULT_SIGNALS_DIR)
+    signals_base = _resolve_path(args.signals_dir, "SIGNALS_OUT_DIR", DEFAULT_SIGNALS_DIR)
     summary_dir = _resolve_path(args.summary_dir, "CYCLE_SUMMARY_DIR", DEFAULT_SUMMARY_DIR)
-    state_path = _resolve_path(args.weekly_state, "WEEKLY_STATE_FILE", DEFAULT_WEEKLY_STATE)
     empty_portfolio = {
         "path": portfolio_path,
         "optimizer": None,
@@ -1202,6 +1292,9 @@ def main(argv: list[str] | None = None) -> int:
         print(message, file=sys.stderr)
         return 1
 
+    # One signals dir per cycle, shared by every step and by the validation below.
+    signals_dir = resolve_cycle_signals(portfolio, signals_base)
+    state_path = resolve_weekly_state_path(args.weekly_state, portfolio)
     cycle_warnings: list[str] = []
     if args.weekly:
         horizon = portfolio["horizon_end"]
@@ -1224,6 +1317,7 @@ def main(argv: list[str] | None = None) -> int:
                 steps=_preview_steps(steps),
                 warnings=[],
                 message=message,
+                signals_dir=signals_dir,
             )
             _emit_or_report(summary_dir, summary)
             print(message)
@@ -1237,12 +1331,14 @@ def main(argv: list[str] | None = None) -> int:
             except CalendarUnavailable as exc:
                 return _calendar_failure(
                     exc, mode, as_of, portfolio, steps, cycle_warnings, summary_dir,
+                    signals_dir,
                 )
             if state_warning:
                 cycle_warnings.append(state_warning)
             if not due:
                 return _not_due(
                     args, mode, as_of, portfolio, steps, cycle_warnings, summary_dir, reason,
+                    signals_dir,
                 )
     elif args.force:
         cycle_warnings.append("NYSE session check bypassed by --force")
@@ -1251,24 +1347,27 @@ def main(argv: list[str] | None = None) -> int:
             due, reason, close_warning = daily_due(as_of)
         except CalendarUnavailable as exc:
             return _calendar_failure(
-                exc, mode, as_of, portfolio, steps, cycle_warnings, summary_dir,
+                exc, mode, as_of, portfolio, steps, cycle_warnings, summary_dir, signals_dir,
             )
         if close_warning:
             cycle_warnings.append(close_warning)
         if not due:
             return _not_due(
                 args, mode, as_of, portfolio, steps, cycle_warnings, summary_dir, reason,
+                signals_dir,
             )
 
     if args.dry_run:
         _print_plan(
             mode, as_of, portfolio, steps, signals_dir, summary_dir, timeout, cycle_warnings,
-            bool(args.force_new_tranche),
+            bool(args.force_new_tranche), signals_base,
         )
         return 0
 
+    print(f"[cycle] signals dir = {signals_dir}")
     outcome = run_steps(
         steps, portfolio, signals_dir, timeout, as_of, bool(args.force_new_tranche),
+        signals_base,
     )
     status = "success" if outcome["ok"] else "failed"
     message = "cycle success" if outcome["ok"] else outcome["error"]
@@ -1286,7 +1385,9 @@ def main(argv: list[str] | None = None) -> int:
         failing_step=outcome["failing_step"],
         error=None if outcome["ok"] else outcome["error"],
         message=message,
+        signals_dir=signals_dir,
     )
+    summary_path = summary_latest_path(summary_dir, summary)
     write_error = _emit_or_report(summary_dir, summary)
     if write_error:
         return 1
@@ -1306,13 +1407,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if not outcome["ok"]:
         print(outcome["error"], file=sys.stderr)
-        print(f"cycle failed; summary: {os.path.join(summary_dir, 'cycle_summary_latest.json')}", file=sys.stderr)
+        print(f"cycle failed; summary: {summary_path}", file=sys.stderr)
         return 1
 
-    print(
-        f"cycle success mode={mode} "
-        f"summary={os.path.join(summary_dir, 'cycle_summary_latest.json')}"
-    )
+    print(f"cycle success mode={mode} signals_dir={signals_dir} summary={summary_path}")
     return 0
 
 

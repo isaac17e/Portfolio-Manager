@@ -456,6 +456,9 @@ def _atomic_write(path: str, text: str) -> None:
 def export_signals(script: str, data, portfolio_meta, warnings=None) -> str | None:
     """Write ``<script>.json`` and a timestamped copy. Returns the latest path.
 
+    The directory is ``resolve_signals_dir(portfolio_meta)``: one subfolder per
+    portfolio by default (see that function for the env switches).
+
     Returns None, after a warning, when the directory cannot be created or
     written. Other export errors are also warned and swallowed so a portfolio
     run is never aborted by the signal file.
@@ -463,7 +466,7 @@ def export_signals(script: str, data, portfolio_meta, warnings=None) -> str | No
     ``warnings``, when not None, is written as a top-level array. Omit it to
     keep the original envelope (callers that have nothing to flag).
     """
-    out_dir = os.environ.get("SIGNALS_OUT_DIR", DEFAULT_SIGNALS_DIR)
+    out_dir = resolve_signals_dir(portfolio_meta)
     try:
         os.makedirs(out_dir, exist_ok=True)
         run_at = _now_bogota()
@@ -554,6 +557,116 @@ def portfolio_key(portfolio_meta) -> str | None:
     return f"{optimizer}_{stamp}"
 
 
+SIGNALS_DIR_EXACT_ENV = "SIGNALS_DIR_EXACT"
+SIGNALS_PER_PORTFOLIO_ENV = "SIGNALS_PER_PORTFOLIO"
+FALLBACK_SIGNALS_SUBDIR = "hardcoded_fallback"
+ARTIFACTS_SUBDIR = "artifacts"
+FIGURES_SUBDIR = "figures"
+_OFF_VALUES = {"0", "false", "no", "off"}
+
+
+def signals_base_dir(env=None) -> str:
+    """``SIGNALS_OUT_DIR``, else ``DEFAULT_SIGNALS_DIR``: the parent of the portfolio folders."""
+    env = os.environ if env is None else env
+    return env.get("SIGNALS_OUT_DIR") or DEFAULT_SIGNALS_DIR
+
+
+def per_portfolio_enabled(env=None) -> bool:
+    """False only when ``SIGNALS_PER_PORTFOLIO`` is ``0`` (also false/no/off)."""
+    env = os.environ if env is None else env
+    return str(env.get(SIGNALS_PER_PORTFOLIO_ENV, "1")).strip().lower() not in _OFF_VALUES
+
+
+def _portfolio_identity(portfolio) -> str | None:
+    """``portfolio_key`` for a loaded meta (``portfolio_optimizer`` / ``portfolio_run_ts``)
+    or a validated portfolio file (``optimizer`` / ``run_ts``)."""
+    p = portfolio or {}
+    return portfolio_key({
+        "portfolio_optimizer": p.get("portfolio_optimizer") or p.get("optimizer"),
+        "portfolio_run_ts": p.get("portfolio_run_ts") or p.get("run_ts"),
+    })
+
+
+def optimizer_history_path(portfolio, legacy_path: str, env=None) -> str:
+    """``<name>_<optimizer><ext>`` next to ``legacy_path``: a history that spans many
+    runs of the same optimizer (a new portfolio every cycle must not reset it), but
+    must not mix optimizers. ``legacy_path`` itself in the flat legacy layout or
+    when the portfolio has no optimizer."""
+    p = portfolio or {}
+    optimizer = _file_token(p.get("portfolio_optimizer") or p.get("optimizer") or "")
+    if not optimizer or not uses_portfolio_layout(env):
+        return legacy_path
+    root, ext = os.path.splitext(legacy_path)
+    return f"{root}_{optimizer}{ext}"
+
+
+def portfolio_signals_dir(portfolio, base: str | None = None) -> str:
+    """``<base>/<optimizer>_<YYYYMMDDTHHMMSS>``, or ``<base>/hardcoded_fallback``
+    when the portfolio has no optimizer and run_ts. ``base`` defaults to
+    ``signals_base_dir()``."""
+    base = signals_base_dir() if base is None else base
+    return os.path.join(base, _portfolio_identity(portfolio) or FALLBACK_SIGNALS_SUBDIR)
+
+
+def resolve_signals_dir(portfolio=None, env=None) -> str:
+    """Directory every script writes its signals to and run_cycle reads from.
+
+    1. ``SIGNALS_DIR_EXACT`` set: used as is.
+    2. else ``SIGNALS_PER_PORTFOLIO`` not ``0`` (the default): the
+       ``portfolio_signals_dir`` under ``SIGNALS_OUT_DIR``.
+    3. else the flat legacy folder ``SIGNALS_OUT_DIR``.
+    """
+    env = os.environ if env is None else env
+    exact = env.get(SIGNALS_DIR_EXACT_ENV)
+    if exact:
+        return exact
+    if per_portfolio_enabled(env):
+        return portfolio_signals_dir(portfolio, signals_base_dir(env))
+    return signals_base_dir(env)
+
+
+def uses_portfolio_layout(env=None) -> bool:
+    """True unless the flat legacy layout is in force (no exact dir and per-portfolio off)."""
+    env = os.environ if env is None else env
+    return bool(env.get(SIGNALS_DIR_EXACT_ENV)) or per_portfolio_enabled(env)
+
+
+def artifact_path(portfolio, filename: str, legacy_dir: str, env=None) -> str:
+    """Where a side output (HTML report, data JSON) of a script goes.
+
+    ``<signals dir>/artifacts/<filename>``; in the flat legacy layout
+    ``<legacy_dir>/<filename>``, where it used to be written."""
+    if uses_portfolio_layout(env):
+        return os.path.join(resolve_signals_dir(portfolio, env), ARTIFACTS_SUBDIR, filename)
+    return os.path.join(legacy_dir, filename)
+
+
+def prepare_artifact_path(path: str, fallback_dir: str) -> str:
+    """Create the folder of ``path``. When that fails (read-only volume, bad
+    permissions) warn and use ``fallback_dir`` instead: a report must never
+    stop the step, whose signal is the product."""
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        return path
+    except OSError as exc:
+        _warn(f"Could not create the folder for {path}: {exc}. Using {fallback_dir}.")
+        return os.path.join(fallback_dir, os.path.basename(path))
+
+
+def default_figures_dir(portfolio=None, env=None) -> str:
+    """``<signals dir>/figures``; ``<pipeline dir>/figures`` in the flat legacy layout."""
+    if uses_portfolio_layout(env):
+        return os.path.join(resolve_signals_dir(portfolio, env), FIGURES_SUBDIR)
+    return os.path.join(pipeline_dir(), FIGURES_SUBDIR)
+
+
+def announce_signals_dir(script: str, portfolio=None) -> str:
+    """Print and return the resolved signals directory; called at the start of a script."""
+    resolved = resolve_signals_dir(portfolio)
+    print(f"[signals] {script}: output dir = {resolved}")
+    return resolved
+
+
 def portfolio_fills_path(portfolio_meta, directory: str | None = None) -> str | None:
     """``<EXECUTIONS_DIR>/fills_<optimizer>_<run_ts stamp>.json``, or None."""
     key = portfolio_key(portfolio_meta)
@@ -572,12 +685,13 @@ def load_portfolio_fills(portfolio_meta, directory: str | None = None):
 
 
 def pipeline_dir() -> str:
-    """``PIPELINE_DIR``, else the parent of ``SIGNALS_OUT_DIR``."""
+    """``PIPELINE_DIR``, else the parent of the signals base (``SIGNALS_OUT_DIR``).
+
+    Derived from the base, never from the per-portfolio subfolder."""
     explicit = os.environ.get("PIPELINE_DIR")
     if explicit:
         return explicit
-    signals = os.environ.get("SIGNALS_OUT_DIR", DEFAULT_SIGNALS_DIR)
-    return os.path.dirname(os.path.abspath(signals))
+    return os.path.dirname(os.path.abspath(signals_base_dir()))
 
 
 def entry_state_path(portfolio_meta) -> str:

@@ -63,9 +63,26 @@ class ShowOrSaveTests(unittest.TestCase):
         with mock.patch.object(viz_utils.sys, "platform", "darwin"):
             self.assertFalse(viz_utils.headless({}, interactive=True))
 
-    def test_default_figures_dir_is_under_the_pipeline_dir(self):
+    def test_default_figures_dir_is_the_portfolio_signals_folder(self):
+        meta = {"portfolio_optimizer": "minimum_variance", "portfolio_run_ts": "2026-10-08T11:29:02-05:00"}
+        env = {"SIGNALS_OUT_DIR": self.tmp}
+        self.assertEqual(
+            viz_utils.figures_dir(env, meta),
+            os.path.join(self.tmp, "minimum_variance_20261008T112902", "figures"),
+        )
+        self.assertEqual(
+            viz_utils.figures_dir(env, None), os.path.join(self.tmp, "hardcoded_fallback", "figures"),
+        )
+        self.assertEqual(viz_utils.figures_dir({**env, "FIGURES_DIR": "/f"}, meta), "/f")
+        self.assertEqual(
+            viz_utils.figures_dir({**env, "SIGNALS_DIR_EXACT": "/x/mv"}, meta), "/x/mv/figures",
+        )
+
+    def test_flat_layout_keeps_figures_under_the_pipeline_dir(self):
         with mock.patch.dict(os.environ, {"PIPELINE_DIR": self.tmp}):
-            self.assertEqual(viz_utils.figures_dir({}), os.path.join(self.tmp, "figures"))
+            self.assertEqual(
+                viz_utils.figures_dir({"SIGNALS_PER_PORTFOLIO": "0"}), os.path.join(self.tmp, "figures"),
+            )
 
     def test_risk_report_saves_every_plot_headless(self):
         figs = {name: mock.MagicMock(name=name) for name in ("pcr", "gex", "lev")}
@@ -76,6 +93,7 @@ class ShowOrSaveTests(unittest.TestCase):
             "plot_loss_distribution": lambda *a: None,
             "plot_leverage_assignment": lambda *a: figs["lev"],
             "show_or_save": viz_utils.show_or_save,
+            "_PORTFOLIO_META": {},
         })
         expost = {"var_es": pd.DataFrame({"Activo": ["A"]}), "risk_contribution": None}
         with mock.patch.dict(os.environ, self.env), mock.patch("builtins.print"):

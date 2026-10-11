@@ -120,11 +120,12 @@ class ExportSignalsTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {"SIGNALS_OUT_DIR": tmp}):
                 with mock.patch.object(pipeline_io, "_now_bogota", return_value=frozen):
                     latest = pipeline_io.export_signals("entry_signal_tool", data, meta)
-            latest_path = Path(tmp) / "entry_signal_tool.json"
-            stamped_path = Path(tmp) / "entry_signal_tool_20261005T164012.json"
+            folder = Path(tmp) / "minimum_variance_20261005T164012"
+            latest_path = folder / "entry_signal_tool.json"
+            stamped_path = folder / "entry_signal_tool_20261005T164012.json"
             self.assertEqual(latest, str(latest_path))
             self.assertEqual(latest_path.read_text(encoding="utf-8"), stamped_path.read_text(encoding="utf-8"))
-            self.assertFalse(list(Path(tmp).glob("*.tmp")))
+            self.assertFalse(list(folder.glob("*.tmp")))
             raw = latest_path.read_text(encoding="utf-8")
             payload = json.loads(raw)
 

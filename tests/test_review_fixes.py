@@ -1,11 +1,14 @@
 """Regression tests for the code-review fixes (gamma flip, scoring, cash, exclusions)."""
 
 import ast
+import io
 import os
 import sys
+import tempfile
 import types
 import unittest
 import warnings
+from contextlib import redirect_stdout
 from unittest import mock
 
 import numpy as np
@@ -215,7 +218,10 @@ class GexLiveShellTests(unittest.TestCase):
                 mock.patch.object(gx, "plot_3d_portfolio_field", return_value=object()), \
                 mock.patch.object(gx, "write_portfolio_data_json"), \
                 mock.patch.object(gx, "write_portfolio_html_shell") as shell, \
-                mock.patch.object(gx.webbrowser, "open") as browser:
+                mock.patch.object(gx.webbrowser, "open") as browser, \
+                tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {"SIGNALS_OUT_DIR": tmp}), \
+                redirect_stdout(io.StringIO()):
             gx.run_live(refresh_seconds=0, max_iterations=2, open_browser=True)
         self.assertEqual(shell.call_count, 1)
         self.assertEqual(browser.call_count, 1)
