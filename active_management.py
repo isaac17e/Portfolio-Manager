@@ -1522,6 +1522,12 @@ def evaluar_regimen_riesgo(risk_report, hist_df):
         return None
 
     md = risk_report["metricas_despues"]
+    # Una segunda corrida del mismo dia recibe un historial que ya trae la fila
+    # de la primera: se descarta para no comparar hoy contra si mismo (misma
+    # fecha local que usa registrar_historial_riesgo al escribir).
+    if len(hist_df) and "fecha" in hist_df.columns:
+        dias = pd.to_datetime(hist_df["fecha"]).dt.date
+        hist_df = hist_df[dias != datetime.now().date()]
     n_obs = len(hist_df)
     resultado = {
         "n_observaciones": n_obs,

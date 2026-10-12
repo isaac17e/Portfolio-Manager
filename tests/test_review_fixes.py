@@ -249,5 +249,69 @@ class VixWeightsArgsTests(unittest.TestCase):
         self.assertEqual(cfg.weights, [0.6, 0.4])
 
 
+class RiskRegimeSameDayTests(unittest.TestCase):
+    """A second run on the same day must be compared against prior days only."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.am = _load_active_management()
+
+    def _report(self, vol, ratio):
+        return {"metricas_despues": {"vol_portafolio": vol, "ratio_diversificacion": ratio}}
+
+    def _hist(self, vols, ratios, dates):
+        return pd.DataFrame({"fecha": pd.to_datetime(dates),
+                             "vol_portafolio_despues": vols,
+                             "ratio_diversificacion_despues": ratios})
+
+    def _prior_days(self, n):
+        today = pd.Timestamp.now().normalize()
+        return [today - pd.Timedelta(days=n - i) for i in range(n)]
+
+    def test_todays_row_is_excluded_from_n_obs_and_percentiles(self):
+        n = self.am["risk_regime_min_history"]
+        prior = self._prior_days(n)
+        vols = [float(i) for i in range(n)]            # 0..n-1
+        ratios = [1.0 + i for i in range(n)]
+        hist = self._hist(vols + [999.0], ratios + [-999.0], prior + [pd.Timestamp.now()])
+        res = self.am["evaluar_regimen_riesgo"](self._report(n / 2, 1.0 + n / 2), hist)
+        self.assertEqual(res["n_observaciones"], n)
+        self.assertEqual(res["estado"], "OK")
+        # Today's 999 / -999 row would drag both percentiles if it were counted.
+        self.assertAlmostEqual(res["percentil_vol_portafolio"], 50.0)
+        self.assertAlmostEqual(res["percentil_ratio_diversificacion"], 50.0)
+
+    def test_only_todays_row_leaves_insufficient_history(self):
+        hist = self._hist([1.0], [2.0], [pd.Timestamp.now()])
+        res = self.am["evaluar_regimen_riesgo"](self._report(1.0, 2.0), hist)
+        self.assertEqual(res["n_observaciones"], 0)
+        self.assertEqual(res["estado"], "HISTORIAL_INSUFICIENTE")
+
+    def test_prior_days_are_still_counted(self):
+        hist = self._hist([1.0, 2.0], [2.0, 3.0], self._prior_days(2))
+        res = self.am["evaluar_regimen_riesgo"](self._report(1.5, 2.5), hist)
+        self.assertEqual(res["n_observaciones"], 2)
+
+    def test_empty_history_is_insufficient(self):
+        res = self.am["evaluar_regimen_riesgo"](self._report(1.0, 2.0), pd.DataFrame())
+        self.assertEqual(res["n_observaciones"], 0)
+        self.assertEqual(res["estado"], "HISTORIAL_INSUFICIENTE")
+
+    def test_registrar_still_keeps_one_row_per_day(self):
+        am = self.am
+        report = {"metricas_antes": {"vol_portafolio": 1.0, "ratio_diversificacion": 1.0},
+                  "metricas_despues": {"vol_portafolio": 2.0, "ratio_diversificacion": 3.0,
+                                       "vol_media_ponderada": 1.0, "beneficio_diversificacion_pts": 0.1,
+                                       "correlacion_implicita_media": 0.5, "exposicion_riesgosa": 0.9},
+                  "corr_detalle": {}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "hist.csv")
+            with mock.patch.dict(am, {"risk_history_path": path}):
+                first = am["registrar_historial_riesgo"](report, pd.DataFrame())
+                second = am["registrar_historial_riesgo"](report, first)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
