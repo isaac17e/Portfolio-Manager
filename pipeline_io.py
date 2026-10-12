@@ -36,6 +36,31 @@ the ``<stamp>`` of its name must be the portfolio's stamp. Only statuses
 
 ``load_portfolio_holdings`` combines both kinds into the NET held quantity per
 ticker (bought - sold, never below 0).
+
+Cumulative buy fills (format change, backward compatible)
+---------------------------------------------------------
+The entry runs over several days (tranches). The buy file of a portfolio is
+CUMULATIVE: ``write_portfolio_fills`` merges each new tranche into the existing
+``fills_<optimizer>_<stamp>.json`` instead of overwriting it. The top-level fields
+are those of the newest tranche (``signal_run_ts``, ``executed_ts``, ...), ``fills[]``
+holds the fills of EVERY tranche (deduplicated by ``ticker`` + ``action`` +
+``deal_id`` + ``fill_ts``), each carrying its own ``signal_run_ts`` (the tranche it
+confirms), and ``tranches[]`` lists ``{"signal_run_ts", "executed_ts"}`` oldest
+first. A single-day file written the old way is still valid: its fills have no
+per-fill ``signal_run_ts`` and count as belonging to the file's ``signal_run_ts``.
+
+The reader (``load_portfolio_fill_docs``) does not rely on the writer: net holdings
+add up the fills of ALL ``fills_<optimizer>_<stamp>*.json`` / ``*.bak`` files of the
+portfolio (a day-1 file that was overwritten and kept as ``.bak`` still counts), with
+the same dedupe, so a fill present in two files counts once.
+
+Entry phase (days 1..5 of a portfolio)
+--------------------------------------
+``entry_phase_info`` counts NYSE sessions from day 1 of the portfolio's entry
+(``entry_start_date`` in the entry state file; older state files fall back to the
+earliest fill date, then the portfolio ``run_ts`` date). During days 1..5
+``drawdown_rotation`` only PAUSES (see ``load_pause_mark``) and ``run_cycle --weekly``
+skips ``active_management``.
 """
 
 from __future__ import annotations
@@ -717,6 +742,136 @@ def load_portfolio_fills(portfolio_meta, directory: str | None = None):
     return _read_fills(path)
 
 
+_FILL_SEPARATORS = "._-"
+
+
+def _fills_candidates(portfolio_meta, directory: str | None = None) -> list[str]:
+    """Paths of every buy-fills file of the portfolio: ``fills_<key>.json`` first, then
+    ``fills_<key>[._-]*.json`` and ``fills_<key>*.bak*`` (oldest name first)."""
+    key = portfolio_key(portfolio_meta)
+    if key is None:
+        return []
+    directory = executions_dir() if directory is None else directory
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    head = f"fills_{key}"
+    main, others = [], []
+    for name in names:
+        if not name.startswith(head):
+            continue
+        rest = name[len(head):]
+        if rest == ".json":
+            bucket = main
+        elif rest and rest[0] in _FILL_SEPARATORS and (rest.endswith(".json") or ".bak" in rest):
+            bucket = others
+        else:
+            continue
+        path = os.path.join(directory, name)
+        if os.path.isfile(path):
+            bucket.append(path)
+    return main + others
+
+
+def load_portfolio_fill_docs(portfolio_meta, directory: str | None = None) -> list[dict]:
+    """Every readable buy-fills document of this portfolio (see ``_fills_candidates``).
+    Never raises; unreadable files are warned about and skipped."""
+    docs = []
+    for path in _fills_candidates(portfolio_meta, directory):
+        doc = _read_fills(path)
+        if doc is not None:
+            docs.append(doc)
+    return docs
+
+
+def _fill_key(fill: dict, default_side: str = "BUY"):
+    """Identity of a fill: ``(ticker, side, deal_id, fill_ts)`` with a ``deal_id``,
+    otherwise every economic field (so two files holding the same fill agree)."""
+    ticker = str(fill.get("ticker") or "").strip()
+    side = _fill_side(fill, default_side)
+    deal_id = fill.get("deal_id")
+    if deal_id:
+        return (ticker, side, str(deal_id), str(fill.get("fill_ts") or ""))
+    return (ticker, side, None, str(fill.get("fill_ts") or ""),
+            _as_float(fill.get("filled_qty")), _as_float(fill.get("filled_weight")),
+            _as_float(fill.get("price")), str(fill.get("signal_run_ts") or ""))
+
+
+def _stamped_fills(doc) -> list[dict]:
+    """Fills of a buy document, each with the ``signal_run_ts`` of its tranche."""
+    signal_run_ts = (doc or {}).get("signal_run_ts")
+    out = []
+    for fill in (doc or {}).get("fills") or []:
+        if not isinstance(fill, dict):
+            continue
+        fill = dict(fill)
+        if signal_run_ts and not fill.get("signal_run_ts"):
+            fill["signal_run_ts"] = signal_run_ts
+        out.append(fill)
+    return out
+
+
+def accumulate_fills(existing, new) -> dict:
+    """Merge a new tranche document into the cumulative buy-fills document.
+
+    ``existing`` is the current file (or None), ``new`` the tranche just executed.
+    Top-level fields come from ``new``; ``fills`` is every fill of both, deduplicated
+    by ``_fill_key`` (a fill that the new document repeats from the file is not
+    added again), each stamped with its own ``signal_run_ts``; ``tranches`` lists the
+    tranches seen, oldest first. Neither argument is modified.
+    """
+    new = dict(new or {})
+    fills, seen = [], set()
+    for fill in _stamped_fills(existing) + _stamped_fills(new):
+        key = _fill_key(fill)
+        if key in seen:
+            continue
+        seen.add(key)
+        fills.append(fill)
+    tranches = []
+    for doc in (existing, new):
+        for tranche in (doc or {}).get("tranches") or []:
+            if isinstance(tranche, dict) and tranche not in tranches:
+                tranches.append(tranche)
+        if doc and doc.get("signal_run_ts"):
+            tranche = {"signal_run_ts": doc["signal_run_ts"], "executed_ts": doc.get("executed_ts")}
+            if not any(t.get("signal_run_ts") == tranche["signal_run_ts"] for t in tranches):
+                tranches.append(tranche)
+    merged = dict(existing or {})
+    merged.update(new)
+    merged["schema_version"] = SCHEMA_VERSION
+    merged["fills"] = fills
+    merged["tranches"] = tranches
+    return merged
+
+
+def write_portfolio_fills(portfolio_meta, payload, directory: str | None = None) -> str | None:
+    """Append a tranche to ``fills_<optimizer>_<stamp>.json`` (never overwrite history).
+
+    The history comes from the existing file and from every other fills file / backup
+    of the portfolio, so a file that an older writer already overwrote is rebuilt from
+    its ``.bak``. Returns the path, or None (after a warning) without a portfolio key
+    or when it cannot be written.
+    """
+    path = portfolio_fills_path(portfolio_meta, directory)
+    if path is None:
+        _warn("Cannot write fills: the portfolio has no optimizer / run_ts.")
+        return None
+    history = None
+    for doc in load_portfolio_fill_docs(portfolio_meta, directory):
+        history = accumulate_fills(history, doc)
+    merged = accumulate_fills(history, payload)
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        _atomic_write(path, json.dumps(to_jsonable(merged), indent=2, ensure_ascii=False,
+                                       allow_nan=False) + "\n")
+    except Exception as exc:
+        _warn(f"Could not write fills file ({path}): {exc}.")
+        return None
+    return path
+
+
 _SELL_FILLS_PREFIX = "sell_fills_"
 _SALE_STAMP = re.compile(r"\d{8}T\d{6}")
 _QTY_EPS = 1e-9
@@ -803,21 +958,25 @@ def _fill_side(fill: dict, default: str) -> str:
     return default
 
 
-def summarize_holdings(buy_doc, sell_docs=()) -> dict:
-    """Net position per ticker from a buy-fills document and sell-fills documents.
+def summarize_holdings(buy_doc, sell_docs=(), capital=None) -> dict:
+    """Net position per ticker from buy-fills document(s) and sell-fills documents.
 
-    Returns ``{ticker: {"bought_qty", "sold_qty", "net_qty", "bought_weight",
-    "sold_weight", "net_weight"}}``. Quantities and weights are absolute values
-    (a sale may be written as a negative ``filled_qty``); ``net_*`` is bought -
-    sold, floored at 0. Only fills with status filled / partial /
-    partially_filled count. A fill repeated in several files (same ticker, side,
-    ``deal_id`` and ``fill_ts``) counts once.
+    ``buy_doc`` is one document or a list of them (every tranche file of the
+    portfolio). Returns ``{ticker: {"bought_qty", "sold_qty", "net_qty",
+    "bought_weight", "sold_weight", "net_weight"}}``. Quantities and weights are
+    absolute values (a sale may be written as a negative ``filled_qty``); ``net_*``
+    is bought - sold, floored at 0. Only fills with status filled / partial /
+    partially_filled count. A fill repeated in several files (see ``_fill_key``)
+    counts once. A fill with no ``filled_weight`` gets ``filled_qty * price /
+    capital`` when ``capital`` (portfolio value) is given.
     """
     holdings: dict = {}
-    seen = set()
-    sources = [("BUY", buy_doc)] + [("SELL", doc) for doc in sell_docs or ()]
-    for default, doc in sources:
-        for fill in (doc or {}).get("fills") or []:
+    first_seen: dict = {}
+    buys = buy_doc if isinstance(buy_doc, (list, tuple)) else [buy_doc]
+    sources = [("BUY", _stamped_fills(doc)) for doc in buys]
+    sources += [("SELL", [f for f in (doc or {}).get("fills") or []]) for doc in sell_docs or ()]
+    for index, (default, fills) in enumerate(sources):
+        for fill in fills:
             if not isinstance(fill, dict):
                 continue
             if str(fill.get("status") or "").strip().lower() not in _APPLIED_FILL_STATUSES:
@@ -827,12 +986,16 @@ def summarize_holdings(buy_doc, sell_docs=()) -> dict:
                 continue
             side = _fill_side(fill, default)
             qty, weight = _as_float(fill.get("filled_qty")), _as_float(fill.get("filled_weight"))
-            deal_id = fill.get("deal_id")
-            if deal_id:
-                key = (ticker, side, str(deal_id), str(fill.get("fill_ts") or ""))
-                if key in seen:
-                    continue
-                seen.add(key)
+            if weight is None and capital and qty is not None:
+                price = _as_float(fill.get("price"))
+                if price is not None and price > 0:
+                    weight = abs(qty) * price / capital
+            key = _fill_key(fill, default)
+            # With a deal_id a repeated fill counts once anywhere; without one only a
+            # copy in ANOTHER document does (two equal fills of one file are two fills).
+            if key in first_seen and (fill.get("deal_id") or first_seen[key] != index):
+                continue
+            first_seen.setdefault(key, index)
             row = holdings.setdefault(ticker, dict.fromkeys(
                 ("bought_qty", "sold_qty", "bought_weight", "sold_weight"), 0.0))
             prefix = "bought" if side == "BUY" else "sold"
@@ -846,19 +1009,35 @@ def summarize_holdings(buy_doc, sell_docs=()) -> dict:
     return holdings
 
 
+def portfolio_capital(env=None) -> float | None:
+    """Portfolio value from ``PORTFOLIO_CAPITAL`` (optional), used to turn a fill's
+    ``qty * price`` into a weight when the fill has no ``filled_weight``."""
+    env = os.environ if env is None else env
+    return _positive_number(_as_float_text(env.get("PORTFOLIO_CAPITAL")))
+
+
+def _as_float_text(value):
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
 def load_portfolio_holdings(portfolio_meta, directory: str | None = None) -> dict:
     """NET held quantity per ticker from the buy and sell fills of this portfolio.
 
-    Buy fills come from ``load_portfolio_fills`` (the legacy lookup when the
-    portfolio has no optimizer / run_ts), sell fills from
-    ``load_portfolio_sell_fills``. See ``summarize_holdings`` for the result;
+    Buy fills are the SUM of every tranche: all ``fills_<optimizer>_<stamp>*``
+    files of the portfolio (``load_portfolio_fill_docs``), or the legacy lookup
+    (``load_fills``) when the portfolio has no optimizer / run_ts. Sell fills come
+    from ``load_portfolio_sell_fills``. See ``summarize_holdings`` for the result;
     ``{}`` when there are no fills. Never raises.
     """
     if portfolio_key(portfolio_meta) is None:
         buys = load_fills("entry_signal_tool", directory)
     else:
-        buys = load_portfolio_fills(portfolio_meta, directory)
-    return summarize_holdings(buys, load_portfolio_sell_fills(portfolio_meta, directory))
+        buys = load_portfolio_fill_docs(portfolio_meta, directory)
+    return summarize_holdings(buys, load_portfolio_sell_fills(portfolio_meta, directory),
+                              capital=portfolio_capital())
 
 
 def fully_sold_tickers(holdings, rotation_state=None) -> list[str]:
@@ -896,24 +1075,185 @@ def rotation_reentered(rotation_state, ticker: str) -> bool:
     return False
 
 
-def pipeline_dir() -> str:
+def pipeline_dir(env=None) -> str:
     """``PIPELINE_DIR``, else the parent of the signals base (``SIGNALS_OUT_DIR``).
 
     Derived from the base, never from the per-portfolio subfolder."""
-    explicit = os.environ.get("PIPELINE_DIR")
+    env = os.environ if env is None else env
+    explicit = env.get("PIPELINE_DIR")
     if explicit:
         return explicit
-    return os.path.dirname(os.path.abspath(signals_base_dir()))
+    return os.path.dirname(os.path.abspath(signals_base_dir(env)))
 
 
-def entry_state_path(portfolio_meta) -> str:
+def entry_state_path(portfolio_meta, env=None) -> str:
     """Entry state of this portfolio: ``ENTRY_STATE_FILE``, else
     ``<pipeline dir>/state/entry_state_<optimizer>_<run_ts stamp>.json``."""
-    explicit = os.environ.get("ENTRY_STATE_FILE")
+    env = os.environ if env is None else env
+    explicit = env.get("ENTRY_STATE_FILE")
     if explicit:
         return explicit
     key = portfolio_key(portfolio_meta) or "hardcoded_fallback"
-    return os.path.join(pipeline_dir(), "state", f"entry_state_{key}.json")
+    return os.path.join(pipeline_dir(env), "state", f"entry_state_{key}.json")
+
+
+# ------------------------------------------------------------------------------
+# Entry phase: days 1..5 of a portfolio, in NYSE sessions
+# ------------------------------------------------------------------------------
+ENTRY_PHASE_DAYS = 5
+PAUSE_RETURN_THRESHOLD = -0.05
+
+
+def nyse_sessions_between(start: date, end: date) -> list[date]:
+    """NYSE sessions in ``[start, end]``. Without a calendar library it falls back to
+    Monday-Friday (holidays are then counted as sessions) and warns."""
+    if end < start:
+        return []
+    try:
+        import pandas_market_calendars as mcal
+    except ImportError:
+        mcal = None
+    try:
+        if mcal is not None:
+            schedule = mcal.get_calendar("NYSE").schedule(
+                start_date=start.isoformat(), end_date=end.isoformat())
+            return [stamp.date() for stamp in schedule.index]
+        import exchange_calendars as xcals
+        calendar = xcals.get_calendar("XNYS")
+        return [stamp.date() for stamp in calendar.sessions_in_range(
+            pd.Timestamp(start), pd.Timestamp(end))]
+    except Exception as exc:
+        _warn(f"NYSE calendar unavailable ({exc}); counting Monday-Friday as sessions.")
+        days = (end - start).days + 1
+        return [start + timedelta(days=i) for i in range(days) if (start + timedelta(days=i)).weekday() < 5]
+
+
+def _read_json_object(path: str):
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _fill_date(fill_or_doc):
+    for key in ("fill_ts", "executed_ts"):
+        parsed = _iso_date((fill_or_doc or {}).get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def entry_start_date(portfolio_meta, today=None, env=None, directory: str | None = None) -> date:
+    """Day 1 of this portfolio's entry.
+
+    1. ``entry_start_date`` in the entry state file (written by entry_signal_tool).
+    2. A state file without it but with entry activity (an older file): the earliest
+       fill date of the portfolio, else the portfolio ``run_ts`` date.
+    3. No state, no activity: ``today`` (the first tranche is day 1).
+    """
+    today = _iso_date(today) or cycle_today()
+    state = _read_json_object(entry_state_path(portfolio_meta, env)) or {}
+    recorded = _iso_date(state.get("entry_start_date"))
+    if recorded is not None:
+        return recorded
+    active = any(state.get(key) for key in
+                 ("ultima_actualizacion", "pending_signal_run_ts", "last_tranche_date"))
+    if not active:
+        return today
+    dates = []
+    for doc in load_portfolio_fill_docs(portfolio_meta, directory):
+        dates.append(_fill_date(doc))
+        dates += [_fill_date(f) for f in doc.get("fills") or [] if isinstance(f, dict)]
+    dates = [d for d in dates if d]
+    if dates:
+        return min(dates)
+    return portfolio_horizon_fields(portfolio_meta)["run_date"] or today
+
+
+def entry_phase_info(portfolio_meta, today=None, env=None, sessions_fn=None,
+                     directory: str | None = None) -> dict:
+    """Where ``today`` falls in the entry phase of the portfolio.
+
+    ``day`` is the number of NYSE sessions in ``[start_date, today]`` (at least 1);
+    ``active`` is true on days 1..``ENTRY_PHASE_DAYS``. ``sessions_fn(start, end)``
+    replaces the calendar (tests, run_cycle).
+    """
+    today = _iso_date(today) or cycle_today()
+    start = entry_start_date(portfolio_meta, today, env, directory)
+    sessions = (sessions_fn or nyse_sessions_between)(start, today)
+    day = max(1, len(sessions))
+    return {"day": day, "start_date": start.isoformat(), "active": day <= ENTRY_PHASE_DAYS,
+            "last_day": ENTRY_PHASE_DAYS}
+
+
+def session_day(start, day, sessions_fn=None) -> int:
+    """Entry-phase day number of calendar date ``day`` for an entry that began on ``start``."""
+    start, day = _iso_date(start), _iso_date(day)
+    return max(1, len((sessions_fn or nyse_sessions_between)(start, day)))
+
+
+def load_pause_mark(portfolio_meta, today=None) -> dict:
+    """The pause mark that ``drawdown_rotation`` wrote for ``today``.
+
+    Reads ``<signals dir>/drawdown_rotation.json`` (``data.pause``, see
+    drawdown_rotation). Returns ``{"tickers": [...], "returns": {...}, "entry_day": n}``
+    only for a mark of this portfolio, dated ``today``, in mode ``pause``; otherwise
+    ``{"tickers": []}``. Never raises.
+    """
+    today = _iso_date(today) or cycle_today()
+    path = os.path.join(resolve_signals_dir(portfolio_meta), "drawdown_rotation.json")
+    payload = _read_json_object(path) if os.path.isfile(path) else None
+    empty = {"tickers": [], "returns": {}, "entry_day": None}
+    if not payload:
+        return empty
+    meta = portfolio_meta or {}
+    if payload.get("portfolio_run_ts") != meta.get("portfolio_run_ts"):
+        return empty
+    pause = (payload.get("data") or {}).get("pause")
+    if not isinstance(pause, dict) or pause.get("mode") != "pause":
+        return empty
+    if _iso_date(pause.get("cycle_date")) != today:
+        return empty
+    tickers = sorted({str(t) for t in pause.get("tickers") or [] if t})
+    returns = pause.get("returns") if isinstance(pause.get("returns"), dict) else {}
+    return {"tickers": tickers, "returns": returns, "entry_day": pause.get("entry_day")}
+
+
+def load_active_management_targets(portfolio_meta, start_date, sessions_fn=None) -> tuple[dict, dict]:
+    """Current targets from the latest ``active_management`` output, if it counts.
+
+    Returns ``(targets, info)``. ``targets`` is ``{ticker: target_weight}`` (CASH
+    excluded) and is empty unless the output belongs to this portfolio AND
+    ``active_management`` ran AFTER the entry phase (its run date is on entry day 6
+    or later: during days 1..5 it must not run, and an older output does not
+    describe a later entry). ``info`` has ``status`` ("used", "missing",
+    "in_entry_phase", "other_portfolio") plus ``run_ts`` and ``entry_day``.
+    """
+    path = os.path.join(resolve_signals_dir(portfolio_meta), "active_management.json")
+    payload = _read_json_object(path) if os.path.isfile(path) else None
+    if not payload:
+        return {}, {"status": "missing"}
+    meta = portfolio_meta or {}
+    if payload.get("portfolio_run_ts") != meta.get("portfolio_run_ts"):
+        return {}, {"status": "other_portfolio"}
+    ran = _iso_date(str(payload.get("run_ts") or "")[:10])
+    if ran is None:
+        return {}, {"status": "missing"}
+    day = session_day(start_date, ran, sessions_fn)
+    info = {"status": "used", "run_ts": payload.get("run_ts"), "entry_day": day}
+    if day <= ENTRY_PHASE_DAYS:
+        info["status"] = "in_entry_phase"
+        return {}, info
+    targets = {}
+    for row in (payload.get("data") or {}).get("rebalances") or []:
+        if not isinstance(row, dict) or str(row.get("ticker")) == "CASH":
+            continue
+        weight = _as_float(row.get("target_weight"))
+        if weight is not None and weight >= 0:
+            targets[str(row["ticker"])] = weight
+    return targets, info
 
 
 # ------------------------------------------------------------------------------
@@ -1071,7 +1411,8 @@ def apply_entry_fills(estado, payload, cycle_length: int = 5, today: str | None 
     Returns ``(estado, applied)``. A match adds ``filled_weight / target_weight``
     to ``pct_ya_invertido`` for BUY fills whose status is ``filled``, ``partial``
     or ``partially_filled``. ``filled_weight`` is a portfolio weight (same units
-    as ``tranche_weight``). Pending cash decisions on that signal are applied
+    as ``tranche_weight``). In a cumulative file only the fills whose own
+    ``signal_run_ts`` is the pending one count. Pending cash decisions on that signal are applied
     too. The input dict is left unchanged when the file does not match.
     """
     if not estado or not payload:
@@ -1091,6 +1432,11 @@ def apply_entry_fills(estado, payload, cycle_length: int = 5, today: str | None 
             continue
         action = str(fill.get("action") or "BUY").strip().upper()
         if action != "BUY":
+            continue
+        # A cumulative file also holds earlier tranches: only the fills of the
+        # pending signal advance the state (fills without the field are its own).
+        own = fill.get("signal_run_ts")
+        if own and own != pending:
             continue
         ticker = str(fill.get("ticker") or "").strip()
         filled = _as_float(fill.get("filled_weight"))

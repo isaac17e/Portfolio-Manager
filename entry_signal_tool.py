@@ -19,10 +19,13 @@ from pipeline_io import (
     apply_entry_fills,
     apply_rotation_overrides,
     cycle_today,
+    entry_phase_info,
     entry_state_path,
     export_signals,
     fully_sold_tickers,
+    load_active_management_targets,
     load_fills,
+    load_pause_mark,
     load_portfolio,
     load_portfolio_fills,
     load_portfolio_holdings,
@@ -210,6 +213,8 @@ def _estado_vacio():
         "pending_decisions": {},
         "last_tranche_date": None,
         "last_tranche": None,
+        "entry_start_date": None,
+        "pausas_entrada": {},
         "activos": {ticker: _activo_vacio() for ticker in TICKERS},
     }
 
@@ -785,6 +790,7 @@ COLORES_ACCION = {
     "CIERRE: CASH": "#d03b3b",
     "COMPLETO": "#2a78d6",
     "ESCALONADO": "#8a6d00",
+    "PAUSA": "#b45f06",
 }
 COLOR_TEXTO_NORMAL = "#52514e"
 
@@ -874,8 +880,10 @@ def graficar_resumen(resumen):
 # ---------------- EJECUCION PRINCIPAL ----------------
 
 def _contexto(estado, warnings, excluded, dia_ciclo, ciclo, pending_cash=None, pending_decisions=None,
-              locked=None, tenencias=None):
+              locked=None, tenencias=None, fase=None, pausados=None):
     return {
+        "entry_phase": fase,
+        "paused": sorted(pausados or []),
         "net_holdings": {t: row["net_qty"] for t, row in sorted((tenencias or {}).items())},
         "locked": locked,
         "estado": estado,
@@ -895,7 +903,8 @@ def _texto(fila, columna):
     return str(valor)
 
 
-def construir_fila_estado(fila, pct_previo, peso_original, dia_ciclo, ciclo, hist_actualizado):
+def construir_fila_estado(fila, pct_previo, peso_original, dia_ciclo, ciclo, hist_actualizado,
+                          pausado=False, con_pausas=False, obligatorio=False):
     """Decision del dia para un activo: cuanto sumar hoy, en % de su peso objetivo.
 
     ``pct_previo`` es la fraccion del peso objetivo ya ejecutada (fills). En
@@ -903,22 +912,47 @@ def construir_fila_estado(fila, pct_previo, peso_original, dia_ciclo, ciclo, his
     (tickers.no_options_weight_cap) y cada senal compra un tramo fijo de
     ENTRADA_ESCALONADA_PCT (o lo que falte) sobre lo ejecutado: nunca el 100%
     de una vez, aunque se hayan perdido fills o sea el dia 5.
+
+    Fase de entrada (dias 1..5 del portafolio): ``pausado`` (marca de
+    drawdown_rotation) no compra hoy; un activo que ya tuvo una pausa
+    (``con_pausas``) compra a lo sumo lo pendiente / dias restantes, asi lo
+    pospuesto se reparte. ``obligatorio`` es el dia 5 de la fase: se completa el
+    100% del objetivo de todos los activos, pausados o no (sin decision por
+    opciones, tambien en tier "none"). Fuera de la fase (ciclos de reemplazo) el
+    dia 5 sigue decidiendo por flujo de opciones.
     """
     ticker = fila["ticker"]
     escalonado = _texto(fila, "modo_entrada") == "escalonado"
     peso_objetivo = no_options_weight_cap(peso_original) if escalonado else peso_original
     es_ultimo_dia = dia_ciclo >= DIAS_CICLO
     pct_cash = 0.0
+    dias_restantes = max(1, DIAS_CICLO - int(dia_ciclo) + 1)
+    reparto = max(0.0, 1.0 - pct_previo) / dias_restantes
+    reparte = con_pausas and not es_ultimo_dia and not obligatorio
 
     if escalonado:
         pct_objetivo_hoy = min(1.0, pct_previo + ENTRADA_ESCALONADA_PCT)
+        if reparte:
+            pct_objetivo_hoy = min(1.0, pct_previo + max(ENTRADA_ESCALONADA_PCT, reparto))
     else:
         pct_objetivo_hoy = fila["pct_entrada_sugerido"]
+        if reparte:
+            pct_objetivo_hoy = min(pct_objetivo_hoy, pct_previo + reparto)
 
     if pct_previo >= 0.999:
         delta = 0.0
         accion = "COMPLETO"
         recomendacion = "COMPLETO (100% del peso objetivo)"
+    elif obligatorio:
+        delta = 1.0 - pct_previo
+        accion = "CIERRE: ENTRAR"
+        recomendacion = (f"CIERRE DIA {DIAS_CICLO} (obligatorio) -> COMPRAR EL {delta*100:.1f}% RESTANTE"
+                         + (" (estaba en pausa)" if pausado or con_pausas else ""))
+    elif pausado:
+        delta = 0.0
+        accion = "PAUSA"
+        recomendacion = ("PAUSA: cayo 5% o mas en 5 sesiones (drawdown_rotation); no se compra hoy, "
+                         "lo pendiente se reparte en los dias restantes")
     elif escalonado:
         delta = pct_objetivo_hoy - pct_previo
         tope = f"{peso_objetivo*100:.2f}%" if not pd.isna(peso_objetivo) else "?"
@@ -928,7 +962,7 @@ def construir_fila_estado(fila, pct_previo, peso_original, dia_ciclo, ciclo, his
             f"{pct_objetivo_hoy*100:.0f}% acumulado del peso recortado {tope}"
         )
     elif es_ultimo_dia:
-        # Dia 5: no hay goteo adicional, se cierra el ciclo en firme.
+        # Dia 5 de un ciclo de reemplazo: se cierra el ciclo en firme.
         decision, motivo = evaluar_flujo_opciones(ticker, hist_actualizado)
         if decision == "ENTRAR":
             delta = 1.0 - pct_previo
@@ -995,6 +1029,9 @@ def correr_entry_signal(cycle_day=None, invested_pct=None, force_new_tranche=Fal
     estado = cargar_estado()
     fills_payload = cargar_fills()
     hoy = cycle_today()
+    fase = entry_phase_info(_PORTFOLIO_META, hoy)
+    if not estado.get("entry_start_date"):
+        estado["entry_start_date"] = fase["start_date"]
     estado, fills_applied = apply_entry_fills(
         estado, fills_payload, cycle_length=DIAS_CICLO, today=hoy.isoformat(),
     )
@@ -1068,8 +1105,61 @@ def correr_entry_signal(cycle_day=None, invested_pct=None, force_new_tranche=Fal
         print(f"  [rotacion] {nota}")
         warnings.append(f"rotation: {nota}")
 
-    es_ultimo_dia = dia_ciclo >= DIAS_CICLO
-    if es_ultimo_dia:
+    # Ciclo 1 = fase de entrada del portafolio. Su dia 5 (por ciclo o por sesiones
+    # NYSE desde el dia 1) es obligatorio: se completa el 100% del objetivo.
+    obligatorio = ciclo == 1 and (dia_ciclo >= DIAS_CICLO or fase["day"] >= DIAS_CICLO)
+    es_ultimo_dia = obligatorio or dia_ciclo >= DIAS_CICLO
+
+    objetivos = dict(PESOS_OBJETIVO)
+    retargeted = set()
+    am_targets, am_info = load_active_management_targets(_PORTFOLIO_META, fase["start_date"])
+    if am_info["status"] == "in_entry_phase":
+        aviso = (f"active_management output of {am_info.get('run_ts')} ignored: it ran on entry day "
+                 f"{am_info['entry_day']} (days 1..{DIAS_CICLO} use the original optimizer targets)")
+        print(f"  [objetivos] {aviso}")
+        warnings.append(aviso)
+    elif am_targets:
+        rotados = set((ESTADO_ROTACION.get("target_overrides") or {}))
+        for ticker, nuevo in sorted(am_targets.items()):
+            if ticker not in objetivos or ticker in rotados:
+                continue
+            antes = objetivos[ticker]
+            if abs(antes - nuevo) <= 1e-9:
+                continue
+            objetivos[ticker] = nuevo
+            retargeted.add(ticker)
+            nota = f"{ticker}: target {antes:.4f} -> {nuevo:.4f} from active_management ({am_info['run_ts']})"
+            print(f"  [objetivos] {nota}")
+            warnings.append(f"active_management: {nota}")
+
+    marca = load_pause_mark(_PORTFOLIO_META, hoy)
+    pausados = set()
+    if fase["active"] and not obligatorio:
+        pausados = {t for t in marca["tickers"] if t in TICKERS}
+    elif marca["tickers"] and obligatorio:
+        aviso = (f"pause mark ignored on the last entry day: {', '.join(marca['tickers'])} "
+                 "are bought up to 100% of target")
+        print(f"  [pausa] {aviso}")
+        warnings.append(aviso)
+    historial_pausas = {t: list(v) for t, v in (estado.get("pausas_entrada") or {}).items()}
+    con_pausas = {t for t, dias in historial_pausas.items() if any(d != hoy.isoformat() for d in dias)}
+    for ticker in sorted(pausados):
+        dias = historial_pausas.setdefault(ticker, [])
+        if hoy.isoformat() not in dias:
+            dias.append(hoy.isoformat())
+        ret = marca["returns"].get(ticker)
+        detalle = f" ({ret:+.2%} en 5 sesiones)" if isinstance(ret, (int, float)) else ""
+        print(f"  [pausa] {ticker}: pausado hoy por drawdown_rotation{detalle}; no se compra.")
+        warnings.append(f"{ticker}: paused today by drawdown_rotation; pending amount spread over the remaining days")
+    estado["pausas_entrada"] = historial_pausas
+
+    if obligatorio:
+        print(
+            f"\nDIA {DIAS_CICLO} de la fase de entrada (obligatorio): se completa el 100% del objetivo "
+            "de todos los activos, pausados o no."
+            "\nEl estado no cambia hasta que el ejecutor confirme los fills.\n"
+        )
+    elif es_ultimo_dia:
         print(
             f"\nDIA {DIAS_CICLO} (ultimo del ciclo): la senal decide la fraccion no invertida."
             "\nEl estado no cambia hasta que el ejecutor confirme los fills.\n"
@@ -1079,7 +1169,7 @@ def correr_entry_signal(cycle_day=None, invested_pct=None, force_new_tranche=Fal
 
     filas_nuevas = []
     for ticker in TICKERS:
-        if ticker in vendidos:
+        if ticker in vendidos or objetivos.get(ticker, 1.0) <= 1e-9:
             continue
         fila = calcular_fila_instrumento(ticker, hist_df, warnings, excluded)
         if fila is not None:
@@ -1089,7 +1179,7 @@ def correr_entry_signal(cycle_day=None, invested_pct=None, force_new_tranche=Fal
     df_nuevo = pd.DataFrame(filas_nuevas)
     if df_nuevo.empty:
         return pd.DataFrame(), hist_df, _contexto(estado, warnings, excluded, dia_ciclo, ciclo,
-                                                  tenencias=tenencias)
+                                                  tenencias=tenencias, fase=fase, pausados=pausados)
     df_nuevo = _etiquetar_definiciones(df_nuevo)
 
     hist_actualizado = pd.concat([hist_df, df_nuevo], ignore_index=True)
@@ -1104,9 +1194,21 @@ def correr_entry_signal(cycle_day=None, invested_pct=None, force_new_tranche=Fal
     for _, fila in df_nuevo.iterrows():
         ticker = fila["ticker"]
         activo = scoring["activos"].setdefault(ticker, _activo_vacio())
+        pct_previo = activo["pct_ya_invertido"]
+        if ticker in retargeted:
+            # pct_ya_invertido es fraccion del objetivo VIGENTE cuando se ejecuto: con un
+            # objetivo nuevo de active_management se recalcula sobre el peso realmente
+            # invertido (fills), para no comprar hacia el objetivo viejo ni de mas.
+            tope = no_options_weight_cap if _texto(fila, "modo_entrada") == "escalonado" else float
+            fila_t = tenencias.get(ticker)
+            invertido = fila_t["net_weight"] if fila_t and fila_t.get("bought_weight", 0.0) > 0 \
+                else pct_previo * tope(PESOS_OBJETIVO[ticker])
+            pct_previo = min(1.0, invertido / tope(objetivos[ticker]))
         filas_estado.append(construir_fila_estado(
-            fila, activo["pct_ya_invertido"], PESOS_OBJETIVO.get(ticker, np.nan),
+            fila, pct_previo, objetivos.get(ticker, np.nan),
             dia_ciclo, ciclo, hist_actualizado,
+            pausado=ticker in pausados, con_pausas=ticker in con_pausas,
+            obligatorio=obligatorio,
         ))
 
     pending_cash = {}
@@ -1125,7 +1227,7 @@ def correr_entry_signal(cycle_day=None, invested_pct=None, force_new_tranche=Fal
 
     return resumen, hist_actualizado, _contexto(
         estado, warnings, excluded, dia_ciclo, ciclo, pending_cash, pending_decisions,
-        tenencias=tenencias,
+        tenencias=tenencias, fase=fase, pausados=pausados,
     )
 
 def imprimir_resumen(resumen):
@@ -1282,6 +1384,9 @@ def main(argv=None):
     data["excluded"] = ctx["excluded"]
     if ctx.get("net_holdings"):
         data["net_holdings"] = ctx["net_holdings"]
+    if ctx.get("entry_phase"):
+        data["entry_phase"] = ctx["entry_phase"]
+    data["paused"] = ctx.get("paused") or []
     path = export_signals(
         "entry_signal_tool", data, _PORTFOLIO_META, warnings=ctx["warnings"],
     )

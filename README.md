@@ -64,7 +64,7 @@ For building new positions gradually. Each day it computes, per ticker, a **0–
 
 The score sets what fraction of the target weight to buy that day: high conviction (≥ 75) buys all of it, medium (40–75) scales between 40% and 80%, and low buys at most 30%.
 
-The script runs a **5-business-day cycle** with no interactive prompts. The cycle day comes from `--cycle-day` or `ENTRY_CYCLE_DAY`, otherwise from the last executed day in `entry_state.json` (next day, or day 1 when the cycle is closed or the file is new). Percent already invested comes from `--invested-pct` or `ENTRY_INVESTED_PCT`, otherwise from that same file. Generating a signal does **not** mark the book as invested. `entry_state.json` advances only when a fills file confirms that signal (see [Pipeline signals](#pipeline-signals)). Indicator history still appends to `entry_signal_history.csv`. On day 5 the signal decides the unfilled fraction: buy the rest if the accumulated options flow is favorable (smart money and distance to zero gamma), or leave it in cash — that cash decision is stored as pending and applied only with the matching fills.
+The script runs a **5-business-day cycle** with no interactive prompts. The cycle day comes from `--cycle-day` or `ENTRY_CYCLE_DAY`, otherwise from the last executed day in `entry_state.json` (next day, or day 1 when the cycle is closed or the file is new). Percent already invested comes from `--invested-pct` or `ENTRY_INVESTED_PCT`, otherwise from that same file. Generating a signal does **not** mark the book as invested. `entry_state.json` advances only when a fills file confirms that signal (see [Pipeline signals](#pipeline-signals)). Indicator history still appends to `entry_signal_history.csv`. On day 5 of the portfolio's **entry phase** (see [Entry phase](#entry-phase-days-15)) the signal is mandatory: it buys the whole unfilled remainder of every ticker's target, paused or not. In a later cycle (a replacement after day 5) day 5 still decides the unfilled fraction: buy the rest if the accumulated options flow is favorable (smart money and distance to zero gamma), or leave it in cash — that cash decision is stored as pending and applied only with the matching fills.
 
 **Output**: a console summary and a Plotly chart.
 
@@ -134,6 +134,8 @@ The number of green signals gives a global rating: **Global Green Light** (≥ 9
 ## `drawdown_rotation.py` — Rotation after an abnormal drop
 
 Runs every day in the cycle, right before `entry_signal_tool`. Most days it only checks prices and exits.
+
+**Entry phase (days 1..5 of the portfolio): pause mode.** While the portfolio is entering it does not sell or rotate and does not touch the rotation state. Any ticker whose 5-session return is −5% or worse is *paused*: the tickers go to `data.pause` of `drawdown_rotation.json` (`{"mode": "pause", "cycle_date", "entry_day", "tickers": [...], "returns": {ticker: ret_5d}}`; `data.mode` is `pause`, `data.triggered` false, `data.rebalances` empty) and `entry_signal_tool` does not buy those tickers that day. From day 6 (`data.mode` `full`, `data.pause` null) the steps below run. `--mode pause|full` forces one (default `auto`).
 
 1. **Detector**: a holding fires when its cumulative return over the last **5 sessions is −5% or worse**. The rotation state remembers each trigger, so the same drop does not fire every day: after a trigger the holding is quiet for 5 sessions, unless it falls another 5% from the trigger close.
 2. **Diagnosis** (deterioration score 0–100, higher is worse):
@@ -232,6 +234,8 @@ Idempotent entry tranches: `entry_signal_tool` prepares at most one tranche per 
 
 Weekly mode runs only `active_management`. Schedule that command every day; the script decides whether today is the session to run. Today is the America/Bogota date (override with `--date YYYY-MM-DD`). It runs when that date is an NYSE session, it is the first NYSE session of its ISO week, and the weekly cycle has not already succeeded in that week. A Monday holiday (Labor Day, Memorial Day) therefore runs on the next session of that week, which is Tuesday. Columbus Day does not close the NYSE, so that week stays on Monday. The last success is stored per portfolio in `/workspace/pipeline/state/weekly_last_run_<optimizer>_<stamp>.json` and is updated only after every weekly step succeeds, so the weekly cycle of a minimum-variance and of a quadratic-utility portfolio are both due on the same Monday. `--weekly-state` / `WEEKLY_STATE_FILE` name one file shared by every portfolio (the old behaviour); `SIGNALS_PER_PORTFOLIO=0` goes back to the single `weekly_last_run.json`.
 
+During the entry phase (days 1..5 of the portfolio, see [Entry phase](#entry-phase-days-15)) weekly mode does **not** run `active_management`, not even on a Monday and not with `--force`: it writes a `not_due` summary and prints `not_due: entry_phase: day N of 5 since <date>; ...` (reason in `not_due_reason`). It runs weekly from day 6. If the first session of the week fell inside the phase, that week's weekly run is skipped and the next one is the following week.
+
 If today is after the portfolio's `horizon_end`, weekly mode writes a summary with status `skipped_after_horizon` and exits 0. A null `horizon_end` still runs, and the summary carries a warning. `--force` skips the due check and still honors `horizon_end`.
 
 ```bash
@@ -262,7 +266,7 @@ Exit codes: `0` success, not due, skipped after the horizon, or dry-run; `1` inv
 
 The calendar (weekly due check, daily session check, early-close lookup) is `pandas_market_calendars` (NYSE), or `exchange_calendars` (`XNYS`) if only that package is installed. Import is lazy. If neither is installed a weekly run, or a daily run without `--force`, exits 1 and names the missing library. The calendars are local; the check does not use the network. `--force` does not need the calendar.
 
-Not-due reasons, printed as `not_due: <reason> (YYYY-MM-DD)`: `non_trading_day` (daily and weekly), `not_first_trading_day_of_week`, `already_ran_this_week`.
+Not-due reasons, printed as `not_due: <reason> (YYYY-MM-DD)`: `non_trading_day` (daily and weekly), `entry_phase: ...` (weekly, days 1..5), `not_first_trading_day_of_week`, `already_ran_this_week`.
 
 ## Pipeline signals
 
@@ -393,6 +397,18 @@ Envelope:
 
 - **`fundamental_analysis`** — `n_tickers`, `n_indicators` (12), `score_green_min` (9), `score_medium_min` (6). `holdings[]`: `ticker`, `score_quality`, `n_green`, `n_indicators`, `rating` (`Luz Verde Global`, `Calidad Media`, `Señal de Alerta Global`), `incomplete`, `metrics` (the scorecard numbers) and `signals` (the traffic-light column for each indicator).
 
+### Entry phase (days 1..5)
+
+The entry phase of a portfolio is days 1..5, counted in NYSE sessions from day 1 of its entry state (`entry_start_date` in `entry_state_<optimizer>_<stamp>.json`, written with the first tranche; an older state without it falls back to the earliest fill date, then the portfolio `run_ts` date; a portfolio with no state starts today). `pipeline_io.entry_phase_info` computes it for every script.
+
+1. `run_cycle` runs `drawdown_rotation` before `entry_signal_tool`. In the phase it runs in **pause mode** (no sell, no rotation, rotation state untouched): a ticker with a 5-session return of −5% or worse is marked in `drawdown_rotation.json` (`data.pause`, see above) and `entry_signal_tool` does not buy it that day (`action` `PAUSA`, listed under `waiting`, `data.paused`). The mark is only valid on its own `cycle_date`.
+2. Paused tranches accumulate: a ticker that had a pause buys at most (unfilled fraction of its target) / (days left including today) on each later day, and never more than its conviction level; if it keeps falling it is paused again. Pauses are remembered in the entry state (`pausas_entrada`: `{ticker: [dates]}`, with `entry_start_date`).
+3. **Day 5 is mandatory** (cycle 1, by cycle day or by 5 sessions since day 1): the signal buys the whole unfilled remainder of every ticker (`CIERRE: ENTRAR`, `signal` `cycle_close`), paused or not, with no option-flow decision, no cash, and without the staggered cap of tier `none`. The pause mark is ignored that day (a warning says so).
+4. `run_cycle --weekly` skips `active_management` on days 1..5 and logs the reason. From day 6, weekly `active_management` and the full `drawdown_rotation` (sell / trim / rotate) are enabled.
+5. Targets: during the phase `entry_signal_tool` uses the original optimizer targets (plus rotation overrides). It uses the latest `active_management` targets (`rebalances[].target_weight`, per portfolio) only when that output was produced after the phase, e.g. for a replacement; output from days 1..5 is ignored with a warning. Where it applies, `pct_ya_invertido` is recomputed on the weight really invested (net fill weight / new target) so the entry neither buys back toward the old weight nor overbuys. Without such an output it falls back to the entry state targets. Names `drawdown_rotation` changed keep the rotation target.
+
+The signal carries `entry_phase` (`day`, `start_date`, `active`, `last_day`) and `paused`.
+
 ### Same-day lock
 
 The entry state records `last_tranche_date` (America/Bogota, or `CYCLE_DATE`) and `last_tranche` (the entries and waiting that were emitted, with their `signal_run_ts`) when a tranche is prepared. Both survive the fills being applied. If a tranche dated today already exists, pending or executed, `entry_signal_tool` does not prepare another: it still applies any fills that have arrived, writes the signal file and exits 0 with
@@ -424,7 +440,7 @@ The entry state lives in `<PIPELINE_DIR>/state/entry_state_<optimizer>_<stamp>.j
 
 Migration: the old `entry_state.json` next to the script is read once, only when no per-portfolio state exists yet and its `portfolio` block names the same optimizer and `run_ts`; otherwise the portfolio starts fresh. Files written before this change have no `portfolio` block, so they are not migrated. The old file is never deleted or rewritten.
 
-The executor writes fills to `EXECUTIONS_DIR/fills_<optimizer>_<stamp>.json`. The reader opens only the file of the current portfolio; fills of other portfolios in the same directory are ignored. (With the script's hardcoded fallback portfolio, which has no `optimizer` / `run_ts`, it keeps the old lookup: `entry_signal_tool_fills.json`, else the newest `fills_*.json`, and the state file is `entry_state_hardcoded_fallback.json`.) Only a document whose `signal_run_ts` equals `pending_signal_run_ts` advances the state. `filled_weight` is a portfolio weight, same units as `tranche_weight`; the invested fraction increases by `filled_weight / target_weight` (capped at 1) for `action: "BUY"` and `status` of `filled`, `partial`, or `partially_filled`. The fills `ticker` is the canonical portfolio ticker.
+The executor writes fills to `EXECUTIONS_DIR/fills_<optimizer>_<stamp>.json`, **cumulatively** (see [Cumulative buy fills](#cumulative-buy-fills)). Fills of other portfolios in the same directory are ignored. (With the script's hardcoded fallback portfolio, which has no `optimizer` / `run_ts`, it keeps the old lookup: `entry_signal_tool_fills.json`, else the newest `fills_*.json`, and the state file is `entry_state_hardcoded_fallback.json`.) Only a document whose `signal_run_ts` equals `pending_signal_run_ts` advances the state. `filled_weight` is a portfolio weight, same units as `tranche_weight`; the invested fraction increases by `filled_weight / target_weight` (capped at 1) for `action: "BUY"` and `status` of `filled`, `partial`, or `partially_filled`. The fills `ticker` is the canonical portfolio ticker.
 
 ```json
 {
@@ -444,6 +460,30 @@ The executor writes fills to `EXECUTIONS_DIR/fills_<optimizer>_<stamp>.json`. Th
   ]
 }
 ```
+
+#### Cumulative buy fills
+
+The entry runs over several days and each day is a tranche, so the buy file is **cumulative**: the writer must append, never overwrite. `pipeline_io.write_portfolio_fills(portfolio_meta, payload)` does it (and `accumulate_fills` is the pure merge): the top-level fields stay those of the newest tranche (`signal_run_ts`, `executed_ts`, ...), `fills[]` accumulates the fills of every tranche deduplicated by `ticker` + `action` + `deal_id` + `fill_ts` (fills without a `deal_id` are deduplicated on all their fields across files), and each fill carries its own `signal_run_ts` (the tranche it confirms). `tranches[]` lists `{"signal_run_ts", "executed_ts"}`, oldest first. Only the fills whose `signal_run_ts` is the pending one advance the entry state, so earlier tranches in the file are never counted twice.
+
+```json
+{
+  "schema_version": 1,
+  "signal_run_ts": "2026-10-09T11:05:00-05:00",
+  "executed_ts": "2026-10-09T15:00:00-05:00",
+  "fills": [
+    {"ticker": "AVGO", "action": "BUY", "filled_weight": 0.04, "filled_qty": 3.44, "price": 330.0,
+     "deal_id": "v1", "status": "filled", "signal_run_ts": "2026-10-08T12:30:00-05:00"},
+    {"ticker": "AVGO", "action": "BUY", "filled_weight": 0.17, "filled_qty": 14.65, "price": 340.0,
+     "deal_id": "v2", "status": "filled", "signal_run_ts": "2026-10-09T11:05:00-05:00"}
+  ],
+  "tranches": [
+    {"signal_run_ts": "2026-10-08T12:30:00-05:00", "executed_ts": "2026-10-08T15:00:00-05:00"},
+    {"signal_run_ts": "2026-10-09T11:05:00-05:00", "executed_ts": "2026-10-09T15:00:00-05:00"}
+  ]
+}
+```
+
+Old single-day files stay valid (their fills have no per-fill `signal_run_ts` and count for the file's own). The reader does not depend on the writer: net holdings are the sum of the fills of **all** `fills_<optimizer>_<stamp>.json`, `fills_<optimizer>_<stamp>_*.json` and `fills_<optimizer>_<stamp>*.bak*` files of the portfolio minus every sell fill, so a day-1 file that an older writer overwrote and kept as `.bak` still counts. `entry_signal_tool` and `active_management` use the same net (`pipeline_io.load_portfolio_holdings`). A fill with no `filled_weight` gets `filled_qty * price / PORTFOLIO_CAPITAL` when that variable is set.
 
 #### Sell fills (`drawdown_rotation`)
 
@@ -477,7 +517,7 @@ The executor records the sales that `drawdown_rotation` asks for in `EXECUTIONS_
 
 `filled_qty` and `filled_weight` are positive amounts sold. The reader also accepts a negative `filled_qty` or `side: "SELL"` and uses the absolute value. A portfolio may have several sell files (one per executed rotation); all are read. A file belongs to the portfolio when its `portfolio_optimizer` matches and its `portfolio_run_ts` gives the portfolio's stamp (without `portfolio_run_ts`, the `<stamp>` in the file name must be the portfolio's). Only statuses `filled`, `partial` and `partially_filled` count; a fill repeated with the same `deal_id` and `fill_ts` counts once.
 
-`pipeline_io.load_portfolio_holdings` combines buy and sell fills into the **net held quantity** per ticker (`bought_qty - sold_qty`, never below 0). `entry_signal_tool` reads it: a ticker that was bought and then sold down to nothing is not bought again (a warning says so), unless `drawdown_rotation` picked it again after the sale, in which case it is bought in tranches from zero. The signal carries `net_holdings` (`{ticker: net_qty}`) when there are fills. `active_management` adds `net_held_qty` to each rebalance and `net_holdings` to its signal, and warns when it proposes trading a fully sold name. A name the rotation adds (`target_overrides`, rebalance `ROTACION_ENTRADA`) is staggered by `entry_signal_tool` like any other target, including when the previous entry cycle has already closed.
+`pipeline_io.load_portfolio_holdings` combines buy and sell fills into the **net held quantity** per ticker (`bought_qty - sold_qty`, never below 0). `entry_signal_tool` reads it: a ticker that was bought and then sold down to nothing is not bought again (a warning says so), unless `drawdown_rotation` picked it again after the sale, in which case it is bought in tranches from zero. The signal carries `net_holdings` (`{ticker: net_qty}`) when there are fills. `active_management` adds `net_held_qty` to each rebalance and `net_holdings` to its signal, and warns when it proposes trading a fully sold name. With fills, its `current_weight` is the weight **actually invested** (net `filled_weight`, bought − sold; `CASH` is what is not invested), not the optimizer target; `original_target_weight` keeps the optimizer weight, `current_weight_source` says `fills` or `target` (a position with a net quantity but no fill weights keeps the target basis), and `delta_weight` / `action` come from `target_weight - current_weight`. A name with tactical action `AUMENTAR` that is under-invested never produces a `SELL` (it is `HOLD` with `target_weight` = what is held), and `RECORTAR` / `LIQUIDAR` never produce a `BUY`. Without any fills the old basis (current = optimizer target) is kept. A name the rotation adds (`target_overrides`, rebalance `ROTACION_ENTRADA`) is staggered by `entry_signal_tool` like any other target, including when the previous entry cycle has already closed.
 
 `ENTRY_INVESTED_PCT` / `--invested-pct` overrides the in-memory baseline for that run only (it is not written as an execution). A bare number is a percent 0–100 for every ticker. `GLD=40,KO=0.25` or a JSON object is per ticker: values above 1, or written with `%`, are percents; values in `[0, 1]` are fractions of that ticker's target.
 

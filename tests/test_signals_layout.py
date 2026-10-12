@@ -15,7 +15,7 @@ import pipeline_io
 import portfolio_gex_field as gex
 import portfolio_vix as vix
 import run_cycle
-from tests.test_run_cycle import FAKE_STEP
+from tests.test_run_cycle import FAKE_STEP, PAST_ENTRY_PHASE
 
 MV = {"optimizer": "minimum_variance", "run_ts": "2026-10-08T11:29:02-05:00"}
 QU = {"optimizer": "quadratic_utility", "run_ts": "2026-10-08T12:12:53-05:00"}
@@ -283,6 +283,7 @@ class CycleCase(CleanEnvCase):
             mock.patch.object(run_cycle, "WEEKLY_STATE_DIR", self.state_dir),
             mock.patch.object(run_cycle, "DEFAULT_WEEKLY_STATE", os.path.join(self.state_dir, "weekly_last_run.json")),
             mock.patch.object(run_cycle, "build_command", side_effect=lambda s: [sys.executable, self.fake, s]),
+            mock.patch.object(run_cycle, "entry_phase", return_value=PAST_ENTRY_PHASE),
         ):
             patch.start()
             self.addCleanup(patch.stop)

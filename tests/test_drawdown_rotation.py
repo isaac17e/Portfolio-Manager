@@ -205,7 +205,7 @@ class RotationRunTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_trigger_liquidates_and_rotates_into_at_most_three(self):
-        data, _ = self.dr.run()
+        data, _ = self.dr.run(mode="full")
         self.assertTrue(data["triggered"])
         trig = data["triggers"][0]
         self.assertEqual(trig["ticker"], "KO")
@@ -221,11 +221,11 @@ class RotationRunTests(unittest.TestCase):
         self.assertAlmostEqual(sum(weights.values()), 1.0)
         self.assertAlmostEqual(weights.get("KO", 0.0), trig["target_weight"])
         # Same drop the next run: cooldown, no second rotation.
-        data2, _ = self.dr.run()
+        data2, _ = self.dr.run(mode="full")
         self.assertFalse(data2["triggered"])
 
     def test_dry_run_keeps_state(self):
-        data, _ = self.dr.run(dry_run=True)
+        data, _ = self.dr.run(dry_run=True, mode="full")
         self.assertTrue(data["triggered"])
         self.assertTrue(data["dry_run"])
         self.assertFalse(os.path.exists(self.state_file))
@@ -233,7 +233,7 @@ class RotationRunTests(unittest.TestCase):
     def test_no_drop_means_no_universe_and_no_rotation(self):
         calm = {t: _ohlc(seed=i) for i, t in enumerate(("KO", "GLD", "MRK"))}
         with mock.patch.object(self.dr, "fetch_ohlc", side_effect=lambda t, days=0: calm[t]):
-            data, _ = self.dr.run()
+            data, _ = self.dr.run(mode="full")
         self.assertFalse(data["triggered"])
         self.assertEqual(data["rebalances"], [])
         self.dr.build_universe.assert_not_called()

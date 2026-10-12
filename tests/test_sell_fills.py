@@ -229,10 +229,11 @@ class ActiveManagementHoldingsTests(unittest.TestCase):
 
     def test_warns_about_trading_a_fully_sold_name(self):
         holdings = pipeline_io.summarize_holdings(buy_doc(buy("GLD", 10)), [sell_doc(sell("GLD", 10))])
-        warns = self.am["_advertencias_tenencias"](self._signal(holdings)["rebalances"], holdings)
+        rebalances = [{"ticker": "GLD", "action": "SELL"}, {"ticker": "KO", "action": "BUY"}]
+        warns = self.am["_advertencias_tenencias"](rebalances, holdings)
         self.assertEqual(len(warns), 1)
         self.assertIn("GLD: SELL proposed", warns[0])
-        self.assertEqual(self.am["_advertencias_tenencias"](self._signal(holdings)["rebalances"], {}), [])
+        self.assertEqual(self.am["_advertencias_tenencias"](rebalances, {}), [])
 
 
 if __name__ == "__main__":

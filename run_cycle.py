@@ -10,6 +10,12 @@ HTML (``viz_utils``) instead of shown. Weekly mode runs only
 ``active_management``, and only on the first NYSE session of the ISO week
 that has not already succeeded.
 
+Entry phase (days 1..5 of each portfolio, in NYSE sessions from day 1 of its
+entry state): ``drawdown_rotation`` runs before ``entry_signal_tool`` in pause
+mode (it only marks the tickers entry must not buy today) and ``--weekly`` skips
+``active_management`` (``not_due`` with an ``entry_phase`` reason, even on a Monday
+and with ``--force``). From day 6 both run in full.
+
 ``entry_signal_tool`` prepares at most one tranche per day (see its same-day
 lock); run_cycle exports the cycle date to every step as ``CYCLE_DATE`` and
 passes the rest of the environment through unchanged (``RISK_FREE_RATE``,
@@ -613,6 +619,19 @@ def daily_due(as_of: date) -> tuple[bool, str | None, str | None]:
                 f"{as_of.isoformat()}); it counts as that session's day"
             )
     return True, None, warning
+
+
+def entry_phase(portfolio: dict, as_of: date, signals_dir: str, signals_base: str | None = None) -> dict:
+    """``pipeline_io.entry_phase_info`` for the cycle's portfolio, counting sessions with
+    this module's NYSE calendar (``nyse_session_dates``) and the same state locations the
+    steps use. Raises ``CalendarUnavailable`` when there is no calendar."""
+    meta = {
+        "portfolio_optimizer": portfolio.get("optimizer"),
+        "portfolio_run_ts": portfolio.get("run_ts"),
+    }
+    env = step_environment(portfolio["path"], signals_dir, "entry_signal_tool", as_of,
+                           signals_base=signals_base)
+    return pipeline_io.entry_phase_info(meta, as_of, env=env, sessions_fn=nyse_session_dates)
 
 
 def _iso_week(day: date) -> tuple[int, int]:
@@ -1334,6 +1353,24 @@ def main(argv: list[str] | None = None) -> int:
             _emit_or_report(summary_dir, summary)
             print(message)
             return 0
+
+        if "active_management" in steps:
+            try:
+                phase = entry_phase(portfolio, as_of, signals_dir, signals_base)
+            except CalendarUnavailable as exc:
+                return _calendar_failure(
+                    exc, mode, as_of, portfolio, steps, cycle_warnings, summary_dir, signals_dir,
+                )
+            if phase["active"]:
+                reason = (
+                    f"entry_phase: day {phase['day']} of {phase['last_day']} since "
+                    f"{phase['start_date']}; active_management is skipped during entry days "
+                    f"1..{phase['last_day']} and runs weekly from day {phase['last_day'] + 1}"
+                )
+                return _not_due(
+                    args, mode, as_of, portfolio, steps, cycle_warnings, summary_dir, reason,
+                    signals_dir,
+                )
 
         if args.force:
             cycle_warnings.append("due check bypassed by --force")

@@ -2053,17 +2053,52 @@ def run_active_management_engine(portfolio, horizon_days, api_key, cash_limit):
         "excluded": excluded,
     }
 
+def _peso_real(ticker, holdings):
+    """Peso realmente invertido de ``ticker`` segun los fills, o None si no se sabe.
+
+    Neto (compras - ventas) en peso del portafolio. Un activo sin fills pesa 0. Con
+    cantidad neta pero sin pesos en los fills (y sin PORTFOLIO_CAPITAL) no se sabe.
+    """
+    row = holdings.get(ticker)
+    if row is None:
+        return 0.0
+    if row["net_qty"] > 1e-9 and row["bought_weight"] <= 0:
+        return None
+    return float(row["net_weight"])
+
+
 def _senal_gestion_activa(resultado, holdings=None):
     """Senal de rebalanceo. ``holdings`` (pipeline_io.load_portfolio_holdings) agrega
-    la tenencia neta ejecutada (compras - ventas, minimo 0) por ticker."""
+    la tenencia neta ejecutada (compras - ventas, minimo 0) por ticker.
+
+    Con holdings, ``current_weight`` es el peso REAL invertido (peso de los fills
+    netos), no el peso objetivo completo del optimizador (``original_target_weight``),
+    y el delta sale de ahi. Un activo con accion tactica AUMENTAR y por debajo de su
+    objetivo original nunca produce SELL (y RECORTAR / LIQUIDAR nunca produce BUY):
+    queda en HOLD. Sin holdings se conserva el
+    comportamiento anterior (actual = objetivo del optimizador)."""
     holdings = holdings or {}
     tabla = resultado.get("tabla_rebalanceo")
     regimen = resultado.get("regimen_riesgo") or {}
     rebalances = []
     if tabla is not None:
+        reales = {}
+        if holdings:
+            for tk in tabla["Ticker"]:
+                if str(tk) != "CASH":
+                    reales[str(tk)] = _peso_real(str(tk), holdings)
         for _, row in tabla.iterrows():
-            current = None if pd.isna(row["Peso_Inicial"]) else float(row["Peso_Inicial"])
+            ticker = str(row["Ticker"])
+            original = None if pd.isna(row["Peso_Inicial"]) else float(row["Peso_Inicial"])
+            current, source = original, "target"
+            if holdings:
+                if ticker == "CASH":
+                    if all(w is not None for w in reales.values()):
+                        current, source = max(0.0, 1.0 - sum(reales.values())), "fills"
+                elif reales.get(ticker) is not None:
+                    current, source = reales[ticker], "fills"
             target = None if pd.isna(row["Nuevo_Peso"]) else float(row["Nuevo_Peso"])
+            tactical = None if pd.isna(row["Accion"]) else str(row["Accion"])
             if current is None or target is None:
                 delta = None
                 action = "HOLD"
@@ -2075,17 +2110,27 @@ def _senal_gestion_activa(resultado, holdings=None):
                     action = "SELL"
                 else:
                     action = "HOLD"
+                if source == "fills":
+                    # Lo tactico manda el sentido: subir un activo infrainvertido no vende,
+                    # y recortar uno infrainvertido no compra.
+                    if (action == "SELL" and tactical == "AUMENTAR"
+                            and original is not None and current < original - 1e-6):
+                        action, target, delta = "HOLD", current, 0.0
+                    elif action == "BUY" and tactical in ("RECORTAR", "LIQUIDAR"):
+                        action, target, delta = "HOLD", current, 0.0
             reason = "" if pd.isna(row["Racional"]) else str(row["Racional"])
             rebalances.append({
-                "ticker": str(row["Ticker"]),
+                "ticker": ticker,
                 "action": action,
                 "current_weight": None if current is None else round(current, 6),
                 "target_weight": None if target is None else round(target, 6),
                 "delta_weight": None if delta is None else round(delta, 6),
                 "reason": reason,
-                "tactical_action": None if pd.isna(row["Accion"]) else str(row["Accion"]),
+                "tactical_action": tactical,
             })
             if holdings:
+                rebalances[-1]["original_target_weight"] = None if original is None else round(original, 6)
+                rebalances[-1]["current_weight_source"] = source
                 known = holdings.get(rebalances[-1]["ticker"])
                 rebalances[-1]["net_held_qty"] = None if known is None else known["net_qty"]
 

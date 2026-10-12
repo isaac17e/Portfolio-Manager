@@ -20,6 +20,7 @@ import run_cycle
 BOGOTA = ZoneInfo("America/Bogota")
 PORTFOLIO_RUN_TS = "2026-10-05T16:40:12-05:00"
 DEFAULT_SESSION_DATE = "2026-03-04"
+PAST_ENTRY_PHASE = {"day": 30, "start_date": "2020-01-02", "active": False, "last_day": 5}
 
 FAKE_STEP = r'''
 import json
@@ -145,6 +146,10 @@ class CycleTestCase(unittest.TestCase):
         self.fake = os.path.join(self.tmp, "fake_step.py")
         Path(self.fake).write_text(FAKE_STEP, encoding="utf-8")
         self.commands = []
+        # Weekly tests are about a portfolio past its entry phase (days 1..5).
+        patch = mock.patch.object(run_cycle, "entry_phase", return_value=PAST_ENTRY_PHASE)
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def tearDown(self):
         self._td.cleanup()

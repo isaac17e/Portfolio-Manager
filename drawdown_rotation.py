@@ -25,6 +25,11 @@
 #   6. SALIDA: terminal + figuras HTML (viz_utils). La senal JSON y el estado
 #      de rotacion son internos: entry_signal_tool lee el estado y escalona la
 #      entrada de los activos nuevos en su ciclo de 5 dias.
+#
+# FASE DE ENTRADA (dias 1..5 del portafolio, en sesiones NYSE): corre en modo
+# PAUSA. No vende, no rota y no toca el estado de rotacion. Solo marca los
+# activos con retorno de 5 sesiones <= -5% en data["pause"]; entry_signal_tool
+# lee la marca y no compra esos activos hoy. Desde el dia 6, modo completo.
 # ==============================================================================
 
 from __future__ import annotations
@@ -47,6 +52,7 @@ from pipeline_io import (  # noqa: E402
     announce_signals_dir,
     apply_rotation_overrides,
     cycle_today,
+    entry_phase_info,
     export_signals,
     load_portfolio,
     load_rotation_state,
@@ -586,13 +592,76 @@ def update_state(state, triggers, elegidos, peso_cada, today):
     return state
 
 
-def run(force=(), dry_run=False):
+def pause_candidates(rows):
+    """Tickers (sorted) whose 5-session return is <= DROP_THRESHOLD, and their returns."""
+    paused, returns = [], {}
+    for row in rows:
+        ret = row["ret_5d"]
+        if ret is not None and np.isfinite(ret) and ret <= DROP_THRESHOLD:
+            paused.append(row["ticker"])
+            returns[row["ticker"]] = float(ret)
+    return sorted(paused), returns
+
+
+def run_pause(pesos, phase, today, state):
+    """Entry-phase mode: detect only, never sell or rotate.
+
+    Writes ``data["pause"] = {"mode": "pause", "cycle_date", "entry_day", "tickers",
+    "returns"}``: the tickers entry_signal_tool must not buy today. The rotation
+    state file is not touched.
+    """
+    print(f"\n[fase de entrada] dia {phase['day']} de {phase['last_day']} "
+          f"(desde {phase['start_date']}): modo PAUSA, sin ventas ni rotacion.")
+    excluded, filas = [], []
+    for ticker, peso in pesos.items():
+        try:
+            ohlc = fetch_ohlc(ticker)
+        except Exception as exc:  # noqa: BLE001
+            excluded.append({"ticker": ticker, "reason": failure_reason(exc)})
+            filas.append({"ticker": ticker, "weight": peso, "ret_5d": np.nan,
+                          "triggered": False, "motivo": "sin precios"})
+            continue
+        ret = price_metrics(ohlc)["ret_5d"]
+        filas.append({"ticker": ticker, "weight": peso, "ret_5d": ret, "triggered": False,
+                      "motivo": f"{ret:+.2%} en {DROP_WINDOW_SESSIONS} sesiones"
+                      if np.isfinite(ret) else "sin historico suficiente"})
+    pausados, retornos = pause_candidates(filas)
+    for fila in filas:
+        if fila["ticker"] in pausados:
+            fila["motivo"] += " -> PAUSA (no se compra hoy)"
+    print_detector(filas)
+    if pausados:
+        print(f"\nPAUSADOS hoy en la entrada: {', '.join(pausados)}")
+    else:
+        print("\nNingun activo en pausa hoy.")
+    data = {"triggered": False, "cycle_date": today, "horizon": HORIZON,
+            "mode": "pause", "entry_phase": phase,
+            "drop_window_sessions": DROP_WINDOW_SESSIONS, "drop_threshold": DROP_THRESHOLD,
+            "detector": [{"ticker": f["ticker"], "weight": f["weight"], "ret_5d": f["ret_5d"],
+                          "triggered": False, "paused": f["ticker"] in pausados,
+                          "reason": f["motivo"]} for f in filas],
+            "pause": {"mode": "pause", "cycle_date": today, "entry_day": phase["day"],
+                      "tickers": pausados, "returns": retornos},
+            "triggers": [], "universe": None, "top": [], "selection": None, "rebalances": [],
+            "target_overrides": state.get("target_overrides") or {}, "excluded": excluded}
+    warns = [f"{item['ticker']}: {item['reason']}" for item in excluded]
+    warns += [f"{t}: paused for today's entry tranche ({retornos[t]:+.2%} in "
+              f"{DROP_WINDOW_SESSIONS} sessions)" for t in pausados]
+    return data, warns
+
+
+def run(force=(), dry_run=False, mode="auto"):
+    """``mode``: "auto" (pause during entry days 1..5, full afterwards), "pause" or "full"."""
     announce_signals_dir(SCRIPT, _PORTFOLIO_META)
-    today = cycle_today().isoformat()
+    today_date = cycle_today()
+    today = today_date.isoformat()
     state = load_rotation_state(_PORTFOLIO_META)
     pesos, notas = apply_rotation_overrides(_PORTFOLIO_META["weights"], state)
     for nota in notas:
         print(f"  [estado] {nota}")
+    phase = entry_phase_info(_PORTFOLIO_META, today_date)
+    if mode == "pause" or (mode == "auto" and phase["active"]):
+        return run_pause(pesos, phase, today, state)
     warnings_out, excluded = [], []
 
     # --- 1. detector -----------------------------------------------------------
@@ -618,6 +687,7 @@ def run(force=(), dry_run=False):
 
     disparados = [f for f in filas_det if f["triggered"]]
     data = {"triggered": bool(disparados), "cycle_date": today, "horizon": HORIZON,
+            "mode": "full", "entry_phase": phase, "pause": None,
             "drop_window_sessions": DROP_WINDOW_SESSIONS, "drop_threshold": DROP_THRESHOLD,
             "detector": [{"ticker": f["ticker"], "weight": f["weight"], "ret_5d": f["ret_5d"],
                           "triggered": f["triggered"], "reason": f["motivo"]} for f in filas_det],
@@ -787,6 +857,9 @@ def parse_args(argv=None):
     p.add_argument("--force", action="append", default=[], metavar="TICKER",
                    help="diagnostica TICKER aunque no haya caido 5%% (pruebas)")
     p.add_argument("--dry-run", action="store_true", help="no actualiza el estado de rotacion")
+    p.add_argument("--mode", choices=("auto", "pause", "full"), default="auto",
+                   help="auto: pausa en los dias 1..5 de la entrada, completo desde el 6; "
+                        "pause / full fuerzan uno")
     p.add_argument("--universe", choices=UNIVERSE_MODES, default=None,
                    help="indices | custom | both (por defecto ROTATION_UNIVERSE o indices)")
     return p.parse_args(argv)
@@ -798,7 +871,7 @@ def main(argv=None):
     if args.universe:
         UNIVERSE_MODE = args.universe
     warnings.filterwarnings("ignore", category=FutureWarning)
-    data, warns = run(force=set(t.upper() for t in args.force), dry_run=args.dry_run)
+    data, warns = run(force=set(t.upper() for t in args.force), dry_run=args.dry_run, mode=args.mode)
     export_signals(SCRIPT, data, _PORTFOLIO_META, warnings=warns)
 
 
