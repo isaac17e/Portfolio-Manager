@@ -37,7 +37,6 @@ portfolio = {"GLD": 0.18,
 
 _PORTFOLIO_META = load_portfolio(portfolio)
 portfolio = _PORTFOLIO_META["weights"]
-announce_signals_dir("active_management", _PORTFOLIO_META)
 
 # Horizonte en dias calendario: lo que queda hasta horizon_end del portafolio
 # (run_cycle lo pasa en PORTFOLIO_HORIZON_DAYS; suelto se lee del JSON). Sin
@@ -2108,17 +2107,26 @@ def _senal_gestion_activa(resultado):
 # BLOQUE 9: EJECUCION
 # ============================================================================
 
-resultado = run_active_management_engine(portfolio, investment_horizon_days, polygon_api_key, cash_reserve_limit)
-_senal_activa = _senal_gestion_activa(resultado)
-_senal_activa["risk_free_rate"] = risk_free_rate
-_senal_activa["horizon"] = HORIZON
-export_signals(
-    "active_management", _senal_activa, _PORTFOLIO_META,
-    warnings=exclusion_warnings(_senal_activa.get("excluded")) + adr_warnings(list(portfolio.keys())),
-)
+def main():
+    # Ejecucion completa. Va dentro de main() para que drawdown_rotation.py pueda
+    # importar el analisis de opciones (analyze_ticker_options, el score tactico)
+    # sin correr el motor entero.
+    announce_signals_dir("active_management", _PORTFOLIO_META)
+    resultado = run_active_management_engine(portfolio, investment_horizon_days, polygon_api_key, cash_reserve_limit)
+    _senal_activa = _senal_gestion_activa(resultado)
+    _senal_activa["risk_free_rate"] = risk_free_rate
+    _senal_activa["horizon"] = HORIZON
+    export_signals(
+        "active_management", _senal_activa, _PORTFOLIO_META,
+        warnings=exclusion_warnings(_senal_activa.get("excluded")) + adr_warnings(list(portfolio.keys())),
+    )
 
-for _nombre in ("gamma_plot", "allocation_plot", "risk_plot"):
-    show_or_save(resultado[_nombre], "active_management", _nombre, portfolio=_PORTFOLIO_META)
+    for _nombre in ("gamma_plot", "allocation_plot", "risk_plot"):
+        show_or_save(resultado[_nombre], "active_management", _nombre, portfolio=_PORTFOLIO_META)
 
-print("\n-- Tabla de Rebalanceo (data.frame crudo) --")
-print(resultado["tabla_rebalanceo"])
+    print("\n-- Tabla de Rebalanceo (data.frame crudo) --")
+    print(resultado["tabla_rebalanceo"])
+
+
+if __name__ == "__main__":
+    main()

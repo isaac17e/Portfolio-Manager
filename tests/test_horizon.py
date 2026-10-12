@@ -397,7 +397,7 @@ class StepHorizonTests(unittest.TestCase):
         self.assertEqual(days, {
             "fundamental_analysis": None, "portfolio_risk_score_leverage": 31,
             "portfolio_gex_field": 31, "portfolio_vix": 31, "entry_signal_tool": 61,
-            "active_management": 31,
+            "drawdown_rotation": 31, "active_management": 31,
         })
 
     def test_per_step_mode_one_month(self):

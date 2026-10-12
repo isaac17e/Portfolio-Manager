@@ -232,6 +232,7 @@ class SuccessPathTests(CycleTestCase):
                 "portfolio_risk_score_leverage",
                 "portfolio_gex_field",
                 "portfolio_vix",
+                "drawdown_rotation",
                 "entry_signal_tool",
             ],
         )
@@ -243,7 +244,7 @@ class SuccessPathTests(CycleTestCase):
         self.assertEqual(body["portfolio"]["run_ts"], PORTFOLIO_RUN_TS)
         self.assertEqual(body["portfolio"]["horizon_end"], "2026-12-05")
         self.assertIsNone(body["failing_step"])
-        self.assertEqual([step["status"] for step in body["steps"]], ["success"] * 5)
+        self.assertEqual([step["status"] for step in body["steps"]], ["success"] * len(run_cycle.DAILY_STEPS))
         self.assertTrue(all(step["duration_seconds"] is not None for step in body["steps"]))
         self.assertTrue(all(step["output_file"] for step in body["steps"]))
         self.assertEqual(body["scalars"]["target_leverage"], 3.5)
@@ -674,7 +675,7 @@ class DailyCalendarTests(CycleTestCase):
         self.assertIsNone(vix["data"]["env_seen"]["ENTRY_FORCE_NEW_TRANCHE"])
 
     def test_step_aliases(self):
-        result = self.invoke("--steps", "entry,vix,gex,risk,fundamental")
+        result = self.invoke("--steps", "entry,rotation,vix,gex,risk,fundamental")
         self.assertEqual(result["code"], 0, result["stderr"])
         self.assertEqual(self.commands, run_cycle.DAILY_STEPS)
         self.commands = []

@@ -14,6 +14,7 @@ Most scripts take a portfolio as a `ticker: weight` dictionary at the top of the
 | [`portfolio_vix.py`](portfolio_vix.py) | A VIX-style model-free implied volatility index for the whole portfolio |
 | [`portfolio_gex_field.py`](portfolio_gex_field.py) | Live 3D surface combining the portfolio's gamma exposure with a macro stress axis |
 | [`fundamental_analysis.py`](fundamental_analysis.py) | Traffic-light fundamental scorecard per ticker, with an HTML report |
+| [`drawdown_rotation.py`](drawdown_rotation.py) | When a holding falls 5% or more in 5 sessions: trims or liquidates it and rotates the freed weight into 1–3 of the top 10 momentum names of the S&P 500 / NASDAQ |
 
 ---
 
@@ -130,6 +131,32 @@ The number of green signals gives a global rating: **Global Green Light** (≥ 9
 
 **Output**: `reporte_fundamental.html` (in the portfolio's `artifacts/` folder, see [Per-portfolio signal folders](#per-portfolio-signal-folders)), with summary cards, a signal matrix and charts of the last 4 fiscal years and 5 quarters.
 
+## `drawdown_rotation.py` — Rotation after an abnormal drop
+
+Runs every day in the cycle, right before `entry_signal_tool`. Most days it only checks prices and exits.
+
+1. **Detector**: a holding fires when its cumulative return over the last **5 sessions is −5% or worse**. The rotation state remembers each trigger, so the same drop does not fire every day: after a trigger the holding is quiet for 5 sessions, unless it falls another 5% from the trigger close.
+2. **Diagnosis** (deterioration score 0–100, higher is worse):
+
+   | Part | Weight | What it reads |
+   |---|---|---|
+   | Options | 40% | `active_management`'s tactical score (GEX, gamma flip, sweeps, put/call, Vanna/Charm) on the target expiry |
+   | Fatigue | 30% | 20-day realized vol vs its 120-day mean, 14-day ATR% vs its 120-day mean, and distance to the 20-day mean in standard deviations (replaces the SMA200) |
+   | Severity | 30% | the 5-session drop in weekly standard deviations (3σ or more = 100) |
+
+   Below 40: hold. 70 or more: liquidate. In between: trim 25% to 75% of the position, linearly.
+3. **Universe**: the top 30 S&P 500 and top 30 NASDAQ stocks by market cap, scraped from stockanalysis.com (slickcharts.com as the S&P fallback, a built-in list if both fail), the same method as `quadratic_utility.py` in AM-PM-Architecture. Duplicates are removed and each list is filled with its next names in market-cap order, so there are 60 unique candidates; one share class per company (GOOGL, not GOOG) and none of the current holdings. `ROTATION_UNIVERSE=custom` uses only your list (`CUSTOM_TICKERS` in the script or `ROTATION_CUSTOM_TICKERS="A,B,C"`), and `both` adds it to the indices.
+4. **Top 10** (score 0–100): momentum 50% (percentiles inside the universe of 12-1 momentum, 6-month return over its volatility and 3-month return), options 35% (the same tactical score, forward-looking) and freshness 15% (100 − fatigue). A candidate that is itself down 5% in 5 sessions is skipped.
+5. **Selection**: every combination of 1, 2 or 3 names from the top 10 (175 in all) is tried, the freed weight split equally among them, and the one with the best expected portfolio Sharpe wins (ties go to fewer names). Covariance = ATM implied volatility (historical when there is none) × one-year historical correlation; expected excess return = 0.5 × (score − 50) / 50 × σ, so the current holdings and the candidates are scored on one scale.
+6. **Output**: the terminal shows the detector, the diagnosis, the top 10, the best combinations and the proposed trades; the charts go to HTML. The new names are not bought at once: the rotation state (`<PIPELINE_DIR>/state/rotation_state_<optimizer>_<run_ts>.json`, `ROTATION_STATE_FILE` to override) gives `entry_signal_tool` the new target weights, and it builds them over its 5-day cycle. A trimmed holding gets no further buys from the entry tool. A new portfolio file starts with no rotations.
+
+```bash
+python drawdown_rotation.py                 # what the daily cycle runs
+python drawdown_rotation.py --dry-run       # full analysis, state not updated
+python drawdown_rotation.py --force KO      # diagnose KO even without a 5% drop (testing)
+python drawdown_rotation.py --universe both
+```
+
 ## Options horizon per script
 
 The portfolio's horizon (`horizon_end`, `horizon_days`, `params.horizon_months` in the portfolio JSON) is the single source of the investment term. `run_cycle` passes each step its horizon in calendar days as `PORTFOLIO_HORIZON_DAYS`; a script run on its own computes the same number from `PORTFOLIO_FILE` (`pipeline_io.resolve_horizon`). Risk and hedging readings use the days **left** from the cycle date (`CYCLE_DATE`, else today) to `horizon_end`; the entry tool uses the **full** term, since it builds the position for the whole holding period. With no portfolio file, or a file without a horizon, each script keeps the default in the table. No script reads an expiration shorter than `pipeline_io.MIN_OPTION_DAYS` (7 calendar days; below a week the chain is dominated by expiry-week gamma and pinning) unless nothing else is listed, in which case it takes the nearest available one and warns.
@@ -141,6 +168,7 @@ The portfolio's horizon (`horizon_end`, `horizon_days`, `params.horizon_months` 
 | `portfolio_risk_score_leverage` | remaining | the one closest to the horizon; ex-post `*_Horizonte` readings scale to `round(days × 5/7)` trading days | 21 trading days = 29 calendar days |
 | `portfolio_vix` | remaining | the two that bracket 30 days (CBOE index, unchanged) plus the two that bracket the horizon, each interpolated with the CBOE rule | 30 days (both readings equal) |
 | `portfolio_gex_field` | remaining | every expiration up to the horizon (at least 14 days). If that window gives no usable gamma field (no expiry beyond 7 days with exposure, e.g. only a 7-day monthly left), it widens to 60, 90, 120, then 180 days and uses the first that does; the ticker is excluded only if none does. `holdings[]` records `expiry_window_days`, `expirations` and `expiry_fallback` | 2 months = 60 days |
+| `drawdown_rotation` | remaining | the one closest to the horizon (same reading as `active_management`, for the falling holding, the 60 candidates and the current holdings) | 42 calendar days |
 
 Every signal records the horizon it used in `data.horizon`: `days`, `source` (`portfolio` or `default`), `via` (`env` from run_cycle, `file`, or null), `mode`, `raw_days` (before the 7-day floor), `floored`, `default_days` and `horizon_end`. The risk score adds `trading_days`. `portfolio_vix` also publishes `vix_portfolio_horizon` (annualized VIX at the horizon), `sigma_portfolio_horizon` (σ over the horizon, not annualized) and `holdings[].vix_horizon`; `vix_portfolio` stays the 30-day index. Annualized readouts are unchanged.
 
@@ -183,6 +211,7 @@ python portfolio_risk_score_leverage.py
 python portfolio_vix.py
 python portfolio_gex_field.py --once   # pipeline mode
 python fundamental_analysis.py
+python drawdown_rotation.py
 ```
 
 `POLYGON_CALLS_PER_MINUTE` defaults to **100** (sliding window). Set it to `5` on the free Stocks tier. HTTP 429 and 5xx are retried with exponential backoff and jitter; a `Retry-After` header is honored.
@@ -191,7 +220,7 @@ python fundamental_analysis.py
 
 One command validates the portfolio file, runs each script as a subprocess of the same interpreter, and writes a cycle summary. Stdin of every step is closed (`DEVNULL`) so a prompt cannot hang the cycle. A per-step timeout stops a step that does not return.
 
-Daily mode is the default. The steps run in this order: `fundamental_analysis`, `portfolio_risk_score_leverage`, `portfolio_gex_field` (`--once`), `portfolio_vix` (`--no-show`, so the cycle does not open the report window), `entry_signal_tool`. Every step gets `HEADLESS=1` (see [Figures](#figures)). The entry tool is not passed a cycle day: it uses `ENTRY_CYCLE_DAY` / `ENTRY_INVESTED_PCT` when those are set, otherwise the portfolio's entry state (see [Entry state and fills](#entry-state-and-fills)), and it does not call `input()`.
+Daily mode is the default. The steps run in this order: `fundamental_analysis`, `portfolio_risk_score_leverage`, `portfolio_gex_field` (`--once`), `portfolio_vix` (`--no-show`, so the cycle does not open the report window), `drawdown_rotation`, `entry_signal_tool`. Every step gets `HEADLESS=1` (see [Figures](#figures)). The entry tool is not passed a cycle day: it uses `ENTRY_CYCLE_DAY` / `ENTRY_INVESTED_PCT` when those are set, otherwise the portfolio's entry state (see [Entry state and fills](#entry-state-and-fills)), and it does not call `input()`.
 
 Daily mode only runs on an NYSE session. The date is the America/Bogota date (override with `--date`); if it is a weekend or an NYSE holiday the run exits 0 with status `not_due` and reason `non_trading_day`, and the summary is written as in weekly mode. `--force` skips this check. There is no time-of-day rule: a run after the close still counts as that session's day, but the summary gets a warning (`run after NYSE close (16:00 ET on <date>); it counts as that session's day`). The close comes from the calendar, so early closes (13:00 ET) are honoured, with 16:00 ET as the fallback. The warning only applies when the date is today, not on a `--date` replay.
 
@@ -257,6 +286,9 @@ Each script also writes a JSON signal (contract section 4) through `pipeline_io.
 | `RISK_FREE_RATE` | unset = each script's own default (see [Risk-free rate](#risk-free-rate)) |
 | `HEADLESS` or `GEX_ONCE` | unset (`run_cycle` sets `HEADLESS=1` for every step) |
 | `FIGURES_DIR` | `<signals dir>/figures` (headless figure HTML; `<PIPELINE_DIR>/figures` with `SIGNALS_PER_PORTFOLIO=0`) |
+| `ROTATION_STATE_FILE` | `<PIPELINE_DIR>/state/rotation_state_<optimizer>_<run_ts>.json` |
+| `ROTATION_UNIVERSE` | `indices` (`custom` or `both` add your own list) |
+| `ROTATION_CUSTOM_TICKERS` | unset (comma-separated tickers for `custom` / `both`) |
 | `ENTRY_STAGGER_PCT` | `0.20` (tier `none`: share of the target bought per cycle day) |
 | `NO_OPTIONS_WEIGHT_CAP_FACTOR` | `0.5` (tier `none`: target weight x factor) |
 | `NO_OPTIONS_WEIGHT_CAP` | unset (tier `none`: optional absolute weight cap) |

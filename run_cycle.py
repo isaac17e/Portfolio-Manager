@@ -3,7 +3,8 @@
 Daily mode validates the portfolio file, checks that the America/Bogota date
 (or ``--date``) is an NYSE session (``--force`` skips this), and runs, in order,
 ``fundamental_analysis``, ``portfolio_risk_score_leverage``,
-``portfolio_gex_field`` (``--once``), ``portfolio_vix`` (``--no-show``), and
+``portfolio_gex_field`` (``--once``), ``portfolio_vix`` (``--no-show``),
+``drawdown_rotation`` (rotation when a holding fell 5% in 5 sessions) and
 ``entry_signal_tool``. Every step gets ``HEADLESS=1``: figures are written to
 HTML (``viz_utils``) instead of shown. Weekly mode runs only
 ``active_management``, and only on the first NYSE session of the ISO week
@@ -77,6 +78,9 @@ DAILY_STEPS = [
     "portfolio_risk_score_leverage",
     "portfolio_gex_field",
     "portfolio_vix",
+    # Antes de entry_signal_tool: si un activo cayo 5% en 5 sesiones, la rotacion
+    # deja en su estado los pesos nuevos y entry los escalona el mismo dia.
+    "drawdown_rotation",
     "entry_signal_tool",
 ]
 WEEKLY_STEPS = ["active_management"]
@@ -90,6 +94,7 @@ STEP_HORIZON_MODE = {
     "portfolio_gex_field": "remaining",
     "portfolio_vix": "remaining",
     "entry_signal_tool": "full",
+    "drawdown_rotation": "remaining",
     "active_management": "remaining",
 }
 STEP_ALIASES = {
@@ -98,6 +103,7 @@ STEP_ALIASES = {
     "gex": "portfolio_gex_field",
     "vix": "portfolio_vix",
     "entry": "entry_signal_tool",
+    "rotation": "drawdown_rotation",
 }
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -807,6 +813,7 @@ _SCALAR_KEYS = {
     "portfolio_gex_field": ("macro_y", "potential_z", "grad_magnitude", "n_holdings"),
     "fundamental_analysis": ("n_tickers", "n_indicators"),
     "active_management": ("regime", "vol_portfolio", "diversification_ratio"),
+    "drawdown_rotation": ("triggered",),
 }
 
 
@@ -834,6 +841,11 @@ def _absorb_signal(script: str, payload: dict, scalars: dict, signal_warnings: d
         if data.get("signal") == "already_prepared_today":
             scalars["entry_signal"] = "already_prepared_today"
             scalars["entry_tranche_status"] = data.get("tranche_status")
+    if script == "drawdown_rotation":
+        rotation = data.get("rebalances")
+        if isinstance(rotation, list):
+            scalars["rotation_rebalances"] = rotation
+            scalars["n_rotation_rebalances"] = len(rotation)
     if script == "active_management":
         rebalances = data.get("rebalances")
         if isinstance(rebalances, list):

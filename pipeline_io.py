@@ -704,6 +704,107 @@ def entry_state_path(portfolio_meta) -> str:
     return os.path.join(pipeline_dir(), "state", f"entry_state_{key}.json")
 
 
+# ------------------------------------------------------------------------------
+# Rotation state (drawdown_rotation.py -> entry_signal_tool.py)
+# ------------------------------------------------------------------------------
+ROTATION_STATE_VERSION = 1
+
+
+def rotation_state_path(portfolio_meta) -> str:
+    """Rotation state of this portfolio: ``ROTATION_STATE_FILE``, else
+    ``<pipeline dir>/state/rotation_state_<optimizer>_<run_ts stamp>.json``.
+
+    One file per portfolio, like the entry state: a new optimized portfolio
+    starts with no rotations, because its weights already supersede them."""
+    explicit = os.environ.get("ROTATION_STATE_FILE")
+    if explicit:
+        return explicit
+    key = portfolio_key(portfolio_meta) or "hardcoded_fallback"
+    return os.path.join(pipeline_dir(), "state", f"rotation_state_{key}.json")
+
+
+def empty_rotation_state(portfolio_meta=None) -> dict:
+    meta = portfolio_meta or {}
+    return {
+        "schema_version": ROTATION_STATE_VERSION,
+        "portfolio": {
+            "optimizer": meta.get("portfolio_optimizer"),
+            "run_ts": meta.get("portfolio_run_ts"),
+        },
+        "target_overrides": {},
+        "triggers": {},
+        "history": [],
+    }
+
+
+def load_rotation_state(portfolio_meta, path: str | None = None) -> dict:
+    """Read the rotation state, or an empty one. Never raises."""
+    path = path or rotation_state_path(portfolio_meta)
+    if not os.path.isfile(path):
+        return empty_rotation_state(portfolio_meta)
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        _warn(f"Could not read rotation state ({path}): {exc}. Starting empty.")
+        return empty_rotation_state(portfolio_meta)
+    if not isinstance(payload, dict) or payload.get("schema_version") != ROTATION_STATE_VERSION:
+        _warn(f"Unsupported rotation state ({path}). Starting empty.")
+        return empty_rotation_state(portfolio_meta)
+    state = empty_rotation_state(portfolio_meta)
+    for key in ("target_overrides", "triggers"):
+        if isinstance(payload.get(key), dict):
+            state[key] = payload[key]
+    if isinstance(payload.get("history"), list):
+        state["history"] = payload["history"]
+    return state
+
+
+def save_rotation_state(state: dict, portfolio_meta, path: str | None = None) -> str | None:
+    """Atomic write of the rotation state. Returns the path, or None after a warning."""
+    path = path or rotation_state_path(portfolio_meta)
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        text = json.dumps(to_jsonable(state), indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+        _atomic_write(path, text)
+        return path
+    except Exception as exc:
+        _warn(f"Could not write rotation state ({path}): {exc}.")
+        return None
+
+
+def apply_rotation_overrides(weights: dict, state) -> tuple[dict, list[str]]:
+    """Target weights after the rotations recorded for this portfolio.
+
+    ``state["target_overrides"]`` maps ticker -> new target weight: a trimmed
+    holding gets its reduced weight, a liquidated one 0 (it leaves the dict),
+    a new name from the rotation its share of the freed weight. Returns
+    ``(weights, notes)``; ``weights`` is unchanged when there are no overrides.
+    """
+    overrides = (state or {}).get("target_overrides") or {}
+    if not overrides:
+        return dict(weights), []
+    out = dict(weights)
+    notes = []
+    for ticker, value in overrides.items():
+        number = _as_float(value)
+        if number is None or number < 0:
+            continue
+        ticker = str(ticker)
+        before = out.get(ticker)
+        if number <= _ZERO_WEIGHT:
+            if ticker in out:
+                del out[ticker]
+                notes.append(f"{ticker}: liquidated by drawdown_rotation")
+            continue
+        out[ticker] = number
+        if before is None:
+            notes.append(f"{ticker}: new target {number:.4f} from drawdown_rotation")
+        elif abs(before - number) > 1e-9:
+            notes.append(f"{ticker}: target {before:.4f} -> {number:.4f} by drawdown_rotation")
+    return out, notes
+
+
 def load_fills(script: str = "entry_signal_tool", directory: str | None = None):
     """Read a fills document or return None. Never raises."""
     path = locate_fills_file(script, directory)

@@ -17,12 +17,14 @@ from pipeline_io import (
     MIN_OPTION_DAYS,
     announce_signals_dir,
     apply_entry_fills,
+    apply_rotation_overrides,
     cycle_today,
     entry_state_path,
     export_signals,
     load_fills,
     load_portfolio,
     load_portfolio_fills,
+    load_rotation_state,
     parse_invested_overrides,
     pick_expiration,
     portfolio_key,
@@ -55,8 +57,18 @@ PESOS_OBJETIVO = {
 }
 
 _PORTFOLIO_META = load_portfolio(PESOS_OBJETIVO)
-PESOS_OBJETIVO = _PORTFOLIO_META["weights"]
+# drawdown_rotation.py deja en el estado de rotacion de este portafolio los
+# pesos que cambio: el activo que cayo queda recortado (o sale si se liquido) y
+# los nuevos entran con su parte del peso liberado, escalonados por este ciclo.
+PESOS_OBJETIVO, NOTAS_ROTACION = apply_rotation_overrides(
+    _PORTFOLIO_META["weights"], load_rotation_state(_PORTFOLIO_META))
 TICKERS = list(PESOS_OBJETIVO.keys())
+# Activos cuyo peso objetivo bajo por una rotacion: no se les compra mas (la
+# rotacion vende parte del activo; seguir llenandolo la contradiria).
+RECORTADOS_POR_ROTACION = sorted(
+    t for t, w in PESOS_OBJETIVO.items()
+    if t in _PORTFOLIO_META["weights"] and w < _PORTFOLIO_META["weights"][t] - 1e-9
+)
 
 PESOS = {
     "gex_regime": 0.18,
@@ -1021,6 +1033,12 @@ def correr_entry_signal(cycle_day=None, invested_pct=None, force_new_tranche=Fal
         for ticker, frac in overrides.items():
             scoring["activos"].setdefault(ticker, _activo_vacio())
             scoring["activos"][ticker]["pct_ya_invertido"] = frac
+    for ticker in RECORTADOS_POR_ROTACION:
+        scoring["activos"].setdefault(ticker, _activo_vacio())
+        scoring["activos"][ticker]["pct_ya_invertido"] = 1.0
+    for nota in NOTAS_ROTACION:
+        print(f"  [rotacion] {nota}")
+        warnings.append(f"rotation: {nota}")
 
     es_ultimo_dia = dia_ciclo >= DIAS_CICLO
     if es_ultimo_dia:

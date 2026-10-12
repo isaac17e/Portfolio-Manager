@@ -6,3 +6,4 @@ plotly
 scipy
 python-dotenv
 pandas_market_calendars
+lxml>=4.9            # motor de pandas.read_html (universe.py)
