@@ -85,7 +85,6 @@ DEFAULT_NO_OPTIONS_CAP_FACTOR = 0.5
 # the Yahoo form of the ticker. ``RY`` is the NYSE listing quoted in USD:
 # Capital.com has no TSX/CAD line for Royal Bank of Canada. Verified ADR epics
 # come from ``_ADR_TABLE``.
-_CAPITAL_VERIFIED_ON = "2026-10-06"
 _CAPITAL_VERIFIED = {
     "BRK-B": {"epic": "BRKB"},  # "BRK.B" does not exist; "BRKb" -> error.not-found.epic
     **{
@@ -179,22 +178,6 @@ def no_us_options_reason(ticker) -> str | None:
 
 def has_us_options(ticker) -> bool:
     return no_us_options_reason(ticker) is None
-
-
-def partition_us_options(tickers):
-    """Split tickers into ``(eligible, excluded)``.
-
-    ``excluded`` is a list of ``{"ticker", "reason"}`` using the original key.
-    """
-    eligible = []
-    excluded = []
-    for ticker in tickers:
-        reason = no_us_options_reason(ticker)
-        if reason:
-            excluded.append({"ticker": _clean(ticker), "reason": reason})
-        else:
-            eligible.append(ticker)
-    return eligible, excluded
 
 
 def exclusion_warnings(excluded) -> list[str]:

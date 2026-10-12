@@ -1101,7 +1101,6 @@ def entry_state_path(portfolio_meta, env=None) -> str:
 # Entry phase: days 1..5 of a portfolio, in NYSE sessions
 # ------------------------------------------------------------------------------
 ENTRY_PHASE_DAYS = 5
-PAUSE_RETURN_THRESHOLD = -0.05
 
 
 def nyse_sessions_between(start: date, end: date) -> list[date]:

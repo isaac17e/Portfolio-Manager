@@ -18,7 +18,7 @@ from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 from pipeline_io import (
-    MIN_OPTION_DAYS, announce_signals_dir, artifact_path, export_signals, load_portfolio,
+    announce_signals_dir, artifact_path, export_signals, load_portfolio,
     prepare_artifact_path, resolve_horizon, resolve_risk_free_rate,
 )
 from polygon_client import NoOptionData, PolygonClient, failure_reason
