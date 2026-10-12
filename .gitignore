@@ -16,3 +16,4 @@ graphify-out/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
 # historiales locales de las corridas (se regeneran en cada ciclo)
 portfolio_risk_history*.csv
 entry_signal_history*.csv
+portfolio_gex_field_data.json
