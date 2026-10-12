@@ -89,12 +89,6 @@
     "ast_hash": "509f63efd8380e04cabedecc49049af0",
     "semantic_hash": ""
   },
-  "CLAUDE.md": {
-    "mtime": 1791469779.0846214,
-    "seen": 1791790453.3944068,
-    "ast_hash": "86a8f8b632925b2ac06771bcf6593fb8",
-    "semantic_hash": ""
-  },
   "gex_utils.py": {
     "mtime": 1791789981.2993739,
     "seen": 1791790453.3943858,
@@ -105,12 +99,6 @@
     "mtime": 1791792606.8119552,
     "seen": 1791792649.77599,
     "ast_hash": "3a0286c68146fe4a6c91df22639f8073",
-    "semantic_hash": ""
-  },
-  "AGENTS.md": {
-    "mtime": 1791469785.388198,
-    "seen": 1791790453.3944058,
-    "ast_hash": "86a8f8b632925b2ac06771bcf6593fb8",
     "semantic_hash": ""
   },
   "price_signals.py": {
