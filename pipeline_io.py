@@ -3,6 +3,39 @@
 Contract: pipeline JSON v1, section 4 (signals). Section 1 describes the
 portfolio file this module reads. Writes are atomic and never raise when the
 output directory cannot be created or written.
+
+Fills formats (EXECUTIONS_DIR, written by the executor, ARES)
+-------------------------------------------------------------
+Buy fills, ``fills_<optimizer>_<run_ts stamp>.json``: ``schema_version`` 1,
+``signal_run_ts`` (the entry signal they confirm), ``executed_ts`` and
+``fills[]`` with ``ticker``, ``action`` "BUY", ``filled_weight``, ``filled_qty``,
+``price``, ``deal_id``, ``status``. See ``load_portfolio_fills``.
+
+Sell fills, ``sell_fills_<optimizer>_<stamp>.json`` (design: no real file
+existed when this was written). The executor records the sales that
+``drawdown_rotation`` asks for here, never in the buy file. Same top level
+as the buy file except that it names the portfolio instead of a signal::
+
+    {"schema_version": 1, "script": "drawdown_rotation",
+     "portfolio_optimizer": "minimum_variance",
+     "portfolio_run_ts": "2026-10-08T11:05:16-05:00",
+     "account": "...", "account_id": "...",
+     "executed_ts": "...", "written_ts": "...",
+     "fills": [{"ticker": "GLD", "action": "SELL", "filled_qty": 10,
+                "filled_weight": 0.06, "price": 180.0, "deal_id": "abc",
+                "status": "filled", "fill_ts": "...", "reason": "ROTACION_SALIDA"}]}
+
+``filled_qty`` and ``filled_weight`` are POSITIVE amounts sold. The reader is
+tolerant: a negative ``filled_qty``, or ``side: "SELL"``, also means a sale, and
+the absolute value is what was sold. There may be several sell files per
+portfolio (one per executed rotation): all of them are read. A file belongs to
+the portfolio when ``portfolio_optimizer`` matches and ``portfolio_run_ts``
+gives the same stamp as the portfolio's; when the file has no ``portfolio_run_ts``
+the ``<stamp>`` of its name must be the portfolio's stamp. Only statuses
+``filled`` / ``partial`` / ``partially_filled`` count.
+
+``load_portfolio_holdings`` combines both kinds into the NET held quantity per
+ticker (bought - sold, never below 0).
 """
 
 from __future__ import annotations
@@ -682,6 +715,185 @@ def load_portfolio_fills(portfolio_meta, directory: str | None = None):
     if not path or not os.path.isfile(path):
         return None
     return _read_fills(path)
+
+
+_SELL_FILLS_PREFIX = "sell_fills_"
+_SALE_STAMP = re.compile(r"\d{8}T\d{6}")
+_QTY_EPS = 1e-9
+
+
+def _sell_fills_candidates(portfolio_meta, directory: str | None = None) -> list[str]:
+    """Paths of ``sell_fills_<optimizer>_<stamp>.json`` files that may belong to the portfolio."""
+    meta = portfolio_meta or {}
+    optimizer = _file_token(meta.get("portfolio_optimizer") or "")
+    if not optimizer or portfolio_key(meta) is None:
+        return []
+    directory = executions_dir() if directory is None else directory
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    head = f"{_SELL_FILLS_PREFIX}{optimizer}_"
+    stamp = run_ts_stamp(meta.get("portfolio_run_ts"))
+    paths = []
+    for name in names:
+        if not (name.startswith(head) and name.endswith(".json")):
+            continue
+        tail = name[len(head):-len(".json")]
+        # A longer optimizer name sharing this prefix ("x" vs "x_y") ends in a
+        # different tail: it must look like a stamp (or be the portfolio's own).
+        if _SALE_STAMP.fullmatch(tail) or tail == stamp:
+            path = os.path.join(directory, name)
+            if os.path.isfile(path):
+                paths.append(path)
+    return paths
+
+
+def _read_sell_fills(path: str, portfolio_meta):
+    """A sell-fills document if it is valid and belongs to the portfolio, else None."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        _warn(f"Could not read sell fills file ({path}): {exc}.")
+        return None
+    if not isinstance(payload, dict) or payload.get("schema_version") != SCHEMA_VERSION:
+        _warn(f"Unsupported sell fills file ({path}).")
+        return None
+    if not isinstance(payload.get("fills", []), list):
+        _warn(f"Sell fills file fills field is not a list ({path}).")
+        return None
+    meta = portfolio_meta or {}
+    optimizer = payload.get("portfolio_optimizer")
+    if optimizer and _file_token(optimizer) != _file_token(meta.get("portfolio_optimizer") or ""):
+        return None
+    wanted = run_ts_stamp(meta.get("portfolio_run_ts"))
+    if payload.get("portfolio_run_ts"):
+        owned = run_ts_stamp(payload["portfolio_run_ts"]) == wanted
+    else:
+        name = os.path.basename(path)
+        owned = name.endswith(f"_{wanted}.json")
+    if not owned:
+        return None
+    loaded = dict(payload)
+    loaded["fills"] = payload.get("fills") or []
+    return loaded
+
+
+def load_portfolio_sell_fills(portfolio_meta, directory: str | None = None) -> list[dict]:
+    """Every sell-fills document of this portfolio (oldest name first). Never raises."""
+    docs = []
+    for path in _sell_fills_candidates(portfolio_meta, directory):
+        doc = _read_sell_fills(path, portfolio_meta)
+        if doc is not None:
+            docs.append(doc)
+    return docs
+
+
+def _fill_side(fill: dict, default: str) -> str:
+    """BUY or SELL for a fill: explicit ``action`` / ``side``, else a negative
+    ``filled_qty`` means a sale, else ``default`` (the kind of file it came from)."""
+    for key in ("action", "side"):
+        value = str(fill.get(key) or "").strip().upper()
+        if value in ("BUY", "SELL"):
+            return value
+    qty = _as_float(fill.get("filled_qty"))
+    if qty is not None and qty < 0:
+        return "SELL"
+    return default
+
+
+def summarize_holdings(buy_doc, sell_docs=()) -> dict:
+    """Net position per ticker from a buy-fills document and sell-fills documents.
+
+    Returns ``{ticker: {"bought_qty", "sold_qty", "net_qty", "bought_weight",
+    "sold_weight", "net_weight"}}``. Quantities and weights are absolute values
+    (a sale may be written as a negative ``filled_qty``); ``net_*`` is bought -
+    sold, floored at 0. Only fills with status filled / partial /
+    partially_filled count. A fill repeated in several files (same ticker, side,
+    ``deal_id`` and ``fill_ts``) counts once.
+    """
+    holdings: dict = {}
+    seen = set()
+    sources = [("BUY", buy_doc)] + [("SELL", doc) for doc in sell_docs or ()]
+    for default, doc in sources:
+        for fill in (doc or {}).get("fills") or []:
+            if not isinstance(fill, dict):
+                continue
+            if str(fill.get("status") or "").strip().lower() not in _APPLIED_FILL_STATUSES:
+                continue
+            ticker = str(fill.get("ticker") or "").strip()
+            if not ticker:
+                continue
+            side = _fill_side(fill, default)
+            qty, weight = _as_float(fill.get("filled_qty")), _as_float(fill.get("filled_weight"))
+            deal_id = fill.get("deal_id")
+            if deal_id:
+                key = (ticker, side, str(deal_id), str(fill.get("fill_ts") or ""))
+                if key in seen:
+                    continue
+                seen.add(key)
+            row = holdings.setdefault(ticker, dict.fromkeys(
+                ("bought_qty", "sold_qty", "bought_weight", "sold_weight"), 0.0))
+            prefix = "bought" if side == "BUY" else "sold"
+            if qty is not None:
+                row[f"{prefix}_qty"] += abs(qty)
+            if weight is not None:
+                row[f"{prefix}_weight"] += abs(weight)
+    for row in holdings.values():
+        row["net_qty"] = max(0.0, row["bought_qty"] - row["sold_qty"])
+        row["net_weight"] = max(0.0, row["bought_weight"] - row["sold_weight"])
+    return holdings
+
+
+def load_portfolio_holdings(portfolio_meta, directory: str | None = None) -> dict:
+    """NET held quantity per ticker from the buy and sell fills of this portfolio.
+
+    Buy fills come from ``load_portfolio_fills`` (the legacy lookup when the
+    portfolio has no optimizer / run_ts), sell fills from
+    ``load_portfolio_sell_fills``. See ``summarize_holdings`` for the result;
+    ``{}`` when there are no fills. Never raises.
+    """
+    if portfolio_key(portfolio_meta) is None:
+        buys = load_fills("entry_signal_tool", directory)
+    else:
+        buys = load_portfolio_fills(portfolio_meta, directory)
+    return summarize_holdings(buys, load_portfolio_sell_fills(portfolio_meta, directory))
+
+
+def fully_sold_tickers(holdings, rotation_state=None) -> list[str]:
+    """Tickers bought and then sold down to nothing (net quantity 0), ascending.
+
+    A ticker with sales but no recorded purchase is not listed: its position
+    came from outside these fills, so a net of 0 would be a guess. A ticker that
+    ``drawdown_rotation`` picked again after the sale (see ``rotation_reentered``)
+    is not listed either: it is meant to be bought again.
+    """
+    out = []
+    for ticker, row in (holdings or {}).items():
+        if row.get("sold_qty", 0.0) > _QTY_EPS and row.get("bought_qty", 0.0) > _QTY_EPS \
+                and row.get("net_qty", 0.0) <= _QTY_EPS \
+                and not rotation_reentered(rotation_state, ticker):
+            out.append(ticker)
+    return sorted(out)
+
+
+def rotation_reentered(rotation_state, ticker: str) -> bool:
+    """True when the rotation bought ``ticker`` on a date after its last trigger.
+
+    ``triggers[ticker]["date"]`` is the last drop that hit it; each ``history``
+    entry lists the names the rotation ``bought`` that day (ISO dates compare as
+    strings). A name that never triggered and was only bought is a plain new
+    entry, which is also True.
+    """
+    state = rotation_state or {}
+    trigger = (state.get("triggers") or {}).get(ticker)
+    last_exit = str(trigger.get("date") or "") if isinstance(trigger, dict) else ""
+    for entry in state.get("history") or []:
+        if isinstance(entry, dict) and ticker in (entry.get("bought") or []) \
+                and str(entry.get("date") or "") > last_exit:
+            return True
+    return False
 
 
 def pipeline_dir() -> str:

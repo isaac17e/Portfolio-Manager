@@ -86,6 +86,71 @@ def _net_gex(spots, contracts, r, scale):
     return (weights @ bs_gamma_matrix(S, k, t, sigma, r, q)) * S ** 2 * scale
 
 
+def _linear_root(a, b, fa, fb):
+    """Root of the chord through (a, fa) and (b, fb), clipped to [a, b]."""
+    if not (np.isfinite(fa) and np.isfinite(fb)) or fb == fa:
+        return 0.5 * (a + b)
+    return float(min(max(a - fa * (b - a) / (fb - fa), min(a, b)), max(a, b)))
+
+
+def _refine_bracket(f, a, b, xtol):
+    """Root of ``f`` in [a, b], or None when the bracket has no strict sign change.
+
+    The endpoints are re-evaluated with ``f`` (the grid values come from the
+    vectorised sum and can differ from the scalar one in the last bits, which
+    is what makes a near-zero bracket raise "f(a) and f(b) must have different
+    signs"). An endpoint that is exactly zero is the root; a bracket whose
+    re-evaluation no longer changes sign has none. If brentq still raises
+    ValueError the chord root is used. Never raises.
+    """
+    try:
+        fa, fb = f(a), f(b)
+    except (ArithmeticError, ValueError):
+        return None
+    if not (np.isfinite(fa) and np.isfinite(fb)):
+        return None
+    if fa == 0:
+        return float(a)
+    if fb == 0:
+        return float(b)
+    if np.sign(fa) == np.sign(fb):
+        return None
+    try:
+        return float(brentq(f, a, b, xtol=xtol))
+    except (ValueError, RuntimeError, ArithmeticError):
+        return _linear_root(a, b, fa, fb)
+
+
+def _grid_roots(f, grid, gex, xtol):
+    """Ascending zero crossings of the GEX profile sampled on ``grid``.
+
+    A run of exactly-zero nodes is one root (its midpoint); a sign change
+    between consecutive finite non-zero nodes is refined by ``_refine_bracket``.
+    An all-zero profile has no crossings.
+    """
+    finite = np.flatnonzero(np.isfinite(gex))
+    if finite.size == 0 or not np.any(gex[finite] != 0):
+        return []
+    roots = []
+    zero_run = []
+    prev = None  # last finite non-zero node
+    for i in finite:
+        if gex[i] == 0:
+            zero_run.append(i)
+            continue
+        if zero_run:
+            roots.append(float(grid[zero_run].mean()))
+            zero_run = []
+        elif prev is not None and np.sign(gex[prev]) != np.sign(gex[i]):
+            root = _refine_bracket(f, grid[prev], grid[i], xtol)
+            if root is not None:
+                roots.append(root)
+        prev = i
+    if zero_run:
+        roots.append(float(grid[zero_run].mean()))
+    return sorted(roots)
+
+
 def zero_gamma_profile(strikes, is_call, open_interest, iv, T, spot, r, q=0.0,
                        half_width=ZERO_GAMMA_GRID_HALF_WIDTH, n_points=ZERO_GAMMA_GRID_POINTS,
                        scale=GEX_PER_PCT_MOVE):
@@ -101,9 +166,10 @@ def zero_gamma_profile(strikes, is_call, open_interest, iv, T, spot, r, q=0.0,
     sticky-moneyness variant needs the smile per expiry interpolated at
     K * spot / S and is not implemented.
 
-    Every sign change on the grid is refined with brentq on the exact sum;
-    ``zero_gamma_level`` is the crossing nearest spot. With no crossing in the
-    grid it is None and ``zero_gamma_status`` is "no_crossing_in_grid", with
+    Every sign change on the grid is refined with brentq on the exact sum
+    (endpoints re-evaluated, exact zeros are roots, a bracket brentq rejects
+    falls back to linear interpolation; it never raises). ``zero_gamma_level``
+    is the crossing nearest spot. With no crossing in the grid it is None and ``zero_gamma_status`` is "no_crossing_in_grid", with
     ``grid_sign`` "all_positive" / "all_negative" (or "all_zero").
     """
     contracts, n_skipped = _valid_contracts(strikes, is_call, open_interest, iv, T, q)
@@ -128,13 +194,8 @@ def zero_gamma_profile(strikes, is_call, open_interest, iv, T, spot, r, q=0.0,
     def f(s):
         return float(_net_gex([s], contracts, r, scale)[0])
 
-    # Sign changes between consecutive non-zero grid values (a zero node lies
-    # inside the bracket and brentq finds it).
-    nonzero = np.flatnonzero(gex != 0)
-    crossings = []
-    for a, b in zip(nonzero[:-1], nonzero[1:]):
-        if np.sign(gex[a]) != np.sign(gex[b]):
-            crossings.append(float(brentq(f, grid[a], grid[b], xtol=1e-9 * spot)))
+    crossings = _grid_roots(f, grid, gex, xtol=1e-9 * spot)
+    nonzero = np.flatnonzero(np.isfinite(gex) & (gex != 0))
     result["zero_gamma_crossings"] = crossings
 
     if not crossings:

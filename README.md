@@ -445,6 +445,40 @@ The executor writes fills to `EXECUTIONS_DIR/fills_<optimizer>_<stamp>.json`. Th
 }
 ```
 
+#### Sell fills (`drawdown_rotation`)
+
+The executor records the sales that `drawdown_rotation` asks for in `EXECUTIONS_DIR/sell_fills_<optimizer>_<stamp>.json`, never in the buy file. It has the buy file's top-level shape, but names the portfolio instead of a signal:
+
+```json
+{
+  "schema_version": 1,
+  "script": "drawdown_rotation",
+  "portfolio_optimizer": "minimum_variance",
+  "portfolio_run_ts": "2026-10-08T11:05:16-05:00",
+  "account": "demo",
+  "account_id": "123",
+  "executed_ts": "2026-10-09T15:00:00-05:00",
+  "written_ts": "2026-10-09T15:01:00-05:00",
+  "fills": [
+    {
+      "ticker": "GLD",
+      "action": "SELL",
+      "filled_qty": 10,
+      "filled_weight": 0.06,
+      "price": 180.0,
+      "deal_id": "abc",
+      "status": "filled",
+      "fill_ts": "2026-10-09T15:00:30-05:00",
+      "reason": "ROTACION_SALIDA"
+    }
+  ]
+}
+```
+
+`filled_qty` and `filled_weight` are positive amounts sold. The reader also accepts a negative `filled_qty` or `side: "SELL"` and uses the absolute value. A portfolio may have several sell files (one per executed rotation); all are read. A file belongs to the portfolio when its `portfolio_optimizer` matches and its `portfolio_run_ts` gives the portfolio's stamp (without `portfolio_run_ts`, the `<stamp>` in the file name must be the portfolio's). Only statuses `filled`, `partial` and `partially_filled` count; a fill repeated with the same `deal_id` and `fill_ts` counts once.
+
+`pipeline_io.load_portfolio_holdings` combines buy and sell fills into the **net held quantity** per ticker (`bought_qty - sold_qty`, never below 0). `entry_signal_tool` reads it: a ticker that was bought and then sold down to nothing is not bought again (a warning says so), unless `drawdown_rotation` picked it again after the sale, in which case it is bought in tranches from zero. The signal carries `net_holdings` (`{ticker: net_qty}`) when there are fills. `active_management` adds `net_held_qty` to each rebalance and `net_holdings` to its signal, and warns when it proposes trading a fully sold name. A name the rotation adds (`target_overrides`, rebalance `ROTACION_ENTRADA`) is staggered by `entry_signal_tool` like any other target, including when the previous entry cycle has already closed.
+
 `ENTRY_INVESTED_PCT` / `--invested-pct` overrides the in-memory baseline for that run only (it is not written as an execution). A bare number is a percent 0–100 for every ticker. `GLD=40,KO=0.25` or a JSON object is per ticker: values above 1, or written with `%`, are percents; values in `[0, 1]` are fractions of that ticker's target.
 
 HTML reports and the risk-history CSV are unchanged aside from the headless GEX path, which writes the same HTML shell and JSON once and does not open a browser. The entry state gains the pending-signal fields above; older files still load.
@@ -452,6 +486,8 @@ HTML reports and the risk-history CSV are unchanged aside from the headless GEX 
 ```bash
 python -m unittest discover -s tests -t .
 ```
+
+The tests are isolated from the machine's pipeline: importing the `tests` package removes the pipeline environment variables (`PORTFOLIO_FILE`, `EXECUTIONS_DIR`, `SIGNALS_OUT_DIR`, ...) and points the default `/workspace/pipeline/...` paths at an empty temp directory, so they pass whatever is in a real pipeline.
 
 ## Disclaimer
 

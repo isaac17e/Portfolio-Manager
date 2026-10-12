@@ -16,7 +16,8 @@ from plotly.subplots import make_subplots
 from gex_utils import gamma_flip_level, zero_gamma_profile
 from polygon_client import NoOptionData, PolygonClient, PolygonError, failure_reason
 from pipeline_io import (
-    MIN_OPTION_DAYS, announce_signals_dir, export_signals, load_portfolio,
+    MIN_OPTION_DAYS, announce_signals_dir, export_signals, fully_sold_tickers,
+    load_portfolio, load_portfolio_holdings, load_rotation_state,
     optimizer_history_path, pick_expiration, resolve_horizon, resolve_risk_free_rate,
 )
 from tickers import adr_warnings, exclusion_warnings, options_exclusion, options_underlying, to_polygon
@@ -2046,7 +2047,10 @@ def run_active_management_engine(portfolio, horizon_days, api_key, cash_limit):
         "excluded": excluded,
     }
 
-def _senal_gestion_activa(resultado):
+def _senal_gestion_activa(resultado, holdings=None):
+    """Senal de rebalanceo. ``holdings`` (pipeline_io.load_portfolio_holdings) agrega
+    la tenencia neta ejecutada (compras - ventas, minimo 0) por ticker."""
+    holdings = holdings or {}
     tabla = resultado.get("tabla_rebalanceo")
     regimen = resultado.get("regimen_riesgo") or {}
     rebalances = []
@@ -2075,6 +2079,9 @@ def _senal_gestion_activa(resultado):
                 "reason": reason,
                 "tactical_action": None if pd.isna(row["Accion"]) else str(row["Accion"]),
             })
+            if holdings:
+                known = holdings.get(rebalances[-1]["ticker"])
+                rebalances[-1]["net_held_qty"] = None if known is None else known["net_qty"]
 
     alertas = [str(alerta) for alerta in (regimen.get("alertas") or [])]
     labels = []
@@ -2092,7 +2099,7 @@ def _senal_gestion_activa(resultado):
     else:
         regime = regimen.get("estado")
 
-    return {
+    senal = {
         "rebalances": rebalances,
         "regime": regime,
         "regime_state": regimen.get("estado"),
@@ -2101,6 +2108,25 @@ def _senal_gestion_activa(resultado):
         "diversification_ratio": regimen.get("ratio_diversificacion"),
         "excluded": list(resultado.get("excluded") or []),
     }
+    if holdings:
+        senal["net_holdings"] = {t: row["net_qty"] for t, row in sorted(holdings.items())}
+    return senal
+
+
+def _advertencias_tenencias(rebalances, holdings, rotation_state=None):
+    """Avisos para rebalanceos que contradicen lo ya vendido por la rotacion.
+
+    Un activo comprado y luego vendido por completo (tenencia neta 0) no se puede
+    vender otra vez ni conviene recomprar: se avisa, la senal no cambia.
+    """
+    vendidos = set(fully_sold_tickers(holdings, rotation_state))
+    avisos = []
+    for r in rebalances:
+        if r["ticker"] not in vendidos or r["action"] not in ("BUY", "SELL"):
+            continue
+        avisos.append(f"{r['ticker']}: {r['action']} proposed but the position is fully sold "
+                      "(net held quantity 0)")
+    return avisos
 
 
 # ============================================================================
@@ -2113,12 +2139,15 @@ def main():
     # sin correr el motor entero.
     announce_signals_dir("active_management", _PORTFOLIO_META)
     resultado = run_active_management_engine(portfolio, investment_horizon_days, polygon_api_key, cash_reserve_limit)
-    _senal_activa = _senal_gestion_activa(resultado)
+    holdings = load_portfolio_holdings(_PORTFOLIO_META)
+    _senal_activa = _senal_gestion_activa(resultado, holdings)
     _senal_activa["risk_free_rate"] = risk_free_rate
     _senal_activa["horizon"] = HORIZON
     export_signals(
         "active_management", _senal_activa, _PORTFOLIO_META,
-        warnings=exclusion_warnings(_senal_activa.get("excluded")) + adr_warnings(list(portfolio.keys())),
+        warnings=(exclusion_warnings(_senal_activa.get("excluded")) + adr_warnings(list(portfolio.keys()))
+                  + _advertencias_tenencias(_senal_activa["rebalances"], holdings,
+                                            load_rotation_state(_PORTFOLIO_META))),
     )
 
     for _nombre in ("gamma_plot", "allocation_plot", "risk_plot"):

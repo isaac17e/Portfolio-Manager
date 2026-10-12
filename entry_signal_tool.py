@@ -21,9 +21,11 @@ from pipeline_io import (
     cycle_today,
     entry_state_path,
     export_signals,
+    fully_sold_tickers,
     load_fills,
     load_portfolio,
     load_portfolio_fills,
+    load_portfolio_holdings,
     load_rotation_state,
     parse_invested_overrides,
     pick_expiration,
@@ -60,8 +62,8 @@ _PORTFOLIO_META = load_portfolio(PESOS_OBJETIVO)
 # drawdown_rotation.py deja en el estado de rotacion de este portafolio los
 # pesos que cambio: el activo que cayo queda recortado (o sale si se liquido) y
 # los nuevos entran con su parte del peso liberado, escalonados por este ciclo.
-PESOS_OBJETIVO, NOTAS_ROTACION = apply_rotation_overrides(
-    _PORTFOLIO_META["weights"], load_rotation_state(_PORTFOLIO_META))
+ESTADO_ROTACION = load_rotation_state(_PORTFOLIO_META)
+PESOS_OBJETIVO, NOTAS_ROTACION = apply_rotation_overrides(_PORTFOLIO_META["weights"], ESTADO_ROTACION)
 TICKERS = list(PESOS_OBJETIVO.keys())
 # Activos cuyo peso objetivo bajo por una rotacion: no se les compra mas (la
 # rotacion vende parte del activo; seguir llenandolo la contradiria).
@@ -265,6 +267,14 @@ def cargar_fills():
     if portfolio_key(_PORTFOLIO_META) is None:
         return load_fills("entry_signal_tool")
     return load_portfolio_fills(_PORTFOLIO_META)
+
+def cargar_tenencias():
+    """Tenencia neta por ticker (compras - ventas, minimo 0) de los fills del portafolio.
+
+    Une los fills de compra (fills_<optimizer>_<run_ts>.json) con los de venta de
+    la rotacion (sell_fills_<optimizer>_<stamp>.json), ver pipeline_io.
+    """
+    return load_portfolio_holdings(_PORTFOLIO_META)
 
 def parse_entry_args(argv=None):
     parser = argparse.ArgumentParser(description="Score de conviccion para entrada en portafolio")
@@ -864,8 +874,9 @@ def graficar_resumen(resumen):
 # ---------------- EJECUCION PRINCIPAL ----------------
 
 def _contexto(estado, warnings, excluded, dia_ciclo, ciclo, pending_cash=None, pending_decisions=None,
-              locked=None):
+              locked=None, tenencias=None):
     return {
+        "net_holdings": {t: row["net_qty"] for t, row in sorted((tenencias or {}).items())},
         "locked": locked,
         "estado": estado,
         "warnings": warnings,
@@ -997,6 +1008,13 @@ def correr_entry_signal(cycle_day=None, invested_pct=None, force_new_tranche=Fal
             f"{estado.get('pending_signal_run_ts')!r}"
         )
 
+    tenencias = cargar_tenencias()
+    # Un activo que la rotacion vendio por completo no se vuelve a comprar, salvo
+    # que la propia rotacion lo vuelva a elegir despues de la venta: en ese caso
+    # el 100% invertido que quedo en el estado es de antes de la venta y se ignora.
+    vendidos = fully_sold_tickers(tenencias, ESTADO_ROTACION)
+    reentrados = sorted(set(fully_sold_tickers(tenencias)) - set(vendidos))
+
     dia_ciclo, day_warn = resolve_cycle_day(cycle_day, estado, DIAS_CICLO)
     dia_explicito = cycle_day is not None and str(cycle_day).strip() != "" and not day_warn
     bloqueo = None if (force_new_tranche or dia_explicito) else tranche_lock(estado, hoy)
@@ -1036,6 +1054,16 @@ def correr_entry_signal(cycle_day=None, invested_pct=None, force_new_tranche=Fal
     for ticker in RECORTADOS_POR_ROTACION:
         scoring["activos"].setdefault(ticker, _activo_vacio())
         scoring["activos"][ticker]["pct_ya_invertido"] = 1.0
+    for ticker in reentrados:
+        if ticker in TICKERS:
+            scoring["activos"].setdefault(ticker, _activo_vacio())
+            scoring["activos"][ticker]["pct_ya_invertido"] = 0.0
+            print(f"  [rotacion] {ticker}: vendido por completo y elegido de nuevo; se compra otra vez.")
+    for ticker in vendidos:
+        if ticker in TICKERS:
+            aviso = f"{ticker}: fully sold (net held quantity 0); not bought again"
+            print(f"  [ventas] {aviso}")
+            warnings.append(aviso)
     for nota in NOTAS_ROTACION:
         print(f"  [rotacion] {nota}")
         warnings.append(f"rotation: {nota}")
@@ -1051,6 +1079,8 @@ def correr_entry_signal(cycle_day=None, invested_pct=None, force_new_tranche=Fal
 
     filas_nuevas = []
     for ticker in TICKERS:
+        if ticker in vendidos:
+            continue
         fila = calcular_fila_instrumento(ticker, hist_df, warnings, excluded)
         if fila is not None:
             filas_nuevas.append(fila)
@@ -1058,7 +1088,8 @@ def correr_entry_signal(cycle_day=None, invested_pct=None, force_new_tranche=Fal
     warnings.extend(exclusion_warnings(excluded))
     df_nuevo = pd.DataFrame(filas_nuevas)
     if df_nuevo.empty:
-        return pd.DataFrame(), hist_df, _contexto(estado, warnings, excluded, dia_ciclo, ciclo)
+        return pd.DataFrame(), hist_df, _contexto(estado, warnings, excluded, dia_ciclo, ciclo,
+                                                  tenencias=tenencias)
     df_nuevo = _etiquetar_definiciones(df_nuevo)
 
     hist_actualizado = pd.concat([hist_df, df_nuevo], ignore_index=True)
@@ -1093,7 +1124,8 @@ def correr_entry_signal(cycle_day=None, invested_pct=None, force_new_tranche=Fal
     ).sort_values("score_conviccion", ascending=False)
 
     return resumen, hist_actualizado, _contexto(
-        estado, warnings, excluded, dia_ciclo, ciclo, pending_cash, pending_decisions
+        estado, warnings, excluded, dia_ciclo, ciclo, pending_cash, pending_decisions,
+        tenencias=tenencias,
     )
 
 def imprimir_resumen(resumen):
@@ -1248,6 +1280,8 @@ def main(argv=None):
         data["cycle_day"] = ctx["cycle_day"]
         data["cycle"] = ctx["cycle"]
     data["excluded"] = ctx["excluded"]
+    if ctx.get("net_holdings"):
+        data["net_holdings"] = ctx["net_holdings"]
     path = export_signals(
         "entry_signal_tool", data, _PORTFOLIO_META, warnings=ctx["warnings"],
     )
