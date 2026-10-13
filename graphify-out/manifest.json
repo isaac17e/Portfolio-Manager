@@ -12,15 +12,15 @@
     "semantic_hash": ""
   },
   "fundamental_analysis.py": {
-    "mtime": 1791693746.6873615,
-    "seen": 1791790453.3943849,
-    "ast_hash": "10dda01cc992fccba390aaaebf52af08",
+    "mtime": 1791897143.4650307,
+    "seen": 1791897145.717267,
+    "ast_hash": "59e079846d6238bf4b3575c241309c0f",
     "semantic_hash": ""
   },
   "pipeline_io.py": {
-    "mtime": 1791823805.7960463,
-    "seen": 1791823811.6592839,
-    "ast_hash": "18556a15cfbc2d1029de423f10a1c513",
+    "mtime": 1791897143.4653888,
+    "seen": 1791897145.717269,
+    "ast_hash": "ed0d8accf38d58adaadb84e73e6174ef",
     "semantic_hash": ""
   },
   "polygon_client.py": {
@@ -42,15 +42,15 @@
     "semantic_hash": ""
   },
   "portfolio_vix.py": {
-    "mtime": 1791693744.6961873,
-    "seen": 1791790453.394389,
-    "ast_hash": "688f4e4ba8281495d7de0306567b3179",
+    "mtime": 1791828533.8126826,
+    "seen": 1791828622.3394392,
+    "ast_hash": "07ec1355047bd119389e8efad9a7f1e3",
     "semantic_hash": ""
   },
   "tests/__init__.py": {
-    "mtime": 1791790105.7200723,
-    "seen": 1791790453.394391,
-    "ast_hash": "e91397b3ab6fdcb94cbb513b011da5a6",
+    "mtime": 1791897143.4662275,
+    "seen": 1791897145.717275,
+    "ast_hash": "b106b9c3e61ce86e87eb972685cc4b5c",
     "semantic_hash": ""
   },
   "tests/test_cycle1_fixes.py": {
@@ -72,15 +72,15 @@
     "semantic_hash": "5c47f9d413ac96063c290252fc170c21"
   },
   "tickers.py": {
-    "mtime": 1791474287.9689512,
-    "seen": 1791790453.3944042,
-    "ast_hash": "e937845e7ac91de06c61206a95744f15",
+    "mtime": 1791828533.782999,
+    "seen": 1791828622.339458,
+    "ast_hash": "90bf59182090f9bbae12d1c74f52a7ad",
     "semantic_hash": ""
   },
   "README.md": {
-    "mtime": 1791823805.793984,
-    "seen": 1791823811.659308,
-    "ast_hash": "a370986278ce10b0bd435b403d4fdd9a",
+    "mtime": 1791897143.464569,
+    "seen": 1791897145.717294,
+    "ast_hash": "3f07b009063561ff0fe80753f30509df",
     "semantic_hash": ""
   },
   "requirements.txt": {
@@ -114,15 +114,15 @@
     "semantic_hash": ""
   },
   "run_cycle.py": {
-    "mtime": 1791823805.7965162,
-    "seen": 1791823811.6592891,
-    "ast_hash": "46d9a92690bfacfb782546724001d1e6",
+    "mtime": 1791897143.465913,
+    "seen": 1791897145.7172742,
+    "ast_hash": "ab76b8aa2b3c99c68e4fe95233da3d38",
     "semantic_hash": ""
   },
   "tests/test_run_cycle.py": {
-    "mtime": 1791823805.7979403,
-    "seen": 1791823811.6593,
-    "ast_hash": "c68dc4a8a25a806f9e8bfc8c183d1b33",
+    "mtime": 1791897143.466851,
+    "seen": 1791897145.7172859,
+    "ast_hash": "0d8584ab23446cdf4bbe1f1832eaa4f9",
     "semantic_hash": ""
   },
   "tests/test_cycle2_fixes.py": {
@@ -168,9 +168,9 @@
     "semantic_hash": ""
   },
   "tests/test_signals_layout.py": {
-    "mtime": 1791823805.7986267,
-    "seen": 1791823811.659303,
-    "ast_hash": "881d6051d6ccaa297671165f3dbe6d65",
+    "mtime": 1791897143.4670649,
+    "seen": 1791897145.717289,
+    "ast_hash": "1e4b4573caa35670bf70b6af029cd192",
     "semantic_hash": ""
   },
   "drawdown_rotation.py": {
@@ -219,6 +219,12 @@
     "mtime": 1791823805.7973773,
     "seen": 1791823811.659298,
     "ast_hash": "7c867d1adc5293f6ddbbd8e6e039626d",
+    "semantic_hash": ""
+  },
+  "tests/test_fundamental_cadence.py": {
+    "mtime": 1791897143.466385,
+    "seen": 1791897145.71728,
+    "ast_hash": "e6c412a9c0c12df6dd8db8557f45a40e",
     "semantic_hash": ""
   }
 }
