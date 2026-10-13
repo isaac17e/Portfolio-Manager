@@ -28,11 +28,11 @@ STATES = ("entry_state_minimum_variance_20261008T112902.json",
 FORCED_TS = "2026-10-13T11:40:00-05:00"
 
 
-class AttachedStateDayFiveTests(unittest.TestCase):
-    def load(self, name):
+class _Helpers(unittest.TestCase):
+    def load(self, name, weights=None):
         self.state0 = json.loads((FIXTURES / name).read_text(encoding="utf-8"))
         tickers = list(self.state0["activos"])
-        self.targets = {t: 1.0 / len(tickers) for t in tickers}
+        self.targets = dict(weights) if weights else {t: 1.0 / len(tickers) for t in tickers}
         optimizer, run_ts = self.state0["portfolio"]["optimizer"], self.state0["portfolio"]["run_ts"]
         self.meta = {"weights": dict(self.targets), "portfolio_source": "/p/portfolio_latest.json",
                      "portfolio_run_ts": run_ts, "portfolio_optimizer": optimizer}
@@ -106,6 +106,8 @@ class AttachedStateDayFiveTests(unittest.TestCase):
             bought = entries[ticker]["tranche_weight"] if ticker in entries else 0.0
             self.assertAlmostEqual(held + bought, target, delta=3e-4, msg=ticker)
 
+
+class AttachedStateDayFiveTests(_Helpers):
     def test_both_portfolios_reach_100_percent_on_day_five_from_every_starting_state(self):
         for name in STATES:
             for label, make_state, env in (
@@ -135,6 +137,44 @@ class AttachedStateDayFiveTests(unittest.TestCase):
         self.check_completes(payload, net)
         entries = {e["ticker"]: e for e in payload["data"]["entries"]}
         self.assertGreater(entries["AVGO"]["tranche_weight"], self.targets["AVGO"] * (1 - 0.692) + 0.04)
+
+
+# weights_used of the 2026-10-13 09:16 / 09:17 entry signals, and the states they left behind.
+REAL = {
+    "entry_state_minimum_variance_20261008T112902_after_force.json": {
+        "BRK-B": 0.260029, "PG": 0.188411, "MCD": 0.165178, "JNJ": 0.158179, "RY.TO": 0.149841, "AEP": 0.078362},
+    "entry_state_quadratic_utility_20261008T121253_after_force.json": {
+        "AVGO": 0.300001, "AMZN": 0.26503, "LLY": 0.200746, "META": 0.147551, "NTES": 0.057287, "ORLY": 0.029385},
+}
+
+
+class PostForceStateDayFiveTests(_Helpers):
+    """The states the 2026-10-13 forced ENTRY_CYCLE_DAY=4 runs really left (empty day-4 signal pending)."""
+
+    def test_post_force_states_complete_to_target_on_day_five(self):
+        for name, weights in REAL.items():
+            with self.subTest(portfolio=name[12:-5]):
+                self.load(name, weights)
+                self.assertEqual((self.state0["pending_cycle_day"], self.state0["dia_ciclo"]), (4, 2))
+                self.put_state(self.state0)
+                self.put_fills()
+                payload = self.day5(ENTRY_CYCLE_DAY="4")
+                net = {t: i["pct_ya_invertido"] * self.targets[t] for t, i in self.state0["activos"].items()}
+                self.check_completes(payload, net)
+                self.assertTrue(all(e["signal"] == "cycle_close" for e in payload["data"]["entries"]))
+
+    def test_post_force_quadratic_utility_buys_avgo_toward_30_percent(self):
+        name = "entry_state_quadratic_utility_20261008T121253_after_force.json"
+        self.load(name, REAL[name])
+        self.put_state(self.state0)
+        sale = 0.05
+        self.put_fills(sold={"AVGO": sale})
+        payload = self.day5()
+        entries = {e["ticker"]: e for e in payload["data"]["entries"]}
+        held = 0.692 * 0.300001 - sale
+        self.assertAlmostEqual(entries["AVGO"]["target_weight"], 0.300001, delta=1e-4)
+        self.assertAlmostEqual(entries["AVGO"]["tranche_weight"], 0.300001 - held, delta=3e-4)
+        self.assertAlmostEqual(held + entries["AVGO"]["tranche_weight"], 0.30, delta=3e-4)
 
 
 if __name__ == "__main__":
