@@ -422,7 +422,10 @@ class OverrideCycleTests(CycleCase):
         self.assertFalse(os.path.exists(os.path.join(self.summary_dir, MV_KEY)))
         code, _, err, _ = self.cycle(MV, "--weekly", env={"SIGNALS_PER_PORTFOLIO": "0"}, date=MONDAY)
         self.assertEqual(code, 0, err)
-        self.assertEqual(os.listdir(self.state_dir), ["weekly_last_run.json"])
+        self.assertEqual(
+            [name for name in os.listdir(self.state_dir) if name.startswith("weekly")],
+            ["weekly_last_run.json"],
+        )
 
 
 if __name__ == "__main__":

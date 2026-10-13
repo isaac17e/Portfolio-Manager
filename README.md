@@ -129,6 +129,8 @@ Uses Yahoo Finance financial statements to grade each ticker as green / neutral 
 
 The number of green signals gives a global rating: **Global Green Light** (≥ 9), **Medium Quality** (≥ 6) or **Global Alert**. All thresholds are editable in the `UMBRALES` dictionary.
 
+**Cadence**: in the pipeline it is not a daily step: `run_cycle` runs it on day 1 of a portfolio and every 30 days after, and reuses the saved result in between (see [Fundamental cadence](#fundamental-cadence)). `FUNDAMENTAL_EXTRA_TICKERS` adds tickers (rotation) to the portfolio's.
+
 **Output**: `reporte_fundamental.html` (in the portfolio's `artifacts/` folder, see [Per-portfolio signal folders](#per-portfolio-signal-folders)), with summary cards, a signal matrix and charts of the last 4 fiscal years and 5 quarters.
 
 ## `drawdown_rotation.py` — Rotation after an abnormal drop
@@ -222,7 +224,7 @@ python drawdown_rotation.py
 
 One command validates the portfolio file, runs each script as a subprocess of the same interpreter, and writes a cycle summary. Stdin of every step is closed (`DEVNULL`) so a prompt cannot hang the cycle. A per-step timeout stops a step that does not return.
 
-Daily mode is the default. The steps run in this order: `fundamental_analysis`, `portfolio_risk_score_leverage`, `portfolio_gex_field` (`--once`), `portfolio_vix` (`--no-show`, so the cycle does not open the report window), `drawdown_rotation`, `entry_signal_tool`. Every step gets `HEADLESS=1` (see [Figures](#figures)). The entry tool is not passed a cycle day: it uses `ENTRY_CYCLE_DAY` / `ENTRY_INVESTED_PCT` when those are set, otherwise the portfolio's entry state (see [Entry state and fills](#entry-state-and-fills)), and it does not call `input()`.
+Daily mode is the default. The steps run in this order: `fundamental_analysis` (only when due, see [Fundamental cadence](#fundamental-cadence)), `portfolio_risk_score_leverage`, `portfolio_gex_field` (`--once`), `portfolio_vix` (`--no-show`, so the cycle does not open the report window), `drawdown_rotation`, `entry_signal_tool`. Every step gets `HEADLESS=1` (see [Figures](#figures)). The entry tool is not passed a cycle day: it uses `ENTRY_CYCLE_DAY` / `ENTRY_INVESTED_PCT` when those are set, otherwise the portfolio's entry state (see [Entry state and fills](#entry-state-and-fills)), and it does not call `input()`.
 
 Daily mode only runs on an NYSE session. The date is the America/Bogota date (override with `--date`); if it is a weekend or an NYSE holiday the run exits 0 with status `not_due` and reason `non_trading_day`, and the summary is written as in weekly mode. `--force` skips this check. There is no time-of-day rule: a run after the close still counts as that session's day, but the summary gets a warning (`run after NYSE close (16:00 ET on <date>); it counts as that session's day`). The close comes from the calendar, so early closes (13:00 ET) are honoured, with 16:00 ET as the fallback. The warning only applies when the date is today, not on a `--date` replay.
 
@@ -252,15 +254,46 @@ python run_cycle.py --weekly --portfolio /workspace/pipeline/portfolio/portfolio
 | `--weekly` | off | Only `active_management`, plus the calendar and horizon checks. |
 | `--date YYYY-MM-DD` | today in America/Bogota | Date used for the horizon, the NYSE session check and the weekly due check. Also exported to the steps as `CYCLE_DATE`. |
 | `--force` | off | Bypass the weekly due check, or the daily NYSE session check. `horizon_end` still applies to weekly. |
+| `--force-fundamental` | off | Run `fundamental_analysis` now even when it is not due (see [Fundamental cadence](#fundamental-cadence)). The only way to force it; `--steps fundamental` does not. Exit 2 when `fundamental_analysis` is not among the steps. |
 | `--force-new-tranche` | off | Sets `ENTRY_FORCE_NEW_TRANCHE=1` for `entry_signal_tool`, so it prepares a new tranche even if one was already prepared today. |
 | `--dry-run` | off | Print the plan, or the skip reason, and write nothing. |
-| `--steps a,b` | the mode's full list | Subset of the known scripts, always in canonical order. Aliases: `fundamental`, `risk` (`portfolio_risk_score_leverage`), `gex`, `vix`, `entry`. |
+| `--steps a,b` | the mode's full list | Subset of the known scripts, always in canonical order. Aliases: `fundamental`, `risk` (`portfolio_risk_score_leverage`), `gex`, `vix`, `entry`, `rotation`. `fundamental` keeps the 30-day gating: it runs only when due, otherwise the saved result is reused. |
 
 The portfolio file must be schema version 1, with `run_ts`, `optimizer`, weights that sum to about 1 (absolute tolerance `0.0001`), and the same names in `tickers` and `weights`. `horizon_end` is `YYYY-MM-DD` or null.
 
 `run_cycle` computes the signals folder once from the portfolio file and passes it to every step as `SIGNALS_DIR_EXACT` (`SIGNALS_OUT_DIR` stays the base, which anchors `PIPELINE_DIR`); it prints it (`[cycle] signals dir = ...`) and records it as `signals_dir` in the summary. A step is accepted only when it exits 0 and `<signals dir>/<script>.json` was written during the step (file mtime and the file's `run_ts` are at or after the step start, America/Bogota). `portfolio_source` must equal the portfolio path and `portfolio_run_ts` must equal the portfolio's `run_ts`. `portfolio_source: "hardcoded_fallback"` is a failure. The cycle stops at the first failure and does not read later files. The summary is still written, with `status: failed` and `failing_step` set to that script. The error includes the step name, the exit code, and the tail of stderr.
 
 The summary's `scalars` include `target_leverage`, `risk_score`, `vix_portfolio`, `n_entries`, and `entries` when those steps ran. `signal_warnings` and `excluded` collect each signal file's `warnings` and `data.excluded`. Timestamps are America/Bogota ISO-8601. Writes are atomic (`*.tmp` then `os.replace`).
+
+### Fundamental cadence
+
+`fundamental_analysis` does not run every day. `run_cycle` decides per portfolio:
+
+- **Runs** on the first cycle of a portfolio (no successful fundamental run recorded for that `optimizer` + `run_ts`, i.e. its day 1), and again on the first cycle on or after **30 calendar days from the last successful run**, but only if that due date is within `horizon_end` (so a horizon of a month or less gets one run). With a null `horizon_end` it keeps repeating every 30 days. It also runs when the saved `fundamental_analysis.json` is missing or belongs to another portfolio.
+- **Reuses** the saved `<signals dir>/fundamental_analysis.json` on every other cycle: the step is not executed and the file is left untouched (same bytes, same mtime), so `entry_signal_tool` and any other consumer read the last result unchanged. The step record in the summary has `status: reused`.
+- **`--steps`**: naming `fundamental` in `--steps` (for example the daily routine `--steps fundamental,gex,vix,rotation`) follows the same gating. It runs only when due and otherwise reuses and logs.
+- **`--force-fundamental`** is the only override: it runs the step now (reason `forced`) and restarts the 30-day clock. It exits 2 when `fundamental_analysis` is not among the steps.
+- **New rotation ticker**: if `drawdown_rotation` proposes a replacement ticker (`data.selection.tickers` or a `BUY` rebalance) that the saved result does not cover, `fundamental_analysis` runs again right after `drawdown_rotation` and before `entry_signal_tool`, for the portfolio tickers plus the tickers held through rotation plus the new ones (passed as `FUNDAMENTAL_EXTRA_TICKERS`, comma separated). It is recorded as an extra `fundamental_analysis` step (`trigger: new_ticker`, `new_tickers`), and counts as the last successful run. Scheduled runs keep covering the tickers the rotation state added.
+
+The last successful run is stored per portfolio in `<PIPELINE_DIR>/state/fundamental_state_<optimizer>_<run_ts>.json` (`FUNDAMENTAL_STATE_FILE` overrides it) and written only after the step succeeds. A failed run stops the cycle as usual and is retried on the next cycle. The calendar-day count uses the cycle date (`--date`), not the NYSE calendar.
+
+Every run prints one log line and writes the same fields in the summary (`cycle_summary_latest.json` key `fundamental`, and a `fundamental:` block in the `.txt`):
+
+```
+[cycle] fundamental: status=reused result_date=2026-10-07 next_due_date=2026-11-06 reason=not_due
+```
+
+| Field | Meaning |
+|---|---|
+| `status` | `ran`, `reused` or `ran_for_new_ticker` (`null` when the step failed, or when no saved result exists and the step was not run) |
+| `result_date` | cycle date of the result in force (the run date, or the date of the last successful run when reused) |
+| `next_due_date` | `result_date` + 30 days, or `null` when that is past `horizon_end` |
+| `reason` | `first_cycle`, `due`, `forced`, `saved_result_missing`, `not_due`, `new_ticker`, `step_failed`, or for cycles that run no fundamental step `step_not_selected` / `cycle_not_due` |
+| `result_file` | the saved `fundamental_analysis.json` |
+| `new_tickers` | tickers that triggered the rotation run (`[]` otherwise) |
+| `forced` | `true` with `--force-fundamental` |
+
+Weekly runs, `--steps` without `fundamental`, and not-due cycles report the result in force the same way (`status: reused`, reason `step_not_selected` or `cycle_not_due`). `--dry-run` prints the same line with `(plan; nothing executed)` and writes nothing.
 
 Exit codes: `0` success, not due, skipped after the horizon, or dry-run; `1` invalid portfolio, step failure, stale or mismatched signal, timeout, missing NYSE calendar, or a summary/state write error; `2` bad arguments.
 
@@ -291,6 +324,8 @@ Each script also writes a JSON signal (contract section 4) through `pipeline_io.
 | `HEADLESS` or `GEX_ONCE` | unset (`run_cycle` sets `HEADLESS=1` for every step) |
 | `FIGURES_DIR` | `<signals dir>/figures` (headless figure HTML; `<PIPELINE_DIR>/figures` with `SIGNALS_PER_PORTFOLIO=0`) |
 | `ROTATION_STATE_FILE` | `<PIPELINE_DIR>/state/rotation_state_<optimizer>_<run_ts>.json` |
+| `FUNDAMENTAL_STATE_FILE` | `<PIPELINE_DIR>/state/fundamental_state_<optimizer>_<run_ts>.json` (last successful fundamental run, see [Fundamental cadence](#fundamental-cadence)) |
+| `FUNDAMENTAL_EXTRA_TICKERS` | unset (comma-separated tickers `fundamental_analysis` analyses besides the portfolio's; `run_cycle` sets it) |
 | `ROTATION_UNIVERSE` | `indices` (`custom` or `both` add your own list) |
 | `ROTATION_CUSTOM_TICKERS` | unset (comma-separated tickers for `custom` / `both`) |
 | `ENTRY_STAGGER_PCT` | `0.20` (tier `none`: share of the target bought per cycle day) |

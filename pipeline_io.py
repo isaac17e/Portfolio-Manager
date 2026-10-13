@@ -1261,17 +1261,18 @@ def load_active_management_targets(portfolio_meta, start_date, sessions_fn=None)
 ROTATION_STATE_VERSION = 1
 
 
-def rotation_state_path(portfolio_meta) -> str:
+def rotation_state_path(portfolio_meta, env=None) -> str:
     """Rotation state of this portfolio: ``ROTATION_STATE_FILE``, else
     ``<pipeline dir>/state/rotation_state_<optimizer>_<run_ts stamp>.json``.
 
     One file per portfolio, like the entry state: a new optimized portfolio
     starts with no rotations, because its weights already supersede them."""
-    explicit = os.environ.get("ROTATION_STATE_FILE")
+    env = os.environ if env is None else env
+    explicit = env.get("ROTATION_STATE_FILE")
     if explicit:
         return explicit
     key = portfolio_key(portfolio_meta) or "hardcoded_fallback"
-    return os.path.join(pipeline_dir(), "state", f"rotation_state_{key}.json")
+    return os.path.join(pipeline_dir(env), "state", f"rotation_state_{key}.json")
 
 
 def empty_rotation_state(portfolio_meta=None) -> dict:
@@ -1288,9 +1289,9 @@ def empty_rotation_state(portfolio_meta=None) -> dict:
     }
 
 
-def load_rotation_state(portfolio_meta, path: str | None = None) -> dict:
+def load_rotation_state(portfolio_meta, path: str | None = None, env=None) -> dict:
     """Read the rotation state, or an empty one. Never raises."""
-    path = path or rotation_state_path(portfolio_meta)
+    path = path or rotation_state_path(portfolio_meta, env)
     if not os.path.isfile(path):
         return empty_rotation_state(portfolio_meta)
     try:
@@ -1322,6 +1323,17 @@ def save_rotation_state(state: dict, portfolio_meta, path: str | None = None) ->
     except Exception as exc:
         _warn(f"Could not write rotation state ({path}): {exc}.")
         return None
+
+
+def parse_ticker_list(raw) -> list[str]:
+    """Tickers from a comma/whitespace separated string, in order, without blanks or
+    duplicates. ``None`` or blank gives ``[]``."""
+    out: list[str] = []
+    for part in re.split(r"[,\s]+", str(raw or "")):
+        part = part.strip()
+        if part and part not in out:
+            out.append(part)
+    return out
 
 
 def apply_rotation_overrides(weights: dict, state) -> tuple[dict, list[str]]:

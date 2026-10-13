@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import time
 import warnings
 import webbrowser
@@ -17,7 +18,8 @@ import numpy as np
 import pandas as pd
 
 from pipeline_io import (
-    announce_signals_dir, artifact_path, export_signals, load_portfolio, prepare_artifact_path,
+    announce_signals_dir, artifact_path, export_signals, load_portfolio, parse_ticker_list,
+    prepare_artifact_path,
 )
 from tickers import to_yahoo
 
@@ -40,6 +42,10 @@ PORTFOLIO_TICKERS: List[str] = ["BBWI", "HP", "CROX", "ZM", "ADBE"]
 _FALLBACK_WEIGHTS = {ticker: 1.0 / len(PORTFOLIO_TICKERS) for ticker in PORTFOLIO_TICKERS}
 _PORTFOLIO_META = load_portfolio(_FALLBACK_WEIGHTS)
 PORTFOLIO_TICKERS = list(_PORTFOLIO_META["weights"].keys())
+
+# run_cycle pasa aqui los tickers que no estan en el portafolio pero si en la cartera
+# viva (rotacion de drawdown): se analizan junto al portafolio.
+EXTRA_TICKERS_ENV: str = "FUNDAMENTAL_EXTRA_TICKERS"
 
 # --- salida -------------------------------------------------------------------
 OUTPUT_HTML: str = "reporte_fundamental.html"   # relativo a la carpeta del script
@@ -1397,9 +1403,22 @@ def _senal_fundamental(df: pd.DataFrame) -> Dict[str, Any]:
 # ==============================================================================
 # BLOQUE 8: EJECUCIÓN
 # ==============================================================================
+def tickers_a_analizar(base: Sequence[str], env=None) -> List[str]:
+    """``base`` mas los tickers de ``FUNDAMENTAL_EXTRA_TICKERS`` (sin repetir)."""
+    env = os.environ if env is None else env
+    out = list(base)
+    for ticker in parse_ticker_list(env.get(EXTRA_TICKERS_ENV)):
+        if ticker not in out:
+            out.append(ticker)
+    return out
+
+
 if __name__ == "__main__":
     announce_signals_dir("fundamental_analysis", _PORTFOLIO_META)
-    df_resultado = analizar_cartera(PORTFOLIO_TICKERS)
+    _tickers = tickers_a_analizar(PORTFOLIO_TICKERS)
+    if len(_tickers) > len(PORTFOLIO_TICKERS):
+        print(f"Tickers extra ({EXTRA_TICKERS_ENV}): {', '.join(_tickers[len(PORTFOLIO_TICKERS):])}")
+    df_resultado = analizar_cartera(_tickers)
 
     pd.set_option("display.width", 200)
     print("\n=== TABLERO DE INDICADORES FUNDAMENTALES ===\n")

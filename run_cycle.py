@@ -2,7 +2,7 @@
 
 Daily mode validates the portfolio file, checks that the America/Bogota date
 (or ``--date``) is an NYSE session (``--force`` skips this), and runs, in order,
-``fundamental_analysis``, ``portfolio_risk_score_leverage``,
+``fundamental_analysis`` (only when due, see below), ``portfolio_risk_score_leverage``,
 ``portfolio_gex_field`` (``--once``), ``portfolio_vix`` (``--no-show``),
 ``drawdown_rotation`` (rotation when a holding fell 5% in 5 sessions) and
 ``entry_signal_tool``. Every step gets ``HEADLESS=1``: figures are written to
@@ -15,6 +15,20 @@ entry state): ``drawdown_rotation`` runs before ``entry_signal_tool`` in pause
 mode (it only marks the tickers entry must not buy today) and ``--weekly`` skips
 ``active_management`` (``not_due`` with an ``entry_phase`` reason, even on a Monday
 and with ``--force``). From day 6 both run in full.
+
+``fundamental_analysis`` is not a daily step in practice. It runs on the first cycle of a
+portfolio (no successful fundamental run recorded for it), then again once 30 calendar
+days have passed since the last successful run, and only while that due date is within
+``horizon_end``. On every other cycle the saved ``fundamental_analysis.json`` is reused:
+the step is not executed and the file is not touched, so consumers read the last result
+unchanged. The same gating applies when the step is named in ``--steps``;
+``--force-fundamental`` is the only way to force a run. When ``drawdown_rotation``
+proposes a ticker with no fundamental result in the saved file, the step runs again
+(portfolio plus those tickers) right after rotation, before entry. Every run reports
+``fundamental`` as ``status`` (``ran``, ``reused`` or ``ran_for_new_ticker``),
+``result_date`` and ``next_due_date`` in the log and in the summary. The last
+successful run is kept per portfolio in ``<pipeline dir>/state/fundamental_state_<key>.json``
+(``FUNDAMENTAL_STATE_FILE`` overrides it).
 
 ``entry_signal_tool`` prepares at most one tranche per day (see its same-day
 lock); run_cycle exports the cycle date to every step as ``CYCLE_DATE`` and
@@ -103,6 +117,11 @@ STEP_HORIZON_MODE = {
     "drawdown_rotation": "remaining",
     "active_management": "remaining",
 }
+FUNDAMENTAL_STEP = "fundamental_analysis"
+FUNDAMENTAL_INTERVAL_DAYS = 30
+FUNDAMENTAL_STATE_ENV = "FUNDAMENTAL_STATE_FILE"
+FUNDAMENTAL_EXTRA_ENV = "FUNDAMENTAL_EXTRA_TICKERS"
+FUNDAMENTAL_STATUSES = ("ran", "reused", "ran_for_new_ticker")
 STEP_ALIASES = {
     "fundamental": "fundamental_analysis",
     "risk": "portfolio_risk_score_leverage",
@@ -132,7 +151,14 @@ otherwise the run is not_due (non_trading_day). --force skips this check. There
 is no time-of-day rule: a run after the close counts as that session's day and
 only adds a warning.
 
-step aliases for --steps: fundamental, risk, gex, vix, entry.
+fundamental gating: fundamental_analysis runs on the first cycle of a portfolio and
+then every 30 calendar days from the last successful run (while within horizon_end);
+other cycles reuse the saved result. This also holds for --steps fundamental.
+--force-fundamental forces a run. A rotation ticker without a fundamental result
+triggers a run right after drawdown_rotation. The log and the summary report
+fundamental status (ran|reused|ran_for_new_ticker), result_date and next_due_date.
+
+step aliases for --steps: fundamental, risk, gex, vix, entry, rotation.
 """.strip()
 
 
@@ -252,6 +278,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="let entry_signal_tool prepare a new tranche even if one was already "
         "prepared today (sets ENTRY_FORCE_NEW_TRANCHE=1 for that step; an explicit "
         "ENTRY_CYCLE_DAY also bypasses the lock)",
+    )
+    parser.add_argument(
+        "--force-fundamental",
+        action="store_true",
+        help="run fundamental_analysis now even when it is not due (otherwise it runs "
+        f"on the first cycle and every {FUNDAMENTAL_INTERVAL_DAYS} days, and the saved "
+        "result is reused); needs fundamental_analysis among the steps",
     )
     parser.add_argument(
         "--dry-run",
@@ -502,6 +535,7 @@ def step_environment(
     force_new_tranche: bool = False,
     horizon_days: int | None = None,
     signals_base: str | None = None,
+    extra_tickers: list[str] | None = None,
 ) -> dict:
     """Parent environment plus the portfolio, signal locations and cycle date.
 
@@ -513,6 +547,8 @@ def step_environment(
     unchanged. ``CYCLE_DATE`` makes the steps use the same day as ``--date``.
     ``PORTFOLIO_HORIZON_DAYS`` is set to ``horizon_days``; without one it is
     removed so the step does not inherit a horizon from another portfolio.
+    ``extra_tickers`` goes to ``fundamental_analysis`` as ``FUNDAMENTAL_EXTRA_TICKERS``
+    (other steps never inherit it).
     """
     env = os.environ.copy()
     env["PORTFOLIO_FILE"] = portfolio_path
@@ -525,6 +561,9 @@ def step_environment(
         env.pop(pipeline_io.HORIZON_ENV, None)
     if as_of is not None:
         env["CYCLE_DATE"] = as_of.isoformat()
+    env.pop(FUNDAMENTAL_EXTRA_ENV, None)
+    if extra_tickers and script == FUNDAMENTAL_STEP:
+        env[FUNDAMENTAL_EXTRA_ENV] = ",".join(extra_tickers)
     if force_new_tranche and script == "entry_signal_tool":
         env["ENTRY_FORCE_NEW_TRANCHE"] = "1"
     # Every step: no figure window and no plotly fig.show(), which waits forever
@@ -884,6 +923,226 @@ def _blank_step(script: str, command: list[str] | None = None) -> dict:
     }
 
 
+def _portfolio_meta(portfolio: dict) -> dict:
+    return {
+        "portfolio_optimizer": portfolio.get("optimizer"),
+        "portfolio_run_ts": portfolio.get("run_ts"),
+    }
+
+
+def _cycle_env(signals_base: str | None) -> dict:
+    env = os.environ.copy()
+    if signals_base:
+        env["SIGNALS_OUT_DIR"] = signals_base
+    return env
+
+
+def fundamental_state_path(portfolio: dict, signals_base: str | None = None) -> str:
+    """``FUNDAMENTAL_STATE_FILE``, else ``<pipeline dir>/state/fundamental_state_<key>.json``
+    (one file per portfolio, like the entry and rotation states)."""
+    env = _cycle_env(signals_base)
+    explicit = env.get(FUNDAMENTAL_STATE_ENV)
+    if explicit:
+        return explicit
+    key = pipeline_io.portfolio_key(_portfolio_meta(portfolio)) or "hardcoded_fallback"
+    return os.path.join(pipeline_io.pipeline_dir(env), "state", f"fundamental_state_{key}.json")
+
+
+def read_fundamental_last_run(path: str, portfolio: dict) -> date | None:
+    """Cycle date of the last successful fundamental run of ``portfolio``, or None
+    (no state, unreadable, or recorded for another portfolio run)."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("portfolio_run_ts") != portfolio.get("run_ts"):
+        return None
+    raw = payload.get("last_run_date")
+    if not isinstance(raw, str):
+        return None
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def write_fundamental_state(
+    path: str, as_of: date, portfolio: dict, run_ts: str, status: str, tickers: list[str],
+) -> None:
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    payload = {
+        "schema_version": SCHEMA_VERSION,
+        "last_run_date": as_of.isoformat(),
+        "last_run_ts": run_ts,
+        "last_run_status": status,
+        "interval_days": FUNDAMENTAL_INTERVAL_DAYS,
+        "tickers": list(tickers),
+        "portfolio_path": portfolio.get("path"),
+        "portfolio_run_ts": portfolio.get("run_ts"),
+    }
+    atomic_write(path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+
+
+def load_saved_fundamental(signals_dir: str, portfolio: dict) -> dict | None:
+    """The saved ``fundamental_analysis.json`` of this portfolio, or None when it is
+    missing, unreadable or belongs to another portfolio."""
+    path = os.path.join(signals_dir, f"{FUNDAMENTAL_STEP}.json")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("schema_version") != SCHEMA_VERSION
+        or payload.get("script") != FUNDAMENTAL_STEP
+        or payload.get("portfolio_source") != portfolio.get("path")
+        or payload.get("portfolio_run_ts") != portfolio.get("run_ts")
+    ):
+        return None
+    return payload
+
+
+def saved_fundamental_tickers(payload: dict | None) -> set[str]:
+    data = (payload or {}).get("data")
+    holdings = data.get("holdings") if isinstance(data, dict) else None
+    if not isinstance(holdings, list):
+        return set()
+    return {
+        str(item["ticker"]) for item in holdings
+        if isinstance(item, dict) and item.get("ticker")
+    }
+
+
+def fundamental_next_due(last_run: date, horizon_end: date | None) -> date | None:
+    """``last_run`` + 30 calendar days, or None when that is past ``horizon_end``
+    (a horizon of a month or less never gets a second run)."""
+    due = last_run + timedelta(days=FUNDAMENTAL_INTERVAL_DAYS)
+    if horizon_end is not None and due > horizon_end:
+        return None
+    return due
+
+
+def _iso_or_none(day: date | None) -> str | None:
+    return None if day is None else day.isoformat()
+
+
+def plan_fundamental(
+    as_of: date,
+    portfolio: dict,
+    signals_dir: str,
+    state_path: str,
+    *,
+    selected: bool = True,
+    force: bool = False,
+    idle_reason: str | None = None,
+) -> dict:
+    """Decide whether ``fundamental_analysis`` runs this cycle, and what to report.
+
+    Runs when forced, on the first cycle of the portfolio (no successful run recorded),
+    when the saved result is missing, or when ``as_of`` is on or after the due date
+    (last successful run + 30 days, only if within ``horizon_end``). Otherwise the saved
+    result is reused. ``selected=False`` or ``idle_reason`` (the cycle will not run
+    steps) never runs it and just describes the saved result in force.
+    Keys: ``run``, ``status`` (None when there is nothing to report), ``reason``,
+    ``result_date``, ``next_due_date``, ``result_file``, ``new_tickers``, ``forced``.
+    """
+    horizon_end = portfolio.get("horizon_end")
+    last = read_fundamental_last_run(state_path, portfolio)
+    saved = load_saved_fundamental(signals_dir, portfolio)
+    result_file = os.path.join(signals_dir, f"{FUNDAMENTAL_STEP}.json")
+    run = False
+    if idle_reason is not None:
+        reason = idle_reason
+    elif not selected:
+        reason = "step_not_selected"
+    elif force:
+        run, reason = True, "forced"
+    elif last is None:
+        run, reason = True, "first_cycle"
+    elif saved is None:
+        run, reason = True, "saved_result_missing"
+    else:
+        due = fundamental_next_due(last, horizon_end)
+        run = due is not None and as_of >= due
+        reason = "due" if run else "not_due"
+    plan = {
+        "run": run, "status": None, "reason": reason, "result_date": None,
+        "next_due_date": None, "result_file": result_file, "new_tickers": [],
+        "forced": bool(force),
+    }
+    if run:
+        plan.update(
+            status="ran", result_date=as_of.isoformat(),
+            next_due_date=_iso_or_none(fundamental_next_due(as_of, horizon_end)),
+        )
+        return plan
+    if saved is not None:
+        used = last
+        if used is None:
+            raw = saved.get("run_ts")
+            try:
+                used = datetime.fromisoformat(raw).date() if isinstance(raw, str) else None
+            except ValueError:
+                used = None
+        plan.update(
+            status="reused", result_date=_iso_or_none(used),
+            next_due_date=_iso_or_none(
+                fundamental_next_due(used, horizon_end) if last is not None else as_of
+            ),
+        )
+    else:
+        plan["next_due_date"] = as_of.isoformat()
+    return plan
+
+
+def rotation_held_extras(portfolio: dict, signals_base: str | None = None) -> list[str]:
+    """Tickers the live book holds through ``drawdown_rotation`` that are not in the
+    portfolio file: fundamental_analysis keeps covering them."""
+    state = pipeline_io.load_rotation_state(
+        _portfolio_meta(portfolio), env=_cycle_env(signals_base),
+    )
+    weights, _notes = pipeline_io.apply_rotation_overrides(portfolio.get("weights") or {}, state)
+    own = set(portfolio.get("tickers") or [])
+    return [ticker for ticker in weights if ticker not in own]
+
+
+def rotation_proposed_tickers(payload: dict) -> list[str]:
+    """Replacement tickers ``drawdown_rotation`` proposes to buy (selection and BUY rows)."""
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return []
+    out: list[str] = []
+    selection = data.get("selection")
+    if isinstance(selection, dict) and isinstance(selection.get("tickers"), list):
+        out += [str(item) for item in selection["tickers"] if item]
+    rebalances = data.get("rebalances")
+    if isinstance(rebalances, list):
+        for item in rebalances:
+            if (
+                isinstance(item, dict) and item.get("ticker")
+                and str(item.get("action", "")).upper() == "BUY"
+            ):
+                out.append(str(item["ticker"]))
+    return list(dict.fromkeys(out))
+
+
+def format_fundamental_line(report: dict | None) -> str:
+    if not report:
+        return "fundamental: status=n/a"
+    line = (
+        f"fundamental: status={report.get('status')} "
+        f"result_date={report.get('result_date')} "
+        f"next_due_date={report.get('next_due_date')} reason={report.get('reason')}"
+    )
+    if report.get("new_tickers"):
+        line += f" new_tickers={','.join(report['new_tickers'])}"
+    return line
+
+
 def run_steps(
     steps: list[str],
     portfolio: dict,
@@ -892,69 +1151,144 @@ def run_steps(
     as_of: date | None = None,
     force_new_tranche: bool = False,
     signals_base: str | None = None,
+    fundamental_plan: dict | None = None,
+    fundamental_state: str | None = None,
 ) -> dict:
     """Run ``steps`` in order. ``signals_dir`` is where each step writes and where
-    its ``<script>.json`` is verified (see ``step_environment`` for ``signals_base``)."""
+    its ``<script>.json`` is verified (see ``step_environment`` for ``signals_base``).
+
+    ``fundamental_plan`` (``plan_fundamental``) gates ``fundamental_analysis``: when it
+    says reuse, the step is recorded as ``reused`` and not executed. A successful run
+    is recorded in ``fundamental_state``. After ``drawdown_rotation`` the step runs
+    again for proposed tickers that the saved result does not cover. Without a plan
+    every selected step runs and no fundamental state is kept."""
     records = []
     failed = None
     scalars: dict = {}
     signal_warnings: dict = {}
     excluded: dict = {}
-    for script in steps:
-        if failed is not None:
-            records.append(_blank_step(script))
-            continue
+    run_warnings: list[str] = []
+    cycle_day = as_of or _today_bogota()
+    report = dict(fundamental_plan) if fundamental_plan else None
+    held_extras: list[str] | None = None
+
+    def execute(script: str, extra_tickers: list[str] | None = None):
         command = build_command(script)
         record = _blank_step(script, command)
         horizon_days = step_horizon_days(script, portfolio, as_of)
         record["horizon_days"] = horizon_days
-
         step_start = _now_bogota()
         started = time.monotonic()
         code, _stdout, stderr, timed_out = _run_command(
             command,
             step_environment(
                 portfolio["path"], signals_dir, script, as_of, force_new_tranche,
-                horizon_days, signals_base,
+                horizon_days, signals_base, extra_tickers,
             ),
             timeout,
         )
         record["duration_seconds"] = round(time.monotonic() - started, 3)
         output = os.path.join(signals_dir, f"{script}.json")
+        payload = None
         if timed_out:
             record["status"] = "failed"
-            record["error"] = _with_tail(
-                f"{script} timed out after {timeout:g}s",
-                stderr,
-            )
-            failed = record
+            record["error"] = _with_tail(f"{script} timed out after {timeout:g}s", stderr)
         elif code != 0:
             record["status"] = "failed"
             record["exit_code"] = code
-            record["error"] = _with_tail(
-                f"{script} failed with exit code {code}",
-                stderr,
-            )
-            failed = record
+            record["error"] = _with_tail(f"{script} failed with exit code {code}", stderr)
         else:
             record["exit_code"] = 0
             try:
                 payload = verify_signal(
-                    output,
-                    script,
-                    portfolio["path"],
-                    portfolio["run_ts"],
-                    step_start,
+                    output, script, portfolio["path"], portfolio["run_ts"], step_start,
                 )
             except SignalError as exc:
                 record["status"] = "failed"
                 record["error"] = str(exc)
-                failed = record
             else:
                 record["status"] = "success"
                 record["output_file"] = output
                 _absorb_signal(script, payload, scalars, signal_warnings, excluded)
+        return record, payload
+
+    def fundamental_ran(status: str, reason: str, payload: dict, new_tickers: list[str]) -> None:
+        horizon_end = portfolio.get("horizon_end")
+        report.update(
+            status=status, reason=reason, result_date=cycle_day.isoformat(),
+            next_due_date=_iso_or_none(fundamental_next_due(cycle_day, horizon_end)),
+            new_tickers=list(new_tickers),
+        )
+        if not fundamental_state:
+            return
+        try:
+            write_fundamental_state(
+                fundamental_state, cycle_day, portfolio, payload.get("run_ts") or "",
+                status, sorted(saved_fundamental_tickers(payload)),
+            )
+        except OSError as exc:
+            run_warnings.append(
+                f"could not write fundamental state ({fundamental_state}): {exc}; "
+                "fundamental_analysis will run again next cycle"
+            )
+
+    def fundamental_failed() -> None:
+        last = read_fundamental_last_run(fundamental_state, portfolio) if fundamental_state else None
+        report.update(
+            status=None, reason="step_failed", result_date=_iso_or_none(last),
+            next_due_date=_iso_or_none(
+                fundamental_next_due(last, portfolio.get("horizon_end")) if last else cycle_day
+            ),
+        )
+
+    for script in steps:
+        if failed is not None:
+            records.append(_blank_step(script))
+            continue
+        if script == FUNDAMENTAL_STEP and report is not None and not report["run"]:
+            saved = load_saved_fundamental(signals_dir, portfolio) or {}
+            record = _blank_step(script)
+            record.update(
+                status="reused", duration_seconds=0.0, horizon_days=None,
+                output_file=report["result_file"], reason=report["reason"],
+                result_date=report["result_date"],
+            )
+            _absorb_signal(script, saved, scalars, signal_warnings, excluded)
+            records.append(record)
+            continue
+
+        extras = None
+        if script == FUNDAMENTAL_STEP and report is not None:
+            held_extras = rotation_held_extras(portfolio, signals_base)
+            extras = held_extras
+        record, payload = execute(script, extras)
         records.append(record)
+        if record["status"] != "success":
+            failed = record
+            if script == FUNDAMENTAL_STEP and report is not None:
+                fundamental_failed()
+            continue
+        if script == FUNDAMENTAL_STEP and report is not None:
+            fundamental_ran("ran", report["reason"], payload, [])
+        elif script == "drawdown_rotation" and report is not None:
+            proposed = rotation_proposed_tickers(payload)
+            covered = saved_fundamental_tickers(load_saved_fundamental(signals_dir, portfolio))
+            missing = [ticker for ticker in proposed if ticker not in covered]
+            if not missing:
+                continue
+            if held_extras is None:
+                held_extras = rotation_held_extras(portfolio, signals_base)
+            extra_record, extra_payload = execute(
+                FUNDAMENTAL_STEP, list(dict.fromkeys(held_extras + missing)),
+            )
+            extra_record["trigger"] = "new_ticker"
+            extra_record["new_tickers"] = missing
+            records.append(extra_record)
+            if extra_record["status"] != "success":
+                failed = extra_record
+                fundamental_failed()
+                continue
+            fundamental_ran("ran_for_new_ticker", "new_ticker", extra_payload, missing)
 
     return {
         "ok": failed is None,
@@ -964,6 +1298,8 @@ def run_steps(
         "scalars": scalars,
         "signal_warnings": signal_warnings,
         "excluded": excluded,
+        "fundamental": report,
+        "warnings": run_warnings,
     }
 
 
@@ -979,6 +1315,16 @@ def _portfolio_view(portfolio: dict) -> dict:
         "horizon_days": portfolio.get("horizon_days"),
         "horizon_months": portfolio.get("horizon_months"),
     }
+
+
+def _fundamental_view(report: dict | None) -> dict | None:
+    """The ``fundamental`` block of the summary (``plan_fundamental`` keys minus ``run``)."""
+    if report is None:
+        return None
+    return {key: report.get(key) for key in (
+        "status", "reason", "result_date", "next_due_date", "result_file",
+        "new_tickers", "forced",
+    )}
 
 
 def make_summary(
@@ -999,6 +1345,7 @@ def make_summary(
     message: str | None = None,
     run_ts: datetime | None = None,
     signals_dir: str | None = None,
+    fundamental: dict | None = None,
 ) -> dict:
     stamp = run_ts or _now_bogota()
     return {
@@ -1010,6 +1357,7 @@ def make_summary(
         "forced": bool(forced),
         "portfolio": _portfolio_view(portfolio),
         "signals_dir": signals_dir,
+        "fundamental": _fundamental_view(fundamental),
         "failing_step": failing_step,
         "not_due_reason": not_due_reason,
         "message": message,
@@ -1049,6 +1397,17 @@ def render_summary_text(summary: dict) -> str:
         f"horizon_end: {portfolio.get('horizon_end')}",
         f"signals_dir: {summary.get('signals_dir')}",
         "",
+        "fundamental:",
+    ]
+    fundamental = summary.get("fundamental")
+    if fundamental:
+        for key in ("status", "result_date", "next_due_date", "reason", "forced", "new_tickers",
+                    "result_file"):
+            lines.append(f"  {key}: {fundamental.get(key)}")
+    else:
+        lines.append("  (none)")
+    lines += [
+        "",
         "steps:",
     ]
     for step in summary.get("steps") or []:
@@ -1059,6 +1418,8 @@ def render_summary_text(summary: dict) -> str:
         lines.append(
             f"  {step.get('script')}  {step.get('status')}  {duration_text}  exit {exit_text}"
         )
+        if step.get("trigger"):
+            lines.append(f"    trigger: {step['trigger']} ({', '.join(step.get('new_tickers') or [])})")
         if step.get("output_file"):
             lines.append(f"    output: {step['output_file']}")
         if step.get("error"):
@@ -1172,7 +1533,7 @@ def _preview_steps(steps: list[str]) -> list[dict]:
     return [_blank_step(script) for script in steps]
 
 
-def _print_plan(mode: str, as_of: date, portfolio: dict, steps: list[str], signals_dir: str, summary_dir: str, timeout: float, warnings: list[str], force_new_tranche: bool = False, signals_base: str | None = None) -> None:
+def _print_plan(mode: str, as_of: date, portfolio: dict, steps: list[str], signals_dir: str, summary_dir: str, timeout: float, warnings: list[str], force_new_tranche: bool = False, signals_base: str | None = None, fundamental: dict | None = None) -> None:
     print(
         f"dry-run mode={mode} as_of={as_of.isoformat()} "
         f"optimizer={portfolio.get('optimizer')} "
@@ -1185,8 +1546,14 @@ def _print_plan(mode: str, as_of: date, portfolio: dict, steps: list[str], signa
     print(f"timeout={timeout:g}")
     for warning in warnings:
         print(f"warning: {warning}")
+    if fundamental is not None:
+        print(format_fundamental_line(fundamental) + " (plan; nothing executed)")
     print("steps:")
     for index, script in enumerate(steps, start=1):
+        if script == FUNDAMENTAL_STEP and fundamental is not None and not fundamental["run"]:
+            print(f"  {index} {script}")
+            print("    reuse saved result (not executed)")
+            continue
         command = build_command(script)
         env = step_environment(
             portfolio["path"], signals_dir, script, as_of, force_new_tranche,
@@ -1225,6 +1592,7 @@ def _calendar_failure(
     cycle_warnings: list[str],
     summary_dir: str,
     signals_dir: str | None = None,
+    fundamental: dict | None = None,
 ) -> int:
     message = str(exc)
     summary = make_summary(
@@ -1238,9 +1606,11 @@ def _calendar_failure(
         error=message,
         message=message,
         signals_dir=signals_dir,
+        fundamental=fundamental,
     )
     _emit_or_report(summary_dir, summary)
     print(message, file=sys.stderr)
+    print(format_fundamental_line(fundamental), file=sys.stderr)
     return 1
 
 
@@ -1254,6 +1624,7 @@ def _not_due(
     summary_dir: str,
     reason: str | None,
     signals_dir: str | None = None,
+    fundamental: dict | None = None,
 ) -> int:
     message = f"not_due: {reason} ({as_of.isoformat()})"
     if args.dry_run:
@@ -1270,9 +1641,11 @@ def _not_due(
         not_due_reason=reason,
         message=message,
         signals_dir=signals_dir,
+        fundamental=fundamental,
     )
     _emit_or_report(summary_dir, summary)
     print(message)
+    print(format_fundamental_line(fundamental))
     return 0
 
 
@@ -1289,6 +1662,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         timeout = resolve_timeout(args)
         steps = select_steps(bool(args.weekly), args.steps)
+        if args.force_fundamental and FUNDAMENTAL_STEP not in steps:
+            raise UsageError(
+                "--force-fundamental needs fundamental_analysis among the steps "
+                "(daily mode, or --steps fundamental)"
+            )
     except UsageError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -1326,6 +1704,11 @@ def main(argv: list[str] | None = None) -> int:
     # One signals dir per cycle, shared by every step and by the validation below.
     signals_dir = resolve_cycle_signals(portfolio, signals_base)
     state_path = resolve_weekly_state_path(args.weekly_state, portfolio)
+    fundamental_state = fundamental_state_path(portfolio, signals_base)
+    idle_fundamental = plan_fundamental(
+        as_of, portfolio, signals_dir, fundamental_state, selected=False,
+        idle_reason="cycle_not_due",
+    )
     cycle_warnings: list[str] = []
     if args.weekly:
         horizon = portfolio["horizon_end"]
@@ -1349,9 +1732,11 @@ def main(argv: list[str] | None = None) -> int:
                 warnings=[],
                 message=message,
                 signals_dir=signals_dir,
+                fundamental=idle_fundamental,
             )
             _emit_or_report(summary_dir, summary)
             print(message)
+            print(format_fundamental_line(idle_fundamental))
             return 0
 
         if "active_management" in steps:
@@ -1360,6 +1745,7 @@ def main(argv: list[str] | None = None) -> int:
             except CalendarUnavailable as exc:
                 return _calendar_failure(
                     exc, mode, as_of, portfolio, steps, cycle_warnings, summary_dir, signals_dir,
+                    idle_fundamental,
                 )
             if phase["active"]:
                 reason = (
@@ -1369,7 +1755,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
                 return _not_due(
                     args, mode, as_of, portfolio, steps, cycle_warnings, summary_dir, reason,
-                    signals_dir,
+                    signals_dir, idle_fundamental,
                 )
 
         if args.force:
@@ -1380,14 +1766,14 @@ def main(argv: list[str] | None = None) -> int:
             except CalendarUnavailable as exc:
                 return _calendar_failure(
                     exc, mode, as_of, portfolio, steps, cycle_warnings, summary_dir,
-                    signals_dir,
+                    signals_dir, idle_fundamental,
                 )
             if state_warning:
                 cycle_warnings.append(state_warning)
             if not due:
                 return _not_due(
                     args, mode, as_of, portfolio, steps, cycle_warnings, summary_dir, reason,
-                    signals_dir,
+                    signals_dir, idle_fundamental,
                 )
     elif args.force:
         cycle_warnings.append("NYSE session check bypassed by --force")
@@ -1397,27 +1783,34 @@ def main(argv: list[str] | None = None) -> int:
         except CalendarUnavailable as exc:
             return _calendar_failure(
                 exc, mode, as_of, portfolio, steps, cycle_warnings, summary_dir, signals_dir,
+                idle_fundamental,
             )
         if close_warning:
             cycle_warnings.append(close_warning)
         if not due:
             return _not_due(
                 args, mode, as_of, portfolio, steps, cycle_warnings, summary_dir, reason,
-                signals_dir,
+                signals_dir, idle_fundamental,
             )
 
+    fundamental_plan = plan_fundamental(
+        as_of, portfolio, signals_dir, fundamental_state,
+        selected=FUNDAMENTAL_STEP in steps, force=bool(args.force_fundamental),
+    )
     if args.dry_run:
         _print_plan(
             mode, as_of, portfolio, steps, signals_dir, summary_dir, timeout, cycle_warnings,
-            bool(args.force_new_tranche), signals_base,
+            bool(args.force_new_tranche), signals_base, fundamental_plan,
         )
         return 0
 
     print(f"[cycle] signals dir = {signals_dir}")
     outcome = run_steps(
         steps, portfolio, signals_dir, timeout, as_of, bool(args.force_new_tranche),
-        signals_base,
+        signals_base, fundamental_plan, fundamental_state,
     )
+    cycle_warnings.extend(outcome["warnings"])
+    print(f"[cycle] {format_fundamental_line(outcome['fundamental'])}")
     status = "success" if outcome["ok"] else "failed"
     message = "cycle success" if outcome["ok"] else outcome["error"]
     summary = make_summary(
@@ -1435,6 +1828,7 @@ def main(argv: list[str] | None = None) -> int:
         error=None if outcome["ok"] else outcome["error"],
         message=message,
         signals_dir=signals_dir,
+        fundamental=outcome["fundamental"],
     )
     summary_path = summary_latest_path(summary_dir, summary)
     write_error = _emit_or_report(summary_dir, summary)

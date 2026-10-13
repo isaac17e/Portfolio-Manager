@@ -90,7 +90,22 @@ elif script == "active_management":
 elif script == "portfolio_gex_field":
     data = {"n_holdings": 2, "macro_y": 0.4, "excluded": []}
 elif script == "fundamental_analysis":
-    data = {"n_tickers": 2, "excluded": []}
+    extra = [t for t in os.environ.get("FUNDAMENTAL_EXTRA_TICKERS", "").split(",") if t]
+    names = list(portfolio.get("tickers") or []) + extra
+    data = {
+        "n_tickers": len(names),
+        "holdings": [{"ticker": t} for t in names],
+        "extra_tickers_env": os.environ.get("FUNDAMENTAL_EXTRA_TICKERS"),
+        "excluded": [],
+    }
+elif script == "drawdown_rotation":
+    bought = [t for t in os.environ.get("FAKE_ROTATION_BUY", "").split(",") if t]
+    data = {
+        "triggered": bool(bought),
+        "selection": {"tickers": bought} if bought else None,
+        "rebalances": [{"ticker": t, "action": "BUY"} for t in bought],
+        "excluded": [],
+    }
 else:
     data = {"excluded": []}
 
