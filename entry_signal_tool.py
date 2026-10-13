@@ -16,13 +16,14 @@ from polygon_client import NO_OPTION_DATA, NoOptionData, PolygonClient, failure_
 from pipeline_io import (
     MIN_OPTION_DAYS,
     announce_signals_dir,
-    apply_entry_fills,
     apply_rotation_overrides,
     cycle_today,
     entry_phase_info,
     entry_state_path,
     export_signals,
+    close_empty_tranche,
     fully_sold_tickers,
+    invested_fraction_from_holdings,
     load_active_management_targets,
     load_fills,
     load_pause_mark,
@@ -33,6 +34,7 @@ from pipeline_io import (
     parse_invested_overrides,
     pick_expiration,
     portfolio_key,
+    reconcile_pending_entry,
     resolve_cycle_day,
     resolve_horizon,
     resolve_risk_free_rate,
@@ -1010,6 +1012,19 @@ def construir_fila_estado(fila, pct_previo, peso_original, dia_ciclo, ciclo, his
     }
 
 
+def _tramo_de_dia_anterior(bloqueo, estado, dia_calendario):
+    """True when the tranche locked for today belongs to an earlier entry day than the calendar's.
+
+    Only the entry cycle follows the calendar. Such a tranche came from a state that was
+    behind (an empty day that never advanced) and must not hide the real day.
+    """
+    tramo = bloqueo.get("tranche") or {}
+    dia = tramo.get("cycle_day")
+    if estado.get("ciclo_cerrado") or tramo.get("cycle") != 1 or int(estado.get("ciclo") or 1) != 1:
+        return False
+    return isinstance(dia, int) and dia < min(DIAS_CICLO, int(dia_calendario))
+
+
 def correr_entry_signal(cycle_day=None, invested_pct=None, force_new_tranche=False):
     """Calcula la senal del dia. No marca el estado del portafolio como invertido.
 
@@ -1032,17 +1047,21 @@ def correr_entry_signal(cycle_day=None, invested_pct=None, force_new_tranche=Fal
     fase = entry_phase_info(_PORTFOLIO_META, hoy)
     if not estado.get("entry_start_date"):
         estado["entry_start_date"] = fase["start_date"]
-    estado, fills_applied = apply_entry_fills(
+    estado, pendiente = reconcile_pending_entry(
         estado, fills_payload, cycle_length=DIAS_CICLO, today=hoy.isoformat(),
     )
-    if fills_applied:
+    if pendiente == "applied":
         guardar_estado(estado)
         print(f"Fills confirmados: {ruta_estado()} avanza con la ejecucion.")
-    elif fills_payload and estado.get("pending_signal_run_ts"):
+    elif pendiente == "closed_empty":
+        guardar_estado(estado)
+        print(f"Tramo pendiente sin ordenes: {ruta_estado()} cierra ese dia sin fills.")
+    elif pendiente == "stale" and fills_payload:
         warnings.append(
-            "fills ignored: signal_run_ts "
+            "stale fills: signal_run_ts "
             f"{fills_payload.get('signal_run_ts')!r} does not match pending "
-            f"{estado.get('pending_signal_run_ts')!r}"
+            f"{estado.get('pending_signal_run_ts')!r}; net holdings still count every fill, "
+            "the cycle day follows entry_phase.day"
         )
 
     tenencias = cargar_tenencias()
@@ -1052,9 +1071,17 @@ def correr_entry_signal(cycle_day=None, invested_pct=None, force_new_tranche=Fal
     vendidos = fully_sold_tickers(tenencias, ESTADO_ROTACION)
     reentrados = sorted(set(fully_sold_tickers(tenencias)) - set(vendidos))
 
-    dia_ciclo, day_warn = resolve_cycle_day(cycle_day, estado, DIAS_CICLO)
+    dia_ciclo, day_warn = resolve_cycle_day(
+        cycle_day, estado, DIAS_CICLO, calendar_day=fase["day"], today=hoy.isoformat(),
+    )
     dia_explicito = cycle_day is not None and str(cycle_day).strip() != "" and not day_warn
     bloqueo = None if (force_new_tranche or dia_explicito) else tranche_lock(estado, hoy)
+    if bloqueo and _tramo_de_dia_anterior(bloqueo, estado, fase["day"]):
+        warnings.append(
+            f"tranche of {bloqueo['prepared_date']} was for cycle day {bloqueo['tranche'].get('cycle_day')} "
+            f"but entry day is {fase['day']}; preparing the right day"
+        )
+        bloqueo = None
     if bloqueo:
         aviso = (
             f"already_prepared_today: el tramo del {bloqueo['prepared_date']} "
@@ -1084,6 +1111,7 @@ def correr_entry_signal(cycle_day=None, invested_pct=None, force_new_tranche=Fal
 
     # Copia solo para el calculo. El archivo no recibe estos porcentajes.
     scoring = copy.deepcopy(estado)
+    fijos = set(overrides or {}) | set(RECORTADOS_POR_ROTACION) | {t for t in reentrados if t in TICKERS}
     if overrides:
         for ticker, frac in overrides.items():
             scoring["activos"].setdefault(ticker, _activo_vacio())
@@ -1195,15 +1223,37 @@ def correr_entry_signal(cycle_day=None, invested_pct=None, force_new_tranche=Fal
         ticker = fila["ticker"]
         activo = scoring["activos"].setdefault(ticker, _activo_vacio())
         pct_previo = activo["pct_ya_invertido"]
+        tope = no_options_weight_cap if _texto(fila, "modo_entrada") == "escalonado" else float
         if ticker in retargeted:
             # pct_ya_invertido es fraccion del objetivo VIGENTE cuando se ejecuto: con un
             # objetivo nuevo de active_management se recalcula sobre el peso realmente
             # invertido (fills), para no comprar hacia el objetivo viejo ni de mas.
-            tope = no_options_weight_cap if _texto(fila, "modo_entrada") == "escalonado" else float
             fila_t = tenencias.get(ticker)
             invertido = fila_t["net_weight"] if fila_t and fila_t.get("bought_weight", 0.0) > 0 \
                 else pct_previo * tope(PESOS_OBJETIVO[ticker])
             pct_previo = min(1.0, invertido / tope(objetivos[ticker]))
+        elif ticker not in fijos:
+            real = invested_fraction_from_holdings(tenencias, ticker, tope(objetivos.get(ticker, np.nan)))
+            if real is None:
+                if tenencias.get(ticker, {}).get("bought_qty", 0.0) > 0:
+                    warnings.append(f"{ticker}: fills carry no weight and PORTFOLIO_CAPITAL is unset; "
+                                    "invested % comes from the state")
+            elif obligatorio:
+                # Dia 5: se completa el 100% del objetivo ORIGINAL sobre la tenencia neta real
+                # (compras - ventas), asi lo vendido despues (rotacion, active_management)
+                # se recompra y un estado desfasado no cambia el resultado.
+                if abs(real - pct_previo) > 1e-6:
+                    nota = (f"{ticker}: last entry day uses net holdings ({real:.1%} of target) "
+                            f"instead of the state ({pct_previo:.1%})")
+                    print(f"  [tenencias] {nota}")
+                    warnings.append(nota)
+                pct_previo = real
+            elif real > pct_previo + 1e-6:
+                # Dias 1-4: sigue el calendario normal de goteo; la tenencia real solo evita
+                # comprar de mas cuando hay fills que el estado no registro.
+                warnings.append(f"{ticker}: net holdings ({real:.1%} of target) exceed the state "
+                                f"({pct_previo:.1%}); not buying more than is already held")
+                pct_previo = real
         filas_estado.append(construir_fila_estado(
             fila, pct_previo, objetivos.get(ticker, np.nan),
             dia_ciclo, ciclo, hist_actualizado,
@@ -1404,12 +1454,17 @@ def main(argv=None):
             }
             # Sin datos de ningun ticker no hubo tramo real: no se bloquea el dia.
             produjo_tramo = len(resumen) > 0
-            guardar_estado(stage_pending_entry(
+            staged = stage_pending_entry(
                 ctx["estado"], run_ts, data.get("cycle_day"), data.get("cycle"),
                 targets, ctx["pending_cash"], ctx["pending_decisions"],
                 prepared_date=cycle_today().isoformat() if produjo_tramo else None,
                 tranche={key: data[key] for key in ("entries", "waiting", "cycle_day", "cycle")},
-            ))
+            )
+            if produjo_tramo and not data["entries"]:
+                # Sin ordenes no llegaran fills: el dia queda cerrado ahora (si no, el
+                # estado se quedaria en el dia anterior).
+                staged = close_empty_tranche(staged, DIAS_CICLO, today=cycle_today().isoformat())
+            guardar_estado(staged)
     show_or_save(graficar_resumen(resumen), "entry_signal_tool", "resumen", portfolio=_PORTFOLIO_META)
 
 

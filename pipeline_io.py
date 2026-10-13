@@ -1474,10 +1474,15 @@ def apply_entry_fills(estado, payload, cycle_length: int = 5, today: str | None 
             activo["decision_final"] = "ENTRAR"
 
     pending_day = updated.get("pending_cycle_day")
+    pending_cycle = updated.get("pending_cycle")
+    same_cycle = not (isinstance(pending_cycle, int) and not isinstance(pending_cycle, bool)) \
+        or pending_cycle == _as_int(updated.get("ciclo"), 1)
     if isinstance(pending_day, int) and not isinstance(pending_day, bool):
+        if same_cycle:
+            # A late confirmation of an older day must not pull the cycle back.
+            pending_day = max(pending_day, _as_int(updated.get("dia_ciclo"), 1))
         updated["dia_ciclo"] = pending_day
         updated["ciclo_cerrado"] = pending_day >= int(cycle_length)
-    pending_cycle = updated.get("pending_cycle")
     if isinstance(pending_cycle, int) and not isinstance(pending_cycle, bool):
         updated["ciclo"] = pending_cycle
 
@@ -1494,6 +1499,101 @@ def apply_entry_fills(estado, payload, cycle_length: int = 5, today: str | None 
     updated["pending_cash"] = {}
     updated["pending_decisions"] = {}
     return updated, True
+
+
+def _as_int(value, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def pending_is_empty_tranche(estado) -> bool:
+    """True when the pending signal asked for no purchase (every ticker MANTENER).
+
+    Nothing is waiting for fills in that case: no executor will ever write a fills
+    file for it, so it must not hold the cycle day back.
+    """
+    estado = estado or {}
+    pending = estado.get("pending_signal_run_ts")
+    if not pending or estado.get("pending_targets"):
+        return False
+    tranche = estado.get("last_tranche")
+    if isinstance(tranche, dict) and tranche.get("signal_run_ts") == pending and tranche.get("entries"):
+        return False
+    return True
+
+
+def close_empty_tranche(estado, cycle_length: int = 5, today: str | None = None):
+    """Close a pending signal that has no orders: the day is done without any fills.
+
+    Same effect as ``apply_entry_fills`` with an empty fills list (day advances, a
+    day-5 cash decision is recorded, pending fields are cleared). The tranche date and
+    ``last_tranche`` are kept, so the same-day lock still sees it as "executed".
+    """
+    pending = (estado or {}).get("pending_signal_run_ts")
+    if not pending:
+        return estado
+    tranche = estado.get("last_tranche")
+    prepared = None
+    if isinstance(tranche, dict) and tranche.get("signal_run_ts") == pending:
+        prepared = estado.get("last_tranche_date")
+    payload = {"signal_run_ts": pending, "fills": [], "executed_ts": prepared or today}
+    updated, _ = apply_entry_fills(estado, payload, cycle_length=cycle_length, today=today)
+    return updated
+
+
+def reconcile_pending_entry(estado, payload, cycle_length: int = 5, today: str | None = None):
+    """Settle the pending signal against the fills file. Returns ``(estado, status)``.
+
+    ``status``: ``"none"`` (nothing pending), ``"applied"`` (the file confirms the
+    pending signal), ``"closed_empty"`` (the pending signal had no orders, so the day
+    is closed without fills) or ``"stale"`` (fills of another signal_run_ts; the state
+    is left alone).
+
+    A stale file never blocks anything: net holdings are always summed from every
+    fills file (``load_portfolio_holdings``), and the entry signal reads them directly,
+    so the state only has to record which cycle day was handled.
+    """
+    if not estado or not estado.get("pending_signal_run_ts"):
+        return estado, "none"
+    if payload and payload.get("signal_run_ts") == estado["pending_signal_run_ts"]:
+        updated, applied = apply_entry_fills(estado, payload, cycle_length=cycle_length, today=today)
+        return updated, "applied" if applied else "stale"
+    if pending_is_empty_tranche(estado):
+        return close_empty_tranche(estado, cycle_length=cycle_length, today=today), "closed_empty"
+    return estado, "stale"
+
+
+def invested_fraction_from_holdings(holdings, ticker: str, target_weight) -> float | None:
+    """Fraction (0..1) of ``target_weight`` that the REAL net position covers.
+
+    ``holdings`` is ``load_portfolio_holdings`` (cumulative buy fills minus sell
+    fills, weights from ``filled_weight`` or ``qty * price / PORTFOLIO_CAPITAL``).
+    Returns None when it cannot be known and the caller must keep the state's value:
+    no fills at all, no valid target, or a position whose fills carry no weight and
+    there is no capital. A sale recorded only in quantity scales the bought weight.
+    A ticker with no fills while others have them is 0.
+    """
+    target = _as_float(target_weight)
+    if not holdings or target is None or target <= 0:
+        return None
+    row = holdings.get(ticker)
+    if not row:
+        return 0.0
+    bought_w, sold_w = row.get("bought_weight", 0.0), row.get("sold_weight", 0.0)
+    bought_q, sold_q = row.get("bought_qty", 0.0), row.get("sold_qty", 0.0)
+    if bought_w <= _ZERO_WEIGHT and sold_w <= _ZERO_WEIGHT:
+        return 0.0 if bought_q <= _QTY_EPS and sold_q <= _QTY_EPS else None
+    if bought_w <= _ZERO_WEIGHT:
+        return None
+    if sold_q > _QTY_EPS and sold_w <= _ZERO_WEIGHT:
+        if bought_q <= _QTY_EPS:
+            return None
+        net_weight = bought_w * row.get("net_qty", 0.0) / bought_q
+    else:
+        net_weight = row.get("net_weight", 0.0)
+    return max(0.0, min(1.0, net_weight / target))
 
 
 def stage_pending_entry(estado, run_ts, cycle_day, cycle, targets=None, cash=None, decisions=None,
@@ -1547,23 +1647,59 @@ def tranche_lock(estado, today) -> dict | None:
     }
 
 
-def suggest_cycle_day(estado, cycle_length: int = 5) -> int:
-    """Next cycle day from the last *executed* state. Does not write the file."""
+def last_executed_day(estado) -> int:
+    """Cycle day last executed (or closed empty) in the state; 0 when none."""
     estado = estado or {}
-    if estado.get("ultima_actualizacion") is None or estado.get("ciclo_cerrado"):
-        return 1
-    try:
-        dia = int(estado.get("dia_ciclo") or 1)
-    except (TypeError, ValueError):
-        dia = 1
-    if dia < 1:
-        dia = 1
-    return min(dia + 1, int(cycle_length))
+    if estado.get("ultima_actualizacion") is None:
+        return 0
+    return max(1, _as_int(estado.get("dia_ciclo") or 1, 1))
 
 
-def resolve_cycle_day(explicit, estado, cycle_length: int = 5):
-    """Return ``(day, warning)``. Blank explicit input uses ``suggest_cycle_day``."""
-    suggested = suggest_cycle_day(estado, cycle_length)
+def entry_floor_day(estado, calendar_day, cycle_length: int = 5) -> int | None:
+    """Earliest cycle day a new signal may use in the entry cycle, or None.
+
+    The entry cycle (cycle 1, not closed) follows ``calendar_day``: the NYSE sessions
+    since ``entry_start_date`` (``entry_phase_info``), capped at the cycle length.
+    A state behind the calendar catches up; a state ahead of it (a day was forced)
+    never goes back. Later cycles do not follow the calendar: None.
+    """
+    estado = estado or {}
+    if calendar_day is None or estado.get("ciclo_cerrado") or _as_int(estado.get("ciclo") or 1, 1) != 1:
+        return None
+    return min(int(cycle_length), max(1, int(calendar_day), last_executed_day(estado)))
+
+
+def suggest_cycle_day(estado, cycle_length: int = 5, calendar_day=None, today=None) -> int:
+    """Cycle day for the next signal. Does not write the file.
+
+    Without ``calendar_day`` it is the day after the last *executed* one (legacy).
+    With it (``entry_phase.day``) the entry cycle follows the calendar, so an empty or
+    unfilled day cannot hold the state back: ``max(calendar, executed)``, and one day
+    further when that day was already executed today (or the state is ahead of the
+    calendar), so an executed day is never run again.
+    """
+    estado = estado or {}
+    floor = entry_floor_day(estado, calendar_day, cycle_length)
+    if floor is None:
+        if estado.get("ultima_actualizacion") is None or estado.get("ciclo_cerrado"):
+            return 1
+        return min(max(1, _as_int(estado.get("dia_ciclo") or 1, 1)) + 1, int(cycle_length))
+    executed = last_executed_day(estado)
+    calendar = max(1, int(calendar_day))
+    done_today = bool(today) and str(estado.get("ultima_actualizacion")) == str(today)
+    if executed > calendar or (executed == calendar and done_today):
+        return min(executed + 1, int(cycle_length))
+    return floor
+
+
+def resolve_cycle_day(explicit, estado, cycle_length: int = 5, calendar_day=None, today=None):
+    """Return ``(day, warning)``. Blank explicit input uses ``suggest_cycle_day``.
+
+    In the entry cycle an explicit day (CLI / ``ENTRY_CYCLE_DAY``) behind the calendar
+    or behind the last executed day is raised to it, with a warning: an earlier day is
+    never run again (a leftover ``ENTRY_CYCLE_DAY`` cannot pin the cycle).
+    """
+    suggested = suggest_cycle_day(estado, cycle_length, calendar_day, today)
     if explicit is None or (isinstance(explicit, str) and explicit.strip() == ""):
         return suggested, None
     try:
@@ -1572,6 +1708,10 @@ def resolve_cycle_day(explicit, estado, cycle_length: int = 5):
         return suggested, f"invalid cycle day {explicit!r}; using {suggested}"
     if not 1 <= dia <= int(cycle_length):
         return suggested, f"cycle day {dia} outside 1..{cycle_length}; using {suggested}"
+    floor = entry_floor_day(estado, calendar_day, cycle_length)
+    if floor is not None and dia < floor:
+        return floor, (f"cycle day {dia} is behind entry day {floor} "
+                       f"(NYSE sessions since entry start / last executed day); using {floor}")
     return dia, None
 
 

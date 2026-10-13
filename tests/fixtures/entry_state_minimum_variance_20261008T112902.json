@@ -1,0 +1,108 @@
+{
+  "ciclo": 1,
+  "dia_ciclo": 2,
+  "ciclo_cerrado": false,
+  "ultima_actualizacion": "2026-10-09",
+  "pending_signal_run_ts": "2026-10-13T09:08:29-05:00",
+  "pending_cycle_day": 3,
+  "pending_cycle": 1,
+  "pending_targets": {},
+  "pending_cash": {},
+  "pending_decisions": {},
+  "activos": {
+    "BRK-B": {
+      "pct_ya_invertido": 0.521,
+      "pct_cash_consolidado": 0.0,
+      "decision_final": null
+    },
+    "PG": {
+      "pct_ya_invertido": 0.6820010615711253,
+      "pct_cash_consolidado": 0.0,
+      "decision_final": null
+    },
+    "MCD": {
+      "pct_ya_invertido": 0.7009987893462468,
+      "pct_cash_consolidado": 0.0,
+      "decision_final": null
+    },
+    "JNJ": {
+      "pct_ya_invertido": 0.6729962073324905,
+      "pct_cash_consolidado": 0.0,
+      "decision_final": null
+    },
+    "RY.TO": {
+      "pct_ya_invertido": 0.625,
+      "pct_cash_consolidado": 0.0,
+      "decision_final": null
+    },
+    "AEP": {
+      "pct_ya_invertido": 0.5920025510204082,
+      "pct_cash_consolidado": 0.0,
+      "decision_final": null
+    }
+  },
+  "portfolio": {
+    "optimizer": "minimum_variance",
+    "run_ts": "2026-10-08T11:29:02-05:00"
+  },
+  "last_tranche_date": "2026-10-13",
+  "last_tranche": {
+    "entries": [],
+    "waiting": [
+      {
+        "ticker": "MCD",
+        "score": 62.72958817777199,
+        "reason": "MANTENER (ya en el nivel objetivo de hoy)",
+        "tier": "native",
+        "analysis_ticker": "MCD",
+        "proxy_etf": null
+      },
+      {
+        "ticker": "PG",
+        "score": 60.1682202605499,
+        "reason": "MANTENER (ya en el nivel objetivo de hoy)",
+        "tier": "native",
+        "analysis_ticker": "PG",
+        "proxy_etf": null
+      },
+      {
+        "ticker": "RY.TO",
+        "score": 56.25616479072453,
+        "reason": "MANTENER (ya en el nivel objetivo de hoy)",
+        "tier": "adr",
+        "analysis_ticker": "RY",
+        "proxy_etf": null,
+        "capital_epic": "RY"
+      },
+      {
+        "ticker": "BRK-B",
+        "score": 47.74960714748191,
+        "reason": "MANTENER (ya en el nivel objetivo de hoy)",
+        "tier": "native",
+        "analysis_ticker": "BRK-B",
+        "proxy_etf": null
+      },
+      {
+        "ticker": "AEP",
+        "score": 46.62692935090648,
+        "reason": "MANTENER (ya en el nivel objetivo de hoy)",
+        "tier": "native",
+        "analysis_ticker": "AEP",
+        "proxy_etf": null
+      },
+      {
+        "ticker": "JNJ",
+        "score": 19.33655901377617,
+        "reason": "MANTENER (ya en el nivel objetivo de hoy)",
+        "tier": "native",
+        "analysis_ticker": "JNJ",
+        "proxy_etf": null
+      }
+    ],
+    "cycle_day": 3,
+    "cycle": 1,
+    "signal_run_ts": "2026-10-13T09:08:29-05:00"
+  },
+  "entry_start_date": "2026-10-08",
+  "pausas_entrada": {}
+}

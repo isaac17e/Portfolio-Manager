@@ -1,0 +1,107 @@
+{
+  "ciclo": 1,
+  "dia_ciclo": 2,
+  "ciclo_cerrado": false,
+  "ultima_actualizacion": "2026-10-09",
+  "pending_signal_run_ts": "2026-10-13T09:11:30-05:00",
+  "pending_cycle_day": 3,
+  "pending_cycle": 1,
+  "pending_targets": {},
+  "pending_cash": {},
+  "pending_decisions": {},
+  "activos": {
+    "AVGO": {
+      "pct_ya_invertido": 0.6920000000000001,
+      "pct_cash_consolidado": 0.0,
+      "decision_final": null
+    },
+    "AMZN": {
+      "pct_ya_invertido": 0.6849999999999999,
+      "pct_cash_consolidado": 0.0,
+      "decision_final": null
+    },
+    "LLY": {
+      "pct_ya_invertido": 0.6520029895366218,
+      "pct_cash_consolidado": 0.0,
+      "decision_final": null
+    },
+    "META": {
+      "pct_ya_invertido": 0.6560027100271002,
+      "pct_cash_consolidado": 0.0,
+      "decision_final": null
+    },
+    "NTES": {
+      "pct_ya_invertido": 0.6139965095986039,
+      "pct_cash_consolidado": 0.0,
+      "decision_final": null
+    },
+    "ORLY": {
+      "pct_ya_invertido": 0.67,
+      "pct_cash_consolidado": 0.0,
+      "decision_final": null
+    }
+  },
+  "portfolio": {
+    "optimizer": "quadratic_utility",
+    "run_ts": "2026-10-08T12:12:53-05:00"
+  },
+  "last_tranche_date": "2026-10-13",
+  "last_tranche": {
+    "entries": [],
+    "waiting": [
+      {
+        "ticker": "ORLY",
+        "score": 62.424672665703866,
+        "reason": "MANTENER (ya en el nivel objetivo de hoy)",
+        "tier": "native",
+        "analysis_ticker": "ORLY",
+        "proxy_etf": null
+      },
+      {
+        "ticker": "AVGO",
+        "score": 61.93697906048972,
+        "reason": "MANTENER (ya en el nivel objetivo de hoy)",
+        "tier": "native",
+        "analysis_ticker": "AVGO",
+        "proxy_etf": null
+      },
+      {
+        "ticker": "META",
+        "score": 60.552034450601916,
+        "reason": "MANTENER (ya en el nivel objetivo de hoy)",
+        "tier": "native",
+        "analysis_ticker": "META",
+        "proxy_etf": null
+      },
+      {
+        "ticker": "LLY",
+        "score": 54.97499835250413,
+        "reason": "MANTENER (ya en el nivel objetivo de hoy)",
+        "tier": "native",
+        "analysis_ticker": "LLY",
+        "proxy_etf": null
+      },
+      {
+        "ticker": "NTES",
+        "score": 54.529990831157704,
+        "reason": "MANTENER (ya en el nivel objetivo de hoy)",
+        "tier": "native",
+        "analysis_ticker": "NTES",
+        "proxy_etf": null
+      },
+      {
+        "ticker": "AMZN",
+        "score": 51.99949221937686,
+        "reason": "MANTENER (ya en el nivel objetivo de hoy)",
+        "tier": "native",
+        "analysis_ticker": "AMZN",
+        "proxy_etf": null
+      }
+    ],
+    "cycle_day": 3,
+    "cycle": 1,
+    "signal_run_ts": "2026-10-13T09:11:30-05:00"
+  },
+  "entry_start_date": "2026-10-08",
+  "pausas_entrada": {}
+}
