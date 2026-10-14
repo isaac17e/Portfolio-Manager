@@ -58,13 +58,12 @@ def price_indicators(closes) -> dict:
         return out
     precio = float(serie.iloc[-1])
     out["precio"] = precio
-    if len(serie) >= SMA_CORTA:
-        out["sma50"] = float(serie.tail(SMA_CORTA).mean())
-    if len(serie) >= SMA_LARGA:
-        out["sma200"] = float(serie.tail(SMA_LARGA).mean())
+    # rolling(N).mean() da NaN mientras haya menos de N cierres.
+    out["sma50"] = float(serie.rolling(SMA_CORTA).mean().iloc[-1])
+    out["sma200"] = float(serie.rolling(SMA_LARGA).mean().iloc[-1])
     out["rsi14"] = rsi(serie)
 
-    rets = np.log(serie / serie.shift(1)).dropna()
+    rets = np.log(serie).diff().dropna()
     if len(rets) >= VOL_VENTANA:
         rv = rets.rolling(VOL_VENTANA).std().dropna() * np.sqrt(252)
         out["vol_realizada"] = float(rv.iloc[-1])
@@ -100,12 +99,7 @@ def price_scores(ind: dict) -> dict:
 
     # Drawdown: un retroceso de hasta 10% mejora el precio de entrada (50 -> 100);
     # mas alla castiga hasta 0 en -30%.
-    if np.isnan(dd):
-        dd_score = 50.0
-    elif dd >= -0.10:
-        dd_score = 50.0 + min(-dd, 0.10) / 0.10 * 50.0
-    else:
-        dd_score = float(np.clip(100.0 * (0.30 + dd) / 0.20, 0, 100))
+    dd_score = 50.0 if np.isnan(dd) else float(np.interp(dd, [-0.30, -0.10, 0.0], [0.0, 100.0, 50.0]))
 
     return {
         "tendencia": tendencia,

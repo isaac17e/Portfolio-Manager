@@ -5,6 +5,7 @@
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
+from dateutil.relativedelta import relativedelta, FR
 import argparse
 import copy
 import os
@@ -463,8 +464,7 @@ def calcular_gex_y_zero_gamma(df_chain, spot, hoy=None):
     # RISK_FREE_RATE y sin dividendos (el script no usa ninguno). Antes era el
     # cruce del GEX acumulado por strike, que no es el zero-gamma.
     hoy = hoy or datetime.now(timezone.utc).date()
-    dias = pd.to_datetime(df["vencimiento"], errors="coerce").dt.date.map(
-        lambda v: (v - hoy).days if pd.notna(v) else np.nan)
+    dias = (pd.to_datetime(df["vencimiento"], errors="coerce") - pd.Timestamp(hoy)).dt.days
     zg = zero_gamma_profile(df["strike"], (df["tipo"] == "call").to_numpy(), df["oi"],
                             pd.to_numeric(df["iv"], errors="coerce"),
                             dias.to_numpy(dtype=float) / 365.0, spot, RISK_FREE_RATE)
@@ -544,15 +544,9 @@ def calcular_smart_money(df_chain):
 def dias_a_opex(hoy=None):
     hoy = hoy or datetime.now(timezone.utc).date()
     primer_dia = hoy.replace(day=1)
-    primer_viernes = primer_dia + timedelta(days=(4 - primer_dia.weekday()) % 7)
-    tercer_viernes = primer_viernes + timedelta(days=14)
+    tercer_viernes = primer_dia + relativedelta(weekday=FR(3))
     if tercer_viernes < hoy:
-        if hoy.month == 12:
-            primer_dia = hoy.replace(year=hoy.year + 1, month=1, day=1)
-        else:
-            primer_dia = hoy.replace(month=hoy.month + 1, day=1)
-        primer_viernes = primer_dia + timedelta(days=(4 - primer_dia.weekday()) % 7)
-        tercer_viernes = primer_viernes + timedelta(days=14)
+        tercer_viernes = primer_dia + relativedelta(months=1, weekday=FR(3))
     return (tercer_viernes - hoy).days
 
 def calcular_vanna_charm_factor():

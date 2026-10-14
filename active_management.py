@@ -224,42 +224,32 @@ def get_options_snapshot(ticker, exp_date_from, exp_date_to, api_key=polygon_api
         warnings.warn(f"Sin cadena de opciones disponible para {ticker} en el rango solicitado.")
         return None
 
-    def get_path(d, path, default=np.nan):
-        cur = d
-        for p in path.split("."):
-            if not isinstance(cur, dict) or p not in cur:
-                return default
-            cur = cur[p]
-        return cur
+    # json_normalize aplana el JSON anidado ("details.ticker", ...); reindex deja
+    # en NaN las columnas que Polygon no haya devuelto.
+    columnas = {
+        "details.ticker": "contract",
+        "details.strike_price": "strike",
+        "details.contract_type": "type",
+        "details.expiration_date": "expiration",
+        "day.volume": "volume",
+        "open_interest": "open_interest",
+        "implied_volatility": "iv",
+        "greeks.delta": "delta",
+        "greeks.gamma": "gamma",
+        "greeks.theta": "theta",
+        "greeks.vega": "vega",
+        "day.close": "last_price",
+        "last_quote.bid": "bid",
+        "last_quote.ask": "ask",
+        "underlying_asset.price": "underlying_price",
+    }
+    chain = (pd.json_normalize(all_results).reindex(columns=list(columnas))
+             .rename(columns=columnas).assign(ticker=ticker))
+    chain = chain[["ticker", *columnas.values()]]
 
-    rows = []
-    for r in all_results:
-        rows.append({
-            "ticker": ticker,
-            "contract": get_path(r, "details.ticker", None),
-            "strike": get_path(r, "details.strike_price"),
-            "type": get_path(r, "details.contract_type", None),
-            "expiration": get_path(r, "details.expiration_date", None),
-            "volume": get_path(r, "day.volume", 0),
-            "open_interest": get_path(r, "open_interest", 0),
-            "iv": get_path(r, "implied_volatility"),
-            "delta": get_path(r, "greeks.delta"),
-            "gamma": get_path(r, "greeks.gamma"),
-            "theta": get_path(r, "greeks.theta"),
-            "vega": get_path(r, "greeks.vega"),
-            "last_price": get_path(r, "day.close"),
-            "bid": get_path(r, "last_quote.bid"),
-            "ask": get_path(r, "last_quote.ask"),
-            "underlying_price": get_path(r, "underlying_asset.price"),
-        })
-
-    chain = pd.DataFrame(rows)
-    if chain.empty:
-        return None
-
-    for col in ["strike", "volume", "open_interest", "iv", "delta", "gamma", "theta",
-                "vega", "last_price", "bid", "ask", "underlying_price"]:
-        chain[col] = pd.to_numeric(chain[col], errors="coerce")
+    numeric_cols = ["strike", "volume", "open_interest", "iv", "delta", "gamma", "theta",
+                    "vega", "last_price", "bid", "ask", "underlying_price"]
+    chain[numeric_cols] = chain[numeric_cols].apply(pd.to_numeric, errors="coerce")
 
     chain["volume"] = chain["volume"].fillna(0)
     chain["open_interest"] = chain["open_interest"].fillna(0)
@@ -357,9 +347,8 @@ def calculate_gex(chain, spot_price):
     # (+/-30%) con los mismos contratos, la IV de cada uno (sticky strike), T con
     # la convencion de calculate_vanna_charm, risk_free_rate y dividend_yield.
     today = date.today()
-    T_years = df["expiration"].map(
-        lambda e: max((datetime.strptime(e, "%Y-%m-%d").date() - today).days, 1) / 365
-        if isinstance(e, str) else np.nan).to_numpy(dtype=float)
+    T_years = ((pd.to_datetime(df["expiration"]) - pd.Timestamp(today)).dt.days
+               .clip(lower=1) / 365).to_numpy(dtype=float)
     zg = zero_gamma_profile(df["strike"], (df["type"] == "call").to_numpy(), df["open_interest"],
                             df["iv"] if "iv" in df.columns else np.full(len(df), np.nan),
                             T_years, spot_price, risk_free_rate, dividend_yield)
@@ -630,7 +619,7 @@ def calculate_tactical_score(analysis):
         signo_sin_cruce = {"all_positive": 1, "all_negative": -1}.get(gex.get("zero_gamma_grid_sign"))
     if gex is not None and pd.notna(gex["gex_flip_level"]):
         dist_pct = (spot - gex["gex_flip_level"]) / spot
-        flip_points = max(min(dist_pct * score_flip_scale, score_flip_cap), -score_flip_cap)
+        flip_points = np.clip(dist_pct * score_flip_scale, -score_flip_cap, score_flip_cap)
         score += flip_points
         reasons.append(f"Spot {spot:.2f} vs Zero Gamma {gex['gex_flip_level']:.2f} ({dist_pct*100:.1f}% dist.)")
     elif signo_sin_cruce:
@@ -657,7 +646,7 @@ def calculate_tactical_score(analysis):
         reasons.append(f"Flujo: {flow['sweep_bias']} (UOA calls={flow['n_uoa_calls']}, puts={flow['n_uoa_puts']})")
 
     if flow is not None and pd.notna(flow["pcr_volume"]):
-        pcr_points = max(min((1 - flow["pcr_volume"]) * score_pcr_scale, score_pcr_cap), -score_pcr_cap)
+        pcr_points = np.clip((1 - flow["pcr_volume"]) * score_pcr_scale, -score_pcr_cap, score_pcr_cap)
         score += pcr_points
         reasons.append(f"PCR volumen = {flow['pcr_volume']:.2f}")
 
@@ -691,7 +680,7 @@ def calculate_tactical_score(analysis):
             f"score amortiguado x{score_low_liquidity_damping}"
         )
 
-    score = max(min(score, 100), -100)
+    score = float(np.clip(score, -100, 100))
 
     max_pain_break = ((gex is not None and pd.notna(gex["gex_flip_level"]) and spot < gex["gex_flip_level"])
                       or signo_sin_cruce == -1)
@@ -1207,7 +1196,8 @@ def build_implied_correlation(prices, tickers, sigmas, fuentes_vol, weights, sig
             masa = {nm: float((pair_w * regiones[nm]).sum()) for nm in escalas}
             total_masa = sum(masa.values())
             if total_masa > 1e-14:
-                k_cruce = sum(escalas[nm] * masa[nm] for nm in escalas) / total_masa
+                k_cruce = float(np.average([escalas[nm] for nm in escalas],
+                                           weights=[masa[nm] for nm in escalas]))
 
         corr = _nearest_pd_corr(
             _assemble_regions(corr_hist, regiones, escalas, planas, mask_cruce, k_cruce))
@@ -1250,10 +1240,10 @@ def build_implied_correlation(prices, tickers, sigmas, fuentes_vol, weights, sig
     total_masa = sum(masa.values())
     if total_masa > 1e-14:
         crudo = {b["bloque"]: b["rho_despejado"] for b in detalle["bloques"]}
-        detalle["rho_despejado"] = sum(crudo[nm] * masa[nm] for nm in regiones) / total_masa
-        detalle["rho_usado"] = sum(objetivos[nm] * masa[nm] for nm in regiones) / total_masa
-        detalle["rho_efectivo"] = sum(
-            realizados[nm] * masa[nm] for nm in regiones) / total_masa
+        pesos_masa = [masa[nm] for nm in regiones]
+        detalle["rho_despejado"] = float(np.average([crudo[nm] for nm in regiones], weights=pesos_masa))
+        detalle["rho_usado"] = float(np.average([objetivos[nm] for nm in regiones], weights=pesos_masa))
+        detalle["rho_efectivo"] = float(np.average([realizados[nm] for nm in regiones], weights=pesos_masa))
 
     detalle["rho_matriz"] = _weighted_mean_corr(corr, pair_w)
     if hay_cruce:
@@ -1658,15 +1648,11 @@ def rebalance_portfolio(portfolio, scores_df, cash_reserve_limit):
     base = scores_df.copy()
     base["peso_inicial"] = base["ticker"].map(portfolio)
 
-    def peso_liberado_row(row):
-        if row["action"] == "LIQUIDAR":
-            return row["peso_inicial"]
-        elif row["action"] == "RECORTAR":
-            return row["peso_inicial"] * row["recorte_pct"]
-        else:
-            return 0.0
-
-    base["peso_liberado"] = base.apply(peso_liberado_row, axis=1)
+    base["peso_liberado"] = np.select(
+        [base["action"] == "LIQUIDAR", base["action"] == "RECORTAR"],
+        [base["peso_inicial"], base["peso_inicial"] * base["recorte_pct"]],
+        default=0.0,
+    )
     base["peso_retenido"] = base["peso_inicial"] - base["peso_liberado"]
 
     capital_liberado = base["peso_liberado"].sum(skipna=True)
@@ -1725,10 +1711,10 @@ def rebalance_portfolio(portfolio, scores_df, cash_reserve_limit):
 
 def generate_executive_dashboard(tabla_rebalanceo):
     tabla_fmt = tabla_rebalanceo.copy()
-    tabla_fmt["Peso_Inicial"] = tabla_fmt["Peso_Inicial"].apply(lambda x: f"{x*100:.1f}%")
-    tabla_fmt["Nuevo_Peso"] = tabla_fmt["Nuevo_Peso"].apply(lambda x: f"{x*100:.1f}%")
+    tabla_fmt["Peso_Inicial"] = tabla_fmt["Peso_Inicial"].map("{:.1%}".format)
+    tabla_fmt["Nuevo_Peso"] = tabla_fmt["Nuevo_Peso"].map("{:.1%}".format)
     tabla_fmt["Movimiento_Esperado_Pct"] = tabla_rebalanceo["Movimiento_Esperado_Pct"].apply(
-        lambda x: "-" if pd.isna(x) else f"{x*100:.1f}%")
+        lambda x: "-" if pd.isna(x) else f"{x:.1%}")
     tabla_fmt["Rango_USD"] = tabla_rebalanceo.apply(
         lambda r: "-" if pd.isna(r["Rango_Bajo_USD"]) else f"${r['Rango_Bajo_USD']:.2f} - ${r['Rango_Alto_USD']:.2f}",
         axis=1)
@@ -1820,11 +1806,11 @@ def plot_allocation_comparison(tabla_rebalanceo):
     fig = go.Figure()
     fig.add_trace(go.Bar(x=df["Ticker"], y=df["Peso_Inicial"], name="Actual",
                           marker_color=allocation_colors["Actual"],
-                          text=df["Peso_Inicial"].map(lambda x: f"{x * 100:.1f}%"), textposition="outside",
+                          text=df["Peso_Inicial"].map("{:.1%}".format), textposition="outside",
                           hovertemplate="%{x} Actual: %{y:.2%}<extra></extra>"))
     fig.add_trace(go.Bar(x=df["Ticker"], y=df["Nuevo_Peso"], name="Sugerido",
                           marker_color=allocation_colors["Sugerido"],
-                          text=df["Nuevo_Peso"].map(lambda x: f"{x * 100:.1f}%"), textposition="outside",
+                          text=df["Nuevo_Peso"].map("{:.1%}".format), textposition="outside",
                           hovertemplate="%{x} Sugerido: %{y:.2%}<extra></extra>"))
     fig.update_layout(
         title="Cambios en la Asignacion del Portafolio",

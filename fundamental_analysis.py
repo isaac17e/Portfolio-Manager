@@ -770,9 +770,9 @@ def analizar_cartera(tickers_list: Sequence[str]) -> pd.DataFrame:
     # Redondeo de columnas numéricas para presentación (se excluyen las columnas
     # de señal, que guardan texto en vez de números)
     columnas_senal = {ind.senal for ind in TODOS_INDICADORES}
-    for col in df.columns:
-        if col not in ("Ticker", "Score_Calidad", "Datos_Incompletos") and col not in columnas_senal:
-            df[col] = df[col].apply(lambda x: round(x, 2) if pd.notna(x) else np.nan)
+    columnas_num = [c for c in df.columns
+                    if c not in ("Ticker", "Score_Calidad", "Datos_Incompletos") and c not in columnas_senal]
+    df[columnas_num] = df[columnas_num].round(2)
 
     df.attrs["historico"] = historicos
     return df
@@ -1406,11 +1406,7 @@ def _senal_fundamental(df: pd.DataFrame) -> Dict[str, Any]:
 def tickers_a_analizar(base: Sequence[str], env=None) -> List[str]:
     """``base`` mas los tickers de ``FUNDAMENTAL_EXTRA_TICKERS`` (sin repetir)."""
     env = os.environ if env is None else env
-    out = list(base)
-    for ticker in parse_ticker_list(env.get(EXTRA_TICKERS_ENV)):
-        if ticker not in out:
-            out.append(ticker)
-    return out
+    return list(dict.fromkeys([*base, *parse_ticker_list(env.get(EXTRA_TICKERS_ENV))]))
 
 
 if __name__ == "__main__":

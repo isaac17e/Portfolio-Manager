@@ -121,18 +121,9 @@ def _split_listing(ticker) -> tuple[str, str]:
     return base, suffix
 
 
-def _class_parts(base: str) -> tuple[str, str] | None:
-    match = _CLASS.match(base)
-    if not match:
-        return None
-    return match.group(1), match.group(2)
-
-
 def _format_class(base: str, separator: str) -> str:
-    parts = _class_parts(base)
-    if not parts:
-        return base
-    return f"{parts[0]}{separator}{parts[1]}"
+    # _CLASS abarca todo el simbolo: si no es una accion de clase, sub lo deja igual.
+    return _CLASS.sub(lambda m: f"{m.group(1)}{separator}{m.group(2)}", base)
 
 
 def to_yahoo(ticker) -> str:

@@ -689,11 +689,8 @@ class CBOEVarianceEngine:
     # -- integración -----------------------------------------------------------
     @staticmethod
     def _delta_k(strikes: np.ndarray) -> np.ndarray:
-        dk = np.empty_like(strikes, dtype=float)
-        dk[1:-1] = (strikes[2:] - strikes[:-2]) / 2.0
-        dk[0] = strikes[1] - strikes[0]
-        dk[-1] = strikes[-1] - strikes[-2]
-        return dk
+        # np.gradient: diferencia central en el interior y de un lado en los bordes.
+        return np.gradient(np.asarray(strikes, dtype=float))
 
     def variance(
         self, strikes: np.ndarray, iv: np.ndarray, F: float, T: float

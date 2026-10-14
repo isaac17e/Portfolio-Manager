@@ -7,3 +7,4 @@ scipy
 python-dotenv
 pandas_market_calendars
 lxml>=4.9            # motor de pandas.read_html (universe.py)
+python-dateutil      # relativedelta (pipeline_io, entry_signal_tool); ya viene con pandas

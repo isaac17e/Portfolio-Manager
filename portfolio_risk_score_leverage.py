@@ -122,7 +122,7 @@ def polygon_get(path, params=None, api_key=None):
     return polygon_client(api_key).get(path, params)
 
 def pct(x, digits=2):
-    return f"{x * 100:.{digits}f}%"
+    return f"{x:.{digits}%}"
 
 # =============================================================================
 # BLOQUE 3: DATOS DE MERCADO Y RETORNOS
@@ -147,11 +147,12 @@ def get_price_data(tickers, start, end):
 
     # Un ticker sin ningun precio dejaba una columna vacia y el dropna() de abajo
     # borraba TODAS las filas. Se excluye ese ticker y el resto sigue.
-    sin_precios = [tk for tk in prices.columns if prices[tk].isna().all()]
+    prices_validos = prices.dropna(axis=1, how="all")
+    sin_precios = [tk for tk in prices.columns if tk not in prices_validos.columns]
     for tk in sin_precios:
         log_warn(f"{tk}: Yahoo no devolvio precios; se excluye del analisis.")
-    prices = prices.drop(columns=sin_precios)
-    if prices.empty or prices.shape[1] == 0:
+    prices = prices_validos
+    if prices.empty:
         raise ValueError("Ningun ticker tiene precios historicos. Revisa los tickers/conexion.")
 
     prices = prices.ffill().dropna()
@@ -159,8 +160,7 @@ def get_price_data(tickers, start, end):
     return prices, excluded
 
 def get_log_returns(prices):
-    rets = np.log(prices / prices.shift(1)).dropna()
-    return rets
+    return np.log(prices).diff().dropna()
 
 def get_portfolio_returns(asset_returns, weights):
     w = pd.Series(weights)[asset_returns.columns]
@@ -244,16 +244,10 @@ def compute_var_es(returns_df, confidence_levels, horizon_days, trading_days_per
     return pd.DataFrame(rows)
 
 def compute_max_drawdown(returns_df):
-    rows = []
-    for asset in returns_df.columns:
-        r = returns_df[asset]
-        # Los retornos son logaritmicos: el valor acumulado es exp(suma), no prod(1 + r)
-        cum = np.exp(r.cumsum())
-        running_max = cum.cummax()
-        drawdown = (cum - running_max) / running_max
-        mdd = -drawdown.min()
-        rows.append({"Activo": asset, "Max_Drawdown": mdd})
-    return pd.DataFrame(rows)
+    # Los retornos son logaritmicos: el valor acumulado es exp(suma), no prod(1 + r)
+    cum = np.exp(returns_df.cumsum())
+    mdd = (1 - cum / cum.cummax()).max()
+    return pd.DataFrame({"Activo": mdd.index, "Max_Drawdown": mdd.values})
 
 def compute_sharpe_sortino(returns_df, rf_annual, mar_annual, trading_days_per_year, horizon_days):
     rf_daily = rf_annual / trading_days_per_year
@@ -498,41 +492,30 @@ def get_option_chain_snapshot(ticker, expiration_date, api_key):
         log_warn(f"Snapshot de opciones vacio para {ticker} @ {expiration_date}.")
         return None
 
-    def g(d, path, default=None):
-        cur = d
-        for key in path.split("."):
-            if not isinstance(cur, dict) or key not in cur:
-                return default
-            cur = cur[key]
-        return cur
-
-    rows = []
-    for item in all_results:
-        rows.append({
-            "contract_ticker": g(item, "details.ticker"),
-            "contract_type": g(item, "details.contract_type"),
-            "strike": g(item, "details.strike_price"),
-            "expiration": g(item, "details.expiration_date"),
-            "iv": g(item, "implied_volatility"),
-            "delta": g(item, "greeks.delta"),
-            "gamma": g(item, "greeks.gamma"),
-            "theta": g(item, "greeks.theta"),
-            "vega": g(item, "greeks.vega"),
-            "volume": g(item, "day.volume"),
-            "open_interest": g(item, "open_interest"),
-            "spot": g(item, "underlying_asset.price"),
-            "day_close": g(item, "day.close"),
-            "last_quote_mid": g(item, "last_quote.midpoint"),
-        })
-
-    chain = pd.DataFrame(rows)
-    if chain.empty:
-        return None
+    # json_normalize aplana el JSON anidado ("details.ticker", ...); reindex
+    # deja en NaN las columnas que Polygon no haya devuelto.
+    columnas = {
+        "details.ticker": "contract_ticker",
+        "details.contract_type": "contract_type",
+        "details.strike_price": "strike",
+        "details.expiration_date": "expiration",
+        "implied_volatility": "iv",
+        "greeks.delta": "delta",
+        "greeks.gamma": "gamma",
+        "greeks.theta": "theta",
+        "greeks.vega": "vega",
+        "day.volume": "volume",
+        "open_interest": "open_interest",
+        "underlying_asset.price": "spot",
+        "day.close": "day_close",
+        "last_quote.midpoint": "last_quote_mid",
+    }
+    chain = (pd.json_normalize(all_results).reindex(columns=list(columnas))
+             .rename(columns=columnas))
 
     numeric_cols = ["strike", "iv", "delta", "gamma", "theta", "vega",
                      "volume", "open_interest", "spot", "day_close", "last_quote_mid"]
-    for c in numeric_cols:
-        chain[c] = pd.to_numeric(chain[c], errors="coerce")
+    chain[numeric_cols] = chain[numeric_cols].apply(pd.to_numeric, errors="coerce")
 
     chain = chain.dropna(subset=["strike", "contract_type"])
     if chain.empty:
@@ -576,12 +559,9 @@ def compute_gex_profile(chain):
 
     df = chain.dropna(subset=["gamma", "open_interest"]).copy()
     df["gamma_oi"] = df["gamma"] * df["open_interest"]
-    grouped = df.groupby(["strike", "contract_type"])["gamma_oi"].sum().reset_index()
-    pivot = grouped.pivot(index="strike", columns="contract_type", values="gamma_oi").fillna(0).reset_index()
-    if "call" not in pivot.columns:
-        pivot["call"] = 0
-    if "put" not in pivot.columns:
-        pivot["put"] = 0
+    pivot = (df.pivot_table(index="strike", columns="contract_type", values="gamma_oi",
+                            aggfunc="sum", fill_value=0)
+             .reindex(columns=["call", "put"], fill_value=0).reset_index())
 
     pivot["GEX_call"] = pivot["call"] * 100 * spot ** 2 * 0.01
     pivot["GEX_put"] = -pivot["put"] * 100 * spot ** 2 * 0.01
@@ -619,11 +599,10 @@ def compute_max_pain(chain):
     calls = chain[chain["contract_type"] == "call"]
     puts = chain[chain["contract_type"] == "put"]
 
-    payouts = []
-    for K in strikes:
-        call_payout = (np.maximum(K - calls["strike"], 0) * calls["open_interest"]).sum(skipna=True)
-        put_payout = (np.maximum(puts["strike"] - K, 0) * puts["open_interest"]).sum(skipna=True)
-        payouts.append(call_payout + put_payout)
+    # Pago total en cada strike K (filas) contra todos los contratos (columnas).
+    S = np.asarray(strikes, dtype=float)[:, None]
+    payouts = (np.maximum(S - calls["strike"].to_numpy(), 0) @ calls["open_interest"].fillna(0).to_numpy()
+               + np.maximum(puts["strike"].to_numpy() - S, 0) @ puts["open_interest"].fillna(0).to_numpy())
 
     notional_tbl = pd.DataFrame({"strike": strikes, "payout": payouts})
     max_pain_strike = strikes[int(np.argmin(payouts))]
@@ -838,8 +817,7 @@ def run_options_module(tickers, hv_by_asset, weights, target_days, api_key,
     else:
         all_w = pd.Series(weights, dtype=float)
         valid_w = all_w[summary_tbl.loc[iv_valida, "Activo"]]
-        portfolio_iv = float((summary_tbl.loc[iv_valida, "IV_ATM"].values * valid_w.values).sum()
-                             / valid_w.sum())
+        portfolio_iv = float(np.average(summary_tbl.loc[iv_valida, "IV_ATM"].values, weights=valid_w.values))
         iv_coverage["weight_coverage"] = float(valid_w.sum() / all_w.sum())
     if iv_coverage["tickers_without_iv"]:
         log_warn(
@@ -944,11 +922,7 @@ def run_leverage_module(expost_results, options_module, weights,
         w["gex_pcr"] * scoring["gex_pcr_norm"]
     )
 
-    score_min, score_max = scoring["Risk_Score"].min(), scoring["Risk_Score"].max()
-    if score_max - score_min == 0:
-        scoring["Risk_Score_Norm"] = 0.5
-    else:
-        scoring["Risk_Score_Norm"] = (scoring["Risk_Score"] - score_min) / (score_max - score_min)
+    scoring["Risk_Score_Norm"] = min_max_normalize(scoring["Risk_Score"])
 
     scoring["Apalancamiento"] = leverage_max - scoring["Risk_Score_Norm"] * (leverage_max - leverage_min)
     scoring["Peso_Inicial"] = scoring["Activo"].map(weights)
@@ -1125,8 +1099,8 @@ def _senal_riesgo(leverage_results, options_module):
     weights = summary["Peso_Inicial"].astype(float)
     weight_sum = float(weights.sum())
     if weight_sum > 0:
-        target_leverage = float((summary["Apalancamiento"].astype(float) * weights).sum() / weight_sum)
-        risk_score = float((summary["Risk_Score"].astype(float) * weights).sum() / weight_sum)
+        target_leverage = float(np.average(summary["Apalancamiento"].astype(float), weights=weights))
+        risk_score = float(np.average(summary["Risk_Score"].astype(float), weights=weights))
     else:
         target_leverage = None
         risk_score = None

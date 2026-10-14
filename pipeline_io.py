@@ -74,6 +74,8 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
+from dateutil.relativedelta import relativedelta
+
 try:
     import numpy as np
 except ImportError:  # pragma: no cover
@@ -297,14 +299,7 @@ def _add_months(start: date, months: float) -> date:
     whole = int(months)
     if whole != months:
         return start + timedelta(days=round(months * _DAYS_PER_MONTH))
-    index = start.month - 1 + whole
-    year, month = start.year + index // 12, index % 12 + 1
-    for day in range(start.day, 0, -1):
-        try:
-            return date(year, month, day)
-        except ValueError:
-            continue
-    return date(year, month, 1)
+    return start + relativedelta(months=whole)
 
 
 def portfolio_horizon_fields(portfolio) -> dict:
@@ -1328,12 +1323,7 @@ def save_rotation_state(state: dict, portfolio_meta, path: str | None = None) ->
 def parse_ticker_list(raw) -> list[str]:
     """Tickers from a comma/whitespace separated string, in order, without blanks or
     duplicates. ``None`` or blank gives ``[]``."""
-    out: list[str] = []
-    for part in re.split(r"[,\s]+", str(raw or "")):
-        part = part.strip()
-        if part and part not in out:
-            out.append(part)
-    return out
+    return list(dict.fromkeys(part for part in re.split(r"[,\s]+", str(raw or "")) if part))
 
 
 def apply_rotation_overrides(weights: dict, state) -> tuple[dict, list[str]]:

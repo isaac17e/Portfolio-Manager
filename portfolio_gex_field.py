@@ -29,7 +29,6 @@ from tickers import (
     to_polygon, to_yahoo,
 )
 import plotly.graph_objects as go
-import plotly.io as pio
 from plotly.subplots import make_subplots
 from viz_utils import show_or_save
 import yfinance as yf
@@ -687,7 +686,7 @@ def _fetch_macro_series(ticker_candidates, period=MACRO_LOOKBACK_PERIOD):
 def _percentile_rank(series, current_value):
     if series is None or series.empty or current_value is None or np.isnan(current_value):
         return np.nan
-    return float((series < current_value).sum() / len(series))
+    return float((series < current_value).mean())
 
 
 _macro_cache = {"t": None, "lookback": None, "data": None}
@@ -732,8 +731,8 @@ def calculate_macro_y_axis(macro_indicators, weights=MACRO_WEIGHTS):
         print("❌ Ningún indicador macro disponible. No se puede calcular el eje Y.")
         return {"y_score": np.nan, "components_used": []}
 
-    total_weight = sum(weights[k] for k in available)
-    y_score = sum(available[k]["percentile"] * weights[k] for k in available) / total_weight
+    y_score = float(np.average([available[k]["percentile"] for k in available],
+                               weights=[weights[k] for k in available]))
 
     missing = set(macro_indicators.keys()) - set(available.keys())
     if missing:
@@ -1004,11 +1003,10 @@ def _build_gex_force_function_sigma(df_gex_structural, current_price, expected_m
         left_band = real_min - (-sigma_range)
         right_band = sigma_range - real_max
         taper = np.ones_like(grid_sigma)
-        for i, gx in enumerate(grid_sigma):
-            if gx < real_min and left_band > 1e-6:
-                taper[i] = np.clip((gx - (-sigma_range)) / left_band, 0.0, 1.0)
-            elif gx > real_max and right_band > 1e-6:
-                taper[i] = np.clip((sigma_range - gx) / right_band, 0.0, 1.0)
+        if left_band > 1e-6:
+            taper = np.where(grid_sigma < real_min, np.clip((grid_sigma + sigma_range) / left_band, 0.0, 1.0), taper)
+        if right_band > 1e-6:
+            taper = np.where(grid_sigma > real_max, np.clip((sigma_range - grid_sigma) / right_band, 0.0, 1.0), taper)
         gex_on_grid = gex_on_grid * taper
 
     gex_smoothed = gaussian_filter1d(gex_on_grid, sigma=smoothing_sigma)
@@ -1438,8 +1436,7 @@ def write_portfolio_data_json(fig, output_dir, filename=DATA_JSON_FILENAME):
     if fig is None:
         return None
     path = os.path.join(output_dir, filename)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(pio.to_json(fig, remove_uids=True))
+    fig.write_json(path, remove_uids=True)
     return path
 
 

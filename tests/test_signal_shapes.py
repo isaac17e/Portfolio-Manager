@@ -99,7 +99,7 @@ class SignalShapeTests(unittest.TestCase):
         build = _load_function(
             "portfolio_risk_score_leverage.py",
             "_senal_riesgo",
-            {"pd": pd, "risk_score_weights": {"hv": 0.30, "cvar": 0.30, "iv": 0.25, "gex_pcr": 0.15},
+            {"pd": pd, "np": np, "risk_score_weights": {"hv": 0.30, "cvar": 0.30, "iv": 0.25, "gex_pcr": 0.15},
              "leverage_min": 2.0, "leverage_max": 5.0},
         )
         summary = pd.DataFrame([

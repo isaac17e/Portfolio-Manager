@@ -203,7 +203,7 @@ def price_metrics(ohlc) -> dict:
         base_12m, base_1m = close.iloc[-253], close.iloc[-22]
         if base_12m > 0:
             out["mom_12_1"] = float(base_1m / base_12m - 1)
-    rets = np.log(close / close.shift(1)).dropna()
+    rets = np.log(close).diff().dropna()
     if len(rets) >= 126:
         vol_6m = float(rets.tail(126).std() * math.sqrt(252))
         if vol_6m > 0 and np.isfinite(out["ret_6m"]):
@@ -369,7 +369,7 @@ def screen_candidates(rows: list[dict]) -> pd.DataFrame:
     df["cansancio"] = [cansancio_score(r)["total"] for r in df.to_dict("records")]
     df["frescura"] = 100.0 - df["cansancio"]
     df["puntaje"] = sum(SCREEN_WEIGHTS[k] * df[k] for k in SCREEN_WEIGHTS)
-    df["descartado"] = df["ret_5d"].apply(lambda r: bool(np.isfinite(r) and r <= DROP_THRESHOLD))
+    df["descartado"] = df["ret_5d"] <= DROP_THRESHOLD
     return df.sort_values(["descartado", "puntaje"], ascending=[True, False]).reset_index(drop=True)
 
 
@@ -428,11 +428,11 @@ def covariance(names, closes: dict, sigmas: dict):
 # BLOQUE 8: SALIDA EN TERMINAL Y FIGURAS
 # ==============================================================================
 def _pct(x, digits=2):
-    return "-" if x is None or not np.isfinite(x) else f"{x * 100:+.{digits}f}%"
+    return "-" if x is None or not np.isfinite(x) else f"{x:+.{digits}%}"
 
 
 def _w(x):
-    return "-" if x is None or not np.isfinite(x) else f"{x * 100:.2f}%"
+    return "-" if x is None or not np.isfinite(x) else f"{x:.2%}"
 
 
 def print_detector(rows):
@@ -832,7 +832,7 @@ def select_rotation(pesos, triggers, top, ranking, closes, liberado):
         if not (s is not None and np.isfinite(s) and s > 0):
             s = np.nan if fila is None else fila.get("vol_1y", np.nan)
         if not (s is not None and np.isfinite(s) and s > 0):
-            rets = np.log(closes[name] / closes[name].shift(1)).dropna()
+            rets = np.log(closes[name]).diff().dropna()
             s = float(rets.tail(252).std() * math.sqrt(252)) if len(rets) > 20 else 0.25
         sigmas[name] = float(s)
         puntaje = 50.0 if fila is None else float(fila.get("puntaje", 50.0))
