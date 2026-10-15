@@ -37,6 +37,19 @@ the ``<stamp>`` of its name must be the portfolio's stamp. Only statuses
 ``load_portfolio_holdings`` combines both kinds into the NET held quantity per
 ticker (bought - sold, never below 0).
 
+Holdings snapshot, ``holdings_<optimizer>_<stamp>.json`` (see ``current_holdings``)
+-----------------------------------------------------------------------------------
+Written by the executor from the broker's positions::
+
+    {"schema_version": 1, "portfolio_run_ts": "2026-10-08T12:12:53-05:00",
+     "portfolio_optimizer": "quadratic_utility", "account_id": "...",
+     "as_of": "2026-10-14T15:58:12-04:00", "source": "capital_positions",
+     "positions": [{"ticker": "AVGO", "qty": 14.65, "price": 412.3,
+                    "market_value": 6040.2}]}
+
+``as_of`` carries a UTC offset. ``current_holdings`` uses the snapshot only when it is at
+most one NYSE session old, else the net fills, else the portfolio file's weights.
+
 Cumulative buy fills (format change, backward compatible)
 ---------------------------------------------------------
 The entry runs over several days (tranches). The buy file of a portfolio is
@@ -740,9 +753,11 @@ def load_portfolio_fills(portfolio_meta, directory: str | None = None):
 _FILL_SEPARATORS = "._-"
 
 
-def _fills_candidates(portfolio_meta, directory: str | None = None) -> list[str]:
+def _fills_candidates(portfolio_meta, directory: str | None = None,
+                      include_backups: bool = True) -> list[str]:
     """Paths of every buy-fills file of the portfolio: ``fills_<key>.json`` first, then
-    ``fills_<key>[._-]*.json`` and ``fills_<key>*.bak*`` (oldest name first)."""
+    ``fills_<key>[._-]*.json`` and ``fills_<key>*.bak*`` (oldest name first).
+    ``include_backups=False`` leaves the ``.bak`` files out."""
     key = portfolio_key(portfolio_meta)
     if key is None:
         return []
@@ -759,7 +774,8 @@ def _fills_candidates(portfolio_meta, directory: str | None = None) -> list[str]
         rest = name[len(head):]
         if rest == ".json":
             bucket = main
-        elif rest and rest[0] in _FILL_SEPARATORS and (rest.endswith(".json") or ".bak" in rest):
+        elif rest and rest[0] in _FILL_SEPARATORS and (
+                rest.endswith(".json") or (include_backups and ".bak" in rest)):
             bucket = others
         else:
             continue
@@ -769,11 +785,12 @@ def _fills_candidates(portfolio_meta, directory: str | None = None) -> list[str]
     return main + others
 
 
-def load_portfolio_fill_docs(portfolio_meta, directory: str | None = None) -> list[dict]:
+def load_portfolio_fill_docs(portfolio_meta, directory: str | None = None,
+                             include_backups: bool = True) -> list[dict]:
     """Every readable buy-fills document of this portfolio (see ``_fills_candidates``).
     Never raises; unreadable files are warned about and skipped."""
     docs = []
-    for path in _fills_candidates(portfolio_meta, directory):
+    for path in _fills_candidates(portfolio_meta, directory, include_backups):
         doc = _read_fills(path)
         if doc is not None:
             docs.append(doc)
@@ -963,10 +980,13 @@ def summarize_holdings(buy_doc, sell_docs=(), capital=None) -> dict:
     is bought - sold, floored at 0. Only fills with status filled / partial /
     partially_filled count. A fill repeated in several files (see ``_fill_key``)
     counts once. A fill with no ``filled_weight`` gets ``filled_qty * price /
-    capital`` when ``capital`` (portfolio value) is given.
+    capital`` when ``capital`` (portfolio value) is given. Each row also carries
+    ``last_price`` (price of its latest fill, by ``fill_ts``) and ``last_fill_ts``
+    when some fill has a price.
     """
     holdings: dict = {}
     first_seen: dict = {}
+    last_stamp: dict = {}
     buys = buy_doc if isinstance(buy_doc, (list, tuple)) else [buy_doc]
     sources = [("BUY", _stamped_fills(doc)) for doc in buys]
     sources += [("SELL", [f for f in (doc or {}).get("fills") or []]) for doc in sell_docs or ()]
@@ -993,6 +1013,14 @@ def summarize_holdings(buy_doc, sell_docs=(), capital=None) -> dict:
             first_seen.setdefault(key, index)
             row = holdings.setdefault(ticker, dict.fromkeys(
                 ("bought_qty", "sold_qty", "bought_weight", "sold_weight"), 0.0))
+            price = _as_float(fill.get("price"))
+            if price is not None and price > 0:
+                moment = _parse_iso(fill.get("fill_ts"))
+                stamp = moment.timestamp() if moment is not None else float("-inf")
+                if stamp >= last_stamp.get(ticker, float("-inf")):
+                    last_stamp[ticker] = stamp
+                    row["last_price"] = price
+                    row["last_fill_ts"] = fill.get("fill_ts") if moment is not None else None
             prefix = "bought" if side == "BUY" else "sold"
             if qty is not None:
                 row[f"{prefix}_qty"] += abs(qty)
@@ -1018,7 +1046,8 @@ def _as_float_text(value):
         return None
 
 
-def load_portfolio_holdings(portfolio_meta, directory: str | None = None) -> dict:
+def load_portfolio_holdings(portfolio_meta, directory: str | None = None,
+                            include_backups: bool = True) -> dict:
     """NET held quantity per ticker from the buy and sell fills of this portfolio.
 
     Buy fills are the SUM of every tranche: all ``fills_<optimizer>_<stamp>*``
@@ -1030,7 +1059,7 @@ def load_portfolio_holdings(portfolio_meta, directory: str | None = None) -> dic
     if portfolio_key(portfolio_meta) is None:
         buys = load_fills("entry_signal_tool", directory)
     else:
-        buys = load_portfolio_fill_docs(portfolio_meta, directory)
+        buys = load_portfolio_fill_docs(portfolio_meta, directory, include_backups)
     return summarize_holdings(buys, load_portfolio_sell_fills(portfolio_meta, directory),
                               capital=portfolio_capital())
 
@@ -1068,6 +1097,217 @@ def rotation_reentered(rotation_state, ticker: str) -> bool:
                 and str(entry.get("date") or "") > last_exit:
             return True
     return False
+
+
+# ------------------------------------------------------------------------------
+# Current holdings: what the portfolio really holds today (weights for gex / vix)
+# ------------------------------------------------------------------------------
+NY = ZoneInfo("America/New_York")
+_default_executions_dir = executions_dir
+HOLDINGS_SNAPSHOT_SCHEMA = 1
+SNAPSHOT_MAX_SESSIONS = 1
+WEIGHTS_FROM_SNAPSHOT = "snapshot"
+WEIGHTS_FROM_FILLS = "fills"
+WEIGHTS_FROM_PORTFOLIO_FILE = "portfolio_file"
+
+
+def _parse_iso(value) -> datetime | None:
+    """Timezone-aware datetime from an ISO-8601 string, or None (also when naive)."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        moment = datetime.fromisoformat(re.sub(r"Z$", "+00:00", value.strip()))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo is not None else None
+
+
+def holdings_snapshot_path(portfolio_meta, directory: str | None = None) -> str | None:
+    """``<EXECUTIONS_DIR>/holdings_<optimizer>_<run_ts stamp>.json``, or None."""
+    key = portfolio_key(portfolio_meta)
+    if key is None:
+        return None
+    directory = executions_dir() if directory is None else directory
+    return os.path.join(directory, f"holdings_{key}.json")
+
+
+def _positive_float(value) -> float | None:
+    number = _as_float(value)
+    return number if number is not None and number > 0 else None
+
+
+def _snapshot_fresh(as_of: datetime, today: date, sessions_fn=None) -> tuple[bool, str]:
+    """(usable, reason). Fresh = at most ``SNAPSHOT_MAX_SESSIONS`` NYSE sessions
+    between the snapshot's New York date (exclusive) and ``today`` (inclusive)."""
+    as_of_day = as_of.astimezone(NY).date()
+    if as_of_day > today + timedelta(days=1):
+        return False, f"as_of {as_of.isoformat()} is in the future"
+    if as_of_day >= today:
+        return True, ""
+    sessions = (sessions_fn or nyse_sessions_between)(as_of_day + timedelta(days=1), today)
+    if len(sessions) > SNAPSHOT_MAX_SESSIONS:
+        return False, (f"as_of {as_of.isoformat()} is {len(sessions)} NYSE sessions old "
+                       f"(max {SNAPSHOT_MAX_SESSIONS})")
+    return True, ""
+
+
+def _snapshot_positions(path: str, portfolio_meta, today: date, sessions_fn, notes: list):
+    """``({ticker: {qty, price, market_value}}, as_of_text)`` from a fresh, valid
+    snapshot, or None (after a warning in ``notes``) when it is missing or unusable."""
+    def reject(reason):
+        notes.append(f"holdings snapshot ignored ({path}): {reason}.")
+        return None
+
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        return reject(f"unreadable ({exc})")
+    if not isinstance(payload, dict) or payload.get("schema_version") != HOLDINGS_SNAPSHOT_SCHEMA:
+        return reject("not a schema_version 1 object")
+    meta = portfolio_meta or {}
+    optimizer = payload.get("portfolio_optimizer")
+    if optimizer and _file_token(optimizer) != _file_token(meta.get("portfolio_optimizer") or ""):
+        return reject("belongs to another optimizer")
+    if payload.get("portfolio_run_ts") and \
+            run_ts_stamp(payload["portfolio_run_ts"]) != run_ts_stamp(meta.get("portfolio_run_ts")):
+        return reject("belongs to another portfolio run")
+    as_of = _parse_iso(payload.get("as_of"))
+    if as_of is None:
+        return reject("as_of missing or not ISO-8601 with a UTC offset")
+    fresh, why = _snapshot_fresh(as_of, today, sessions_fn)
+    if not fresh:
+        return reject(why)
+    rows = payload.get("positions")
+    if not isinstance(rows, list):
+        return reject("positions is not a list")
+    positions: dict = {}
+    for row in rows:
+        ticker = str((row or {}).get("ticker") or "").strip() if isinstance(row, dict) else ""
+        qty = _as_float(row.get("qty")) if ticker else None
+        if qty is None:
+            continue
+        if qty < -_QTY_EPS:
+            notes.append(f"snapshot: {ticker} has negative qty {qty:g}; dropped.")
+        if qty <= _QTY_EPS:
+            continue
+        price = _positive_float(row.get("price"))
+        value = _positive_float(row.get("market_value"))
+        if value is None and price is not None:
+            value = qty * price
+        if value is None:
+            notes.append(f"snapshot: {ticker} has no price or market_value; dropped.")
+            continue
+        slot = positions.setdefault(ticker, {"qty": 0.0, "price": price, "market_value": 0.0,
+                                             "price_source": "snapshot"})
+        slot["qty"] += qty
+        slot["market_value"] += value
+        slot["price"] = value / slot["qty"]
+    if not positions:
+        return reject("no valid positions")
+    return positions, str(payload["as_of"])
+
+
+def _fills_positions(portfolio_meta, directory, include_backups, prices, price_fn, notes: list):
+    """``(positions, as_of, price_fallback)`` from the net fills, or None when there are
+    no fills or none can be valued. Net = buys - sells (``load_portfolio_holdings``)."""
+    holdings = load_portfolio_holdings(portfolio_meta, directory, include_backups)
+    if not holdings:
+        return None
+    positions, fallback, latest = {}, [], None
+    for ticker, row in sorted(holdings.items()):
+        net = row["bought_qty"] - row["sold_qty"]
+        if net < -_QTY_EPS:
+            notes.append(f"fills: {ticker} sold more than bought (net {net:g}); dropped.")
+        if net <= _QTY_EPS:
+            continue
+        price, source = _positive_float((prices or {}).get(ticker)), "prices"
+        if price is None and price_fn is not None:
+            try:
+                price, source = _positive_float(price_fn(ticker)), "price_fn"
+            except Exception as exc:
+                notes.append(f"fills: price for {ticker} unavailable ({exc}).")
+        if price is None:
+            price, source = _positive_float(row.get("last_price")), "last_fill"
+        if price is None:
+            notes.append(f"fills: {ticker} has no price; dropped.")
+            continue
+        if source == "last_fill":
+            fallback.append(ticker)
+        positions[ticker] = {"qty": net, "price": price, "market_value": net * price,
+                             "price_source": source}
+        moment = _parse_iso(row.get("last_fill_ts"))
+        if moment is not None and (latest is None or moment > latest[0]):
+            latest = (moment, row["last_fill_ts"])
+    if not positions:
+        return None
+    if fallback:
+        notes.append("fills: valued at the last fill price (no current price): "
+                     + ", ".join(fallback) + ".")
+    return positions, (latest[1] if latest else None), fallback
+
+
+def _weights_from_values(positions: dict) -> dict:
+    total = sum(p["market_value"] for p in positions.values())
+    return {t: p["market_value"] / total for t, p in sorted(positions.items())}
+
+
+def current_holdings(portfolio, executions_dir: str | None = None, *, prices=None,
+                     price_fn=None, today: date | None = None, sessions_fn=None,
+                     include_backups: bool = True) -> dict:
+    """What the portfolio really holds now, with weights over the invested positions.
+
+    ``portfolio`` is the dict of ``load_portfolio`` (``weights`` and ``portfolio_optimizer`` /
+    ``portfolio_run_ts``). Sources, in priority order:
+
+    1. ``holdings_<key>.json`` (``HOLDINGS_SNAPSHOT_SCHEMA``, written by the executor from the
+       broker's positions), only when its ``as_of`` is at most ``SNAPSHOT_MAX_SESSIONS`` NYSE
+       sessions old; otherwise it is ignored with a warning.
+    2. Net fills: buy fills minus sell fills (``load_portfolio_holdings``), valued at
+       ``prices[ticker]``, else ``price_fn(ticker)``, else the ticker's last fill price (listed
+       in ``price_fallback_tickers``). ``include_backups=False`` ignores ``fills_*.bak*``.
+    3. The portfolio file's own weights.
+
+    Quantities <= 0 are dropped (a net sale beyond the purchases warns). Weights are
+    market value / total market value of the invested positions (sum 1; cash is not part of
+    it). Never raises; the executions folder is only read.
+
+    Returns ``{"holdings": {ticker: {"qty", "price", "market_value", "weight", ...}},
+    "weights": {ticker: weight}, "weights_source": "snapshot" | "fills" | "portfolio_file",
+    "as_of": ISO text or None, "price_fallback_tickers": [...], "warnings": [...]}``.
+    """
+    notes: list = []
+    directory = executions_dir if executions_dir is not None else _default_executions_dir()
+    today = today or cycle_today()
+    meta = portfolio or {}
+    source, as_of, positions, fallback = None, None, None, []
+
+    path = holdings_snapshot_path(meta, directory)
+    if path:
+        found = _snapshot_positions(path, meta, today, sessions_fn, notes)
+        if found:
+            positions, as_of = found
+            source = WEIGHTS_FROM_SNAPSHOT
+    if positions is None and portfolio_key(meta) is not None:
+        found = _fills_positions(meta, directory, include_backups, prices, price_fn, notes)
+        if found:
+            positions, as_of, fallback = found
+            source = WEIGHTS_FROM_FILLS
+
+    if positions is not None:
+        weights = _weights_from_values(positions)
+        detail = {t: dict(positions[t], weight=weights[t]) for t in weights}
+    else:
+        source, as_of = WEIGHTS_FROM_PORTFOLIO_FILE, meta.get("portfolio_run_ts")
+        weights = {str(t): float(w) for t, w in (meta.get("weights") or {}).items()}
+        detail = {t: {"qty": None, "price": None, "market_value": None, "weight": w}
+                  for t, w in weights.items()}
+    for note in notes:
+        _warn(note)
+    return {"holdings": detail, "weights": weights, "weights_source": source, "as_of": as_of,
+            "price_fallback_tickers": fallback, "warnings": notes}
 
 
 def pipeline_dir(env=None) -> str:

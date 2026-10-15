@@ -19,8 +19,8 @@ from scipy.interpolate import interp1d
 from scipy.ndimage import gaussian_filter1d
 from datetime import datetime, timedelta
 from pipeline_io import (
-    MIN_OPTION_DAYS, announce_signals_dir, artifact_path, export_signals, load_portfolio,
-    prepare_artifact_path, resolve_horizon, resolve_risk_free_rate,
+    MIN_OPTION_DAYS, announce_signals_dir, artifact_path, current_holdings, export_signals,
+    load_portfolio, prepare_artifact_path, resolve_horizon, resolve_risk_free_rate,
 )
 from gex_utils import downsample_profile, gamma_flip_crossings, gamma_flip_level, zero_gamma_profile
 from polygon_client import NO_OPTION_DATA, PolygonClient, PolygonError, failure_reason
@@ -104,6 +104,9 @@ PORTFOLIO_HOLDINGS = {
 
 _PORTFOLIO_META = load_portfolio(PORTFOLIO_HOLDINGS)
 PORTFOLIO_HOLDINGS = _PORTFOLIO_META["weights"]
+# Pesos reales (ver actualizar_tenencias): hasta que se calculan, los del archivo.
+_TENENCIAS = {"weights_source": "portfolio_file", "as_of": _PORTFOLIO_META.get("portfolio_run_ts"),
+              "price_fallback_tickers": []}
 
 # Horizonte: dias calendario que quedan hasta horizon_end (run_cycle los pasa en
 # PORTFOLIO_HORIZON_DAYS; suelto se leen del JSON). La cadena llega hasta ese
@@ -323,6 +326,31 @@ def get_current_price(ticker):
             except Exception as e3:
                 print(f"❌ [{ticker}] ERROR CRÍTICO: no se pudo obtener el precio spot por ninguna fuente: {e3}")
                 return None
+
+
+def actualizar_tenencias():
+    """Reemplaza PORTFOLIO_HOLDINGS por las tenencias reales del portafolio.
+
+    Orden: snapshot ``holdings_<pf>.json`` vigente, fills netos (compras - ventas) a precio
+    actual, pesos del archivo del portafolio (pipeline_io.current_holdings). Nunca lanza.
+    """
+    global PORTFOLIO_HOLDINGS, _TENENCIAS
+    try:
+        actual = current_holdings(_PORTFOLIO_META, price_fn=get_current_price)
+    except Exception as exc:
+        print(f"⚠️  No se pudieron calcular las tenencias reales ({exc}); se usan los pesos del archivo.")
+        return PORTFOLIO_HOLDINGS
+    if actual["weights"]:
+        PORTFOLIO_HOLDINGS = actual["weights"]
+    _TENENCIAS = {key: actual[key] for key in ("weights_source", "as_of", "price_fallback_tickers")}
+    print(f"ℹ️  Pesos del campo GEX: fuente={actual['weights_source']} as_of={actual['as_of']} "
+          f"({len(PORTFOLIO_HOLDINGS)} tickers).")
+    return PORTFOLIO_HOLDINGS
+
+
+def _meta_senal():
+    """Metadatos del portafolio con los pesos realmente usados (``weights_used`` de la senal)."""
+    return dict(_PORTFOLIO_META, weights=dict(PORTFOLIO_HOLDINGS))
 
 
 def get_polygon_options_data(ticker, current_price, horizon_months=None,
@@ -1540,6 +1568,10 @@ def _senal_gex(result, excluded=None):
         "n_holdings": len(holdings),
         "holdings": holdings,
         "excluded": list(_LAST_EXCLUDED if excluded is None else excluded),
+        "weights_source": _TENENCIAS["weights_source"],
+        "as_of": _TENENCIAS["as_of"],
+        "weights_used": {item["ticker"]: item["weight"] for item in holdings},
+        "price_fallback_tickers": list(_TENENCIAS["price_fallback_tickers"]),
     }
 
 
@@ -1595,6 +1627,7 @@ def run_live(refresh_seconds=REFRESH_SECONDS, max_iterations=MAX_ITERATIONS,
               f"{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n{'='*60}\n")
 
         inicio_iteracion = time.time()
+        actualizar_tenencias()
         result = run_once()
 
         excluded = list(_LAST_EXCLUDED)
@@ -1602,7 +1635,7 @@ def run_live(refresh_seconds=REFRESH_SECONDS, max_iterations=MAX_ITERATIONS,
         data["risk_free_rate"] = RISK_FREE_RATE
         data["horizon"] = HORIZON
         export_signals(
-            "portfolio_gex_field", data, _PORTFOLIO_META,
+            "portfolio_gex_field", data, _meta_senal(),
             warnings=exclusion_warnings(excluded) + adr_warnings(PORTFOLIO_HOLDINGS),
         )
         if result is not None:
@@ -1655,13 +1688,14 @@ def run_headless(output_path=OUTPUT_HTML_PATH):
     """Un calculo, HTML + JSON, sin navegador ni servidor. Modo pipeline."""
     announce_signals_dir("portfolio_gex_field", _PORTFOLIO_META)
     print("Modo pipeline (--once): un calculo, sin navegador.")
+    actualizar_tenencias()
     result = run_once()
     excluded = list(_LAST_EXCLUDED)
     data = _senal_gex(result or {}, excluded)
     data["risk_free_rate"] = RISK_FREE_RATE
     data["horizon"] = HORIZON
     export_signals(
-        "portfolio_gex_field", data, _PORTFOLIO_META,
+        "portfolio_gex_field", data, _meta_senal(),
         warnings=exclusion_warnings(excluded) + adr_warnings(PORTFOLIO_HOLDINGS),
     )
     if result is None:

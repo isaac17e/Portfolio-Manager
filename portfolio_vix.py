@@ -18,7 +18,7 @@ from typing import Callable, Dict, List, Literal, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 from pipeline_io import (
-    announce_signals_dir, artifact_path, export_signals, load_portfolio,
+    announce_signals_dir, artifact_path, current_holdings, export_signals, load_portfolio,
     prepare_artifact_path, resolve_horizon, resolve_risk_free_rate,
 )
 from polygon_client import NoOptionData, PolygonClient, failure_reason
@@ -79,6 +79,11 @@ PORTFOLIO_HOLDINGS: Dict[str, Optional[float]] = {
 
 _PORTFOLIO_META = load_portfolio(PORTFOLIO_HOLDINGS)
 PORTFOLIO_HOLDINGS = _PORTFOLIO_META["weights"]
+# Pesos reales (ver actualizar_tenencias): hasta que se calculan, los del archivo.
+_TENENCIAS: Dict[str, object] = {
+    "weights_source": "portfolio_file", "as_of": _PORTFOLIO_META.get("portfolio_run_ts"),
+    "price_fallback_tickers": [],
+}
 
 # El VIX de portafolio sigue siendo el indice CBOE a 30 dias. Ademas se publica
 # la misma lectura al horizonte del portafolio (dias calendario que quedan hasta
@@ -148,6 +153,41 @@ def portfolio_weights() -> Optional[List[float]]:
     if total <= 0:
         return None
     return list(vals / total)
+
+
+def _spot_price(ticker: str) -> Optional[float]:
+    """Ultimo precio de Yahoo (la misma fuente de precios que usa el motor); None si falla."""
+    if not _HAS_YF:
+        return None
+    try:
+        price = yf.Ticker(to_yahoo(ticker)).fast_info.get("last_price")
+        if not price:
+            hist = yf.Ticker(to_yahoo(ticker)).history(period="1d")["Close"].dropna()
+            price = hist.iloc[-1] if len(hist) else None
+        return float(price) if price and math.isfinite(float(price)) and float(price) > 0 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def actualizar_tenencias() -> Dict[str, float]:
+    """Reemplaza PORTFOLIO_HOLDINGS por las tenencias reales del portafolio.
+
+    Orden: snapshot ``holdings_<pf>.json`` vigente, fills netos (compras - ventas) a precio
+    actual, pesos del archivo del portafolio (pipeline_io.current_holdings). Nunca lanza.
+    """
+    global PORTFOLIO_HOLDINGS, _TENENCIAS
+    try:
+        actual = current_holdings(_PORTFOLIO_META, price_fn=_spot_price)
+    except Exception as exc:  # noqa: BLE001
+        warnings.warn(f"No se pudieron calcular las tenencias reales ({exc}); se usan los "
+                      "pesos del archivo.", RuntimeWarning)
+        return PORTFOLIO_HOLDINGS
+    if actual["weights"]:
+        PORTFOLIO_HOLDINGS = actual["weights"]
+    _TENENCIAS = {key: actual[key] for key in ("weights_source", "as_of", "price_fallback_tickers")}
+    print(f"[tenencias] fuente={actual['weights_source']} as_of={actual['as_of']} "
+          f"({len(PORTFOLIO_HOLDINGS)} tickers)")
+    return PORTFOLIO_HOLDINGS
 
 
 # ==============================================================================
@@ -1895,6 +1935,8 @@ class VIXConfig:
     html_file: str = OUTPUT_HTML
     show_plot: bool = SHOW_PLOT
     horizon_days: float = float(HORIZON["days"])
+    weights_source: Optional[str] = None
+    weights_as_of: Optional[str] = None
 
 
 class PortfolioVIXCalculator:
@@ -2149,6 +2191,10 @@ def _senal_vix(results: Dict[str, object], cfg: "VIXConfig") -> Dict[str, object
             "ctr_pct": row.get("CTR_%"),
         })
     metrics = dict(results["metrics"])
+    if hasattr(cfg, "weights_source"):
+        weights_source, as_of = cfg.weights_source, getattr(cfg, "weights_as_of", None)
+    else:
+        weights_source, as_of = _TENENCIAS["weights_source"], _TENENCIAS["as_of"]
     lectura_h = results.get("horizon") or {}
     por_ticker_h = lectura_h.get("by_ticker") or {}
     for item in holdings:
@@ -2167,6 +2213,10 @@ def _senal_vix(results: Dict[str, object], cfg: "VIXConfig") -> Dict[str, object
         "metrics": metrics,
         "holdings": holdings,
         "excluded": list(results.get("excluded") or []),
+        "weights_source": weights_source,
+        "as_of": as_of,
+        "weights_used": {item["ticker"]: item["weight"] for item in holdings},
+        "price_fallback_tickers": list(_TENENCIAS["price_fallback_tickers"]),
     }
 
 
@@ -2220,6 +2270,13 @@ def _parse_args() -> VIXConfig:
     else:
         weights = portfolio_weights()
 
+    if a.tickers or a.weights is not None:
+        weights_source, weights_as_of = "cli", None
+    elif EQUAL_WEIGHTS:
+        weights_source, weights_as_of = "equal_weights", None
+    else:
+        weights_source, weights_as_of = _TENENCIAS["weights_source"], _TENENCIAS["as_of"]
+
     return VIXConfig(
         tickers=tickers,
         weights=weights,
@@ -2233,12 +2290,15 @@ def _parse_args() -> VIXConfig:
         html_file=a.html,
         show_plot=SHOW_PLOT if a.show is None else a.show,
         horizon_days=float(HORIZON["days"]),
+        weights_source=weights_source,
+        weights_as_of=weights_as_of,
     )
 
 
 if __name__ == "__main__":
     warnings.simplefilter("always", RuntimeWarning)
     announce_signals_dir("portfolio_vix", _PORTFOLIO_META)
+    actualizar_tenencias()
     cfg = _parse_args()
     pesos_txt = (
         "equiponderado"
