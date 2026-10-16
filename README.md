@@ -324,6 +324,8 @@ Each script also writes a JSON signal (contract section 4) through `pipeline_io.
 | `HEADLESS` or `GEX_ONCE` | unset (`run_cycle` sets `HEADLESS=1` for every step) |
 | `FIGURES_DIR` | `<signals dir>/figures` (headless figure HTML; `<PIPELINE_DIR>/figures` with `SIGNALS_PER_PORTFOLIO=0`) |
 | `ROTATION_STATE_FILE` | `<PIPELINE_DIR>/state/rotation_state_<optimizer>_<run_ts>.json` |
+| `MANUAL_OVERRIDES_FILE` | `<PIPELINE_DIR>/state/manual_overrides.json` (one file for all portfolios, written by ARES, see [Manual overrides](#manual-overrides)) |
+| `MANUAL_OVERRIDES_STRICT_GATE` | unset (`1` = a name that only the rotation state brings in, never bought and not in the portfolio file, is also emitted as `REQUIRES_VERIFICATION`) |
 | `FUNDAMENTAL_STATE_FILE` | `<PIPELINE_DIR>/state/fundamental_state_<optimizer>_<run_ts>.json` (last successful fundamental run, see [Fundamental cadence](#fundamental-cadence)) |
 | `FUNDAMENTAL_EXTRA_TICKERS` | unset (comma-separated tickers `fundamental_analysis` analyses besides the portfolio's; `run_cycle` sets it) |
 | `ROTATION_UNIVERSE` | `indices` (`custom` or `both` add your own list) |
@@ -466,6 +468,72 @@ The entry state records `last_tranche_date` (America/Bogota, or `CYCLE_DATE`) an
 `tranche_status` is `pending` (fills not applied yet) or `executed`. `entries` is empty on purpose so an executor cannot repeat the tranche; the earlier tranche is under `existing_tranche`, and its fills file must keep the `existing_signal_run_ts`. The state is not changed, the history CSV is not touched, and the envelope keeps the right `portfolio_source` / `portfolio_run_ts`, so `run_cycle` accepts it (and reports `entry_signal` and `entry_tranche_status` in its `scalars`). Normal runs carry `"signal": "new_tranche"`. The next calendar day prepares the next cycle day as before.
 
 Bypass the lock with `--force-new-tranche` / `ENTRY_FORCE_NEW_TRANCHE=1`, or by naming the day explicitly with `--cycle-day` / `ENTRY_CYCLE_DAY` (a valid day 1..5; an invalid or blank value does not bypass). A run that produced no data for any ticker does not lock the day, so it can be retried. States written before this change have no date and are not locked.
+
+### Manual overrides
+
+When Isaac approves or rejects a replacement / rotation that differs from the one the pipeline proposed, ARES records it in `<PIPELINE_DIR>/state/manual_overrides.json` (`/workspace/pipeline/state/manual_overrides.json` by default; `MANUAL_OVERRIDES_FILE` overrides the path). Without it, a name the rotation brought in stays in `rotation_state` / `entry_state` `pending_targets` and `entry_signal_tool` keeps emitting BUY for it (incident: quadratic_utility 20261008T121253, Isaac replaced FTNT with MRK and FTNT was still bought).
+
+One file for every portfolio, keyed like the fills files, `<optimizer>_<run_ts stamp>` (`pipeline_io.portfolio_key`):
+
+```json
+{
+  "schema_version": 1,
+  "updated_ts": "2026-10-09T10:02:11-05:00",
+  "portfolios": {
+    "quadratic_utility_20261008T121253": {
+      "account_id": "ACC-123",
+      "overrides": [
+        {
+          "id": "ovr-20261009-001",
+          "ts": "2026-10-09T10:01:40-05:00",
+          "action": "replace",
+          "replaced_ticker": "FTNT",
+          "chosen_ticker": "MRK",
+          "target_weight": 0.0462,
+          "source_script": "drawdown_rotation",
+          "approved_by": "isaac",
+          "fills": ["deal-123"],
+          "note": "Isaac prefers MRK over FTNT"
+        }
+      ]
+    }
+  }
+}
+```
+
+| Field | Rule |
+|---|---|
+| `schema_version` | `1` (any other value makes the whole file invalid) |
+| `updated_ts` | ISO-8601 with UTC offset (informative; a bad value only warns) |
+| `portfolios.<key>.account_id` | string, informative |
+| `overrides[].id` | required, non-empty string, unique within the portfolio |
+| `overrides[].ts` | required, ISO-8601 **with** a UTC offset. Entries are replayed oldest first (file order breaks ties); the latest word on a ticker wins, so an `add` after a `remove` brings it back |
+| `overrides[].action` | `replace`, `reject`, `add` or `remove` |
+| `overrides[].replaced_ticker` | required for `replace`, `reject`, `remove`; `null` for `add`. Canonical ticker (upper-cased when read) |
+| `overrides[].chosen_ticker` | required for `replace`, `add` (and different from `replaced_ticker`); `null` for `reject`, `remove` |
+| `overrides[].target_weight` | portfolio weight as a fraction in `(0, 1]` (same units as `target_weight` in the signals), required for `replace`, `add`; `null` (or `0`) for `reject`, `remove` |
+| `overrides[].approved_by` | required, non-empty string (`"isaac"`) |
+| `overrides[].source_script`, `fills`, `note` | optional: script whose proposal was changed (`drawdown_rotation`, `active_management`, ...), deal ids (list of strings) and free text |
+
+| `action` | Effect |
+|---|---|
+| `replace` | `replaced_ticker` never produces a BUY; `chosen_ticker` gets `target_weight` |
+| `add` | `chosen_ticker` gets `target_weight` |
+| `reject` | `replaced_ticker` is the proposed name Isaac rejected: never BUY |
+| `remove` | `replaced_ticker` leaves the targets: never BUY |
+
+A blocked ticker is never bought again; selling what is already held is ARES's job (a SELL is never filtered). Weights are not renormalized: ARES writes the `target_weight` it executes.
+
+`pipeline_io` exposes `load_manual_overrides(portfolio_meta)` (never raises), `validate_manual_overrides(doc)` (a list of messages that name the portfolio key, the position in `overrides` and the field), `effective_targets(weights, rotation_state, entry_state, overrides)`, `buy_gate` and `apply_buy_gate`. **Precedence**, highest first: manual overrides, then the rotation state's `target_overrides` and the entry state's `pending_targets`, then the portfolio file's `weights`. A chosen ticker also beats an `active_management` retarget. A missing file, or a file with no section for the portfolio, changes nothing.
+
+**Where it applies.** `entry_signal_tool` (targets, `pending_targets`, the same-day replay of an already prepared tranche; the signal gets `manual_overrides` and `flagged_by_override`), `drawdown_rotation` (its targets, the candidate pool and its BUY rows; a blocked name is never proposed), `active_management` (a BUY of a blocked name becomes HOLD at the current weight; its engine only analyses the portfolio file's tickers, so a chosen name that is not in the file is covered by `entry_signal_tool`) and `run_cycle`'s extra fundamental tickers.
+
+**Invalid file.** It never crashes a cycle. It is warned about (terminal, signal `warnings`, `data.manual_overrides.errors`), and:
+
+- an entry that fails validation does not apply; the tickers it names are `REQUIRES_VERIFICATION`, the valid entries still apply;
+- a file that cannot be read, is not JSON, has another `schema_version` or has a malformed section for this portfolio makes every ticker that comes only from the rotation state or the pending targets `REQUIRES_VERIFICATION` (which tickers it meant is unknown); tickers of the portfolio file keep their BUY.
+
+**Safety gate and `REQUIRES_VERIFICATION`.** A BUY for a ticker that is not in the portfolio file, not in the net holdings / fills (`load_portfolio_holdings` / `current_holdings`) and not a `chosen_ticker` is emitted with `action` **and** `status` `"REQUIRES_VERIFICATION"`, `verification_reason` and `original_action: "BUY"`; its `tranche_weight` / `target_weight` stay for information. By default a name that the rotation state brings in (and what `drawdown_rotation` itself just picked) is the normal rotation flow and still comes out as BUY; `MANUAL_OVERRIDES_STRICT_GATE=1` makes those need verification too. **Consumers (ARES): never place an order for a row whose `action` is not `BUY`.** Ask Isaac; on approval record an `add` / `replace` override (or `reject` / `remove` if he declines). A signal whose only entries are `REQUIRES_VERIFICATION` closes its entry day like an empty tranche (nothing will be filled), so after approving, rerun with `--force-new-tranche`. Entries of a replayed same-day tranche go through the same gate (`flagged_by_override` lists what changed: `BLOCKED` rows are dropped, `REQUIRES_VERIFICATION` rows are rewritten).
 
 ### Entry state and fills
 

@@ -50,11 +50,15 @@ load_dotenv()
 
 from pipeline_io import (  # noqa: E402
     announce_signals_dir,
-    apply_rotation_overrides,
+    apply_buy_gate,
     cycle_today,
+    describe_overrides,
+    effective_targets,
     entry_phase_info,
     export_signals,
+    load_manual_overrides,
     load_portfolio,
+    load_portfolio_holdings,
     load_rotation_state,
     resolve_horizon,
     resolve_risk_free_rate,
@@ -656,12 +660,26 @@ def run(force=(), dry_run=False, mode="auto"):
     today_date = cycle_today()
     today = today_date.isoformat()
     state = load_rotation_state(_PORTFOLIO_META)
-    pesos, notas = apply_rotation_overrides(_PORTFOLIO_META["weights"], state)
-    for nota in notas:
+    # manual_overrides.json (ARES) manda sobre el estado de rotacion: un ticker que
+    # Isaac reemplazo / rechazo / quito no entra a los pesos, ni se propone de nuevo.
+    manual = load_manual_overrides(_PORTFOLIO_META)
+    efectivos = effective_targets(_PORTFOLIO_META["weights"], state, None, manual)
+    pesos = efectivos["targets"]
+    for nota in efectivos["notes"]:
         print(f"  [estado] {nota}")
+    manual_warns = [f"manual override: {nota}" for nota in efectivos["override_notes"]]
+    manual_warns += [f"manual overrides invalid: {error}" for error in manual.get("errors") or []]
+    manual_warns += [f"{ticker}: {motivo}; BUY becomes REQUIRES_VERIFICATION"
+                     for ticker, motivo in sorted(efectivos["unverified"].items())]
+    for aviso in manual_warns:
+        print(f"  [override] {aviso}")
+    resumen_manual = describe_overrides(manual, efectivos)
     phase = entry_phase_info(_PORTFOLIO_META, today_date)
     if mode == "pause" or (mode == "auto" and phase["active"]):
-        return run_pause(pesos, phase, today, state)
+        data, warns = run_pause(pesos, phase, today, state)
+        if resumen_manual:
+            data["manual_overrides"] = resumen_manual
+        return data, manual_warns + warns
     warnings_out, excluded = [], []
 
     # --- 1. detector -----------------------------------------------------------
@@ -693,6 +711,9 @@ def run(force=(), dry_run=False, mode="auto"):
                           "triggered": f["triggered"], "reason": f["motivo"]} for f in filas_det],
             "triggers": [], "universe": None, "top": [], "selection": None, "rebalances": [],
             "target_overrides": state.get("target_overrides") or {}, "excluded": excluded}
+    if resumen_manual:
+        data["manual_overrides"] = resumen_manual
+    warnings_out += manual_warns
     sin_precio = [f["ticker"] for f in filas_det if f["motivo"] == "sin precios"]
     if not disparados:
         warnings_out += [f"{item['ticker']}: {item['reason']}" for item in excluded]
@@ -728,10 +749,14 @@ def run(force=(), dry_run=False, mode="auto"):
     liberado = float(sum(t["peso_liberado"] for t in triggers))
 
     # --- 3-4. universo y screener ------------------------------------------------
-    info = build_universe(N_TOP_SP500, N_TOP_NASDAQ, UNIVERSE_MODE, _custom_tickers(), exclude=list(pesos))
+    vetados = set(efectivos["blocked"])
+    info = build_universe(N_TOP_SP500, N_TOP_NASDAQ, UNIVERSE_MODE, _custom_tickers(),
+                          exclude=list(pesos) + sorted(vetados))
     origen = {row["ticker"]: row["origin"] for row in info["rows"]}
     filas = []
     for ticker in info["tickers"]:
+        if ticker.strip().upper() in vetados:
+            continue
         try:
             ohlc = fetch_ohlc(ticker)
         except Exception as exc:  # noqa: BLE001
@@ -771,6 +796,17 @@ def run(force=(), dry_run=False, mode="auto"):
     show_or_save(figure_top(top, elegidos), SCRIPT, "top", portfolio=_PORTFOLIO_META)
 
     rebalances = build_rebalances(triggers, elegidos, peso_cada)
+    # Compuerta: un BUY de un ticker bloqueado a mano no sale; uno sin origen conocido
+    # (salvo lo que esta misma rotacion eligio) sale como REQUIRES_VERIFICATION.
+    rebalances, marcadas = apply_buy_gate(
+        rebalances, efectivos, _PORTFOLIO_META["weights"], load_portfolio_holdings(_PORTFOLIO_META),
+        own_picks=elegidos,
+    )
+    if marcadas:
+        compras = {r["ticker"] for r in rebalances if r["action"] == "BUY"}
+        elegidos = [t for t in elegidos if t in compras]
+        data["flagged_by_override"] = marcadas
+        warnings_out += [f"{m['ticker']}: {m['status']} ({m['reason']})" for m in marcadas]
     print_rebalances(rebalances)
 
     if dry_run:

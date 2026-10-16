@@ -16,7 +16,8 @@ from plotly.subplots import make_subplots
 from gex_utils import gamma_flip_level, zero_gamma_profile
 from polygon_client import NoOptionData, PolygonClient, PolygonError, failure_reason
 from pipeline_io import (
-    MIN_OPTION_DAYS, announce_signals_dir, export_signals, fully_sold_tickers,
+    MIN_OPTION_DAYS, announce_signals_dir, apply_buy_gate, describe_overrides, effective_targets,
+    export_signals, fully_sold_tickers, load_manual_overrides,
     load_portfolio, load_portfolio_holdings, load_rotation_state,
     optimizer_history_path, pick_expiration, resolve_horizon, resolve_risk_free_rate,
 )
@@ -2166,6 +2167,30 @@ def _advertencias_tenencias(rebalances, holdings, rotation_state=None):
     return avisos
 
 
+def _aplicar_overrides_manuales(senal, portfolio_weights, holdings=None, rotation_state=None, manual=None):
+    """manual_overrides.json sobre los rebalanceos: un BUY de un ticker que Isaac reemplazo /
+    rechazo / quito pasa a HOLD (queda una fila por ticker; un SELL no se toca) y uno en duda
+    sale como REQUIRES_VERIFICATION. Devuelve (senal, avisos). Sin archivo no cambia nada.
+
+    El motor solo analiza los tickers del archivo del portafolio: un ticker elegido a mano
+    que no esta ahi no aparece en esta senal (lo cubre entry_signal_tool)."""
+    if manual is None:
+        manual = load_manual_overrides(_PORTFOLIO_META)
+    if manual.get("status", "absent") == "absent":
+        return senal, []
+    efectivos = effective_targets(portfolio_weights, rotation_state, None, manual)
+    senal["rebalances"], marcadas = apply_buy_gate(
+        senal.get("rebalances"), efectivos, portfolio_weights, holdings, blocked_as="hold",
+    )
+    senal["manual_overrides"] = describe_overrides(manual, efectivos)
+    if marcadas:
+        senal["flagged_by_override"] = marcadas
+    avisos = [f"manual override: {nota}" for nota in efectivos["override_notes"]]
+    avisos += [f"manual overrides invalid: {error}" for error in manual.get("errors") or []]
+    avisos += [f"{m['ticker']}: {m['status']} ({m['reason']})" for m in marcadas]
+    return senal, avisos
+
+
 # ============================================================================
 # BLOQUE 9: EJECUCION
 # ============================================================================
@@ -2180,11 +2205,14 @@ def main():
     _senal_activa = _senal_gestion_activa(resultado, holdings)
     _senal_activa["risk_free_rate"] = risk_free_rate
     _senal_activa["horizon"] = HORIZON
+    _estado_rotacion = load_rotation_state(_PORTFOLIO_META)
+    _senal_activa, _avisos_manuales = _aplicar_overrides_manuales(
+        _senal_activa, portfolio, holdings, _estado_rotacion)
     export_signals(
         "active_management", _senal_activa, _PORTFOLIO_META,
         warnings=(exclusion_warnings(_senal_activa.get("excluded")) + adr_warnings(list(portfolio.keys()))
-                  + _advertencias_tenencias(_senal_activa["rebalances"], holdings,
-                                            load_rotation_state(_PORTFOLIO_META))),
+                  + _advertencias_tenencias(_senal_activa["rebalances"], holdings, _estado_rotacion)
+                  + _avisos_manuales),
     )
 
     for _nombre in ("gamma_plot", "allocation_plot", "risk_plot"):

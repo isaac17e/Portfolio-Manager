@@ -1105,7 +1105,9 @@ def rotation_held_extras(portfolio: dict, signals_base: str | None = None) -> li
     state = pipeline_io.load_rotation_state(
         _portfolio_meta(portfolio), env=_cycle_env(signals_base),
     )
-    weights, _notes = pipeline_io.apply_rotation_overrides(portfolio.get("weights") or {}, state)
+    meta = _portfolio_meta(portfolio)
+    manual = pipeline_io.load_manual_overrides(meta, env=_cycle_env(signals_base))
+    weights = pipeline_io.effective_targets(portfolio.get("weights") or {}, state, None, manual)["targets"]
     own = set(portfolio.get("tickers") or [])
     return [ticker for ticker in weights if ticker not in own]
 

@@ -67,6 +67,54 @@ add up the fills of ALL ``fills_<optimizer>_<stamp>*.json`` / ``*.bak`` files of
 portfolio (a day-1 file that was overwritten and kept as ``.bak`` still counts), with
 the same dedupe, so a fill present in two files counts once.
 
+Manual overrides, ``manual_overrides.json`` (written by ARES, read by every script)
+-----------------------------------------------------------------------------------
+When Isaac approves or rejects a replacement / rotation that differs from the one the
+pipeline proposed, ARES records it in ``<PIPELINE_DIR>/state/manual_overrides.json``
+(``MANUAL_OVERRIDES_FILE`` overrides the path). One file for all portfolios, keyed like
+the fills files (``<optimizer>_<run_ts stamp>``, see ``portfolio_key``)::
+
+    {"schema_version": 1, "updated_ts": "2026-10-09T10:02:11-05:00",
+     "portfolios": {"quadratic_utility_20261008T121253": {
+       "account_id": "ACC-123",
+       "overrides": [{
+         "id": "ovr-20261009-001",
+         "ts": "2026-10-09T10:01:40-05:00",
+         "action": "replace",
+         "replaced_ticker": "FTNT", "chosen_ticker": "MRK", "target_weight": 0.0462,
+         "source_script": "drawdown_rotation", "approved_by": "isaac",
+         "fills": ["deal-123"], "note": "Isaac prefers MRK over FTNT"}]}}}
+
+Entry fields: ``id`` (unique within the portfolio), ``ts`` (ISO-8601 WITH a UTC offset),
+``action``, ``replaced_ticker``, ``chosen_ticker``, ``target_weight`` (portfolio weight
+as a fraction, same units as ``target_weight`` in the signals), ``approved_by`` (all
+required) and ``source_script``, ``fills`` (deal ids), ``note`` (optional). Per action:
+
+=========  ===============  ===============  ===============  ======================================
+action     replaced_ticker  chosen_ticker    target_weight    effect
+=========  ===============  ===============  ===============  ======================================
+replace    required         required (!=)    required (0, 1]  replaced never BUY; chosen target set
+add        null             required         required (0, 1]  chosen target set
+reject     required         null             null (or 0)      ticker (the rejected proposal) never BUY
+remove     required         null             null (or 0)      ticker taken out; never BUY
+=========  ===============  ===============  ===============  ======================================
+
+Entries are replayed oldest ``ts`` first (file order breaks ties); the latest word on a
+ticker wins, so an ``add`` after a ``remove`` brings it back. ``load_manual_overrides``
+reads it (never raises), ``validate_manual_overrides`` lists every problem with its path,
+``effective_targets`` merges it with the rotation state (precedence: manual overrides >
+rotation ``target_overrides`` / entry ``pending_targets`` > portfolio file), and
+``buy_gate`` / ``apply_buy_gate`` decide, per BUY, between ``BUY``, dropped (blocked) and
+``REQUIRES_VERIFICATION``. A missing file, or no section for the portfolio, changes
+nothing. An invalid file is warned about, never crashes a cycle, and the tickers it may
+affect get ``REQUIRES_VERIFICATION`` instead of BUY (see ``load_manual_overrides``).
+
+``REQUIRES_VERIFICATION`` is emitted in place of ``BUY``: ``action`` and ``status`` are
+both ``"REQUIRES_VERIFICATION"``, ``verification_reason`` says why and ``original_action``
+is ``"BUY"``. The executor must NOT place an order for it: it asks Isaac, and on approval
+records an ``add`` / ``replace`` override (or ``reject`` / ``remove``); the next run
+emits a normal BUY (or nothing).
+
 Entry phase (days 1..5 of a portfolio)
 --------------------------------------
 ``entry_phase_info`` counts NYSE sessions from day 1 of the portfolio's entry
@@ -1596,6 +1644,471 @@ def apply_rotation_overrides(weights: dict, state) -> tuple[dict, list[str]]:
         elif abs(before - number) > 1e-9:
             notes.append(f"{ticker}: target {before:.4f} -> {number:.4f} by drawdown_rotation")
     return out, notes
+
+
+# ------------------------------------------------------------------------------
+# Manual overrides (ARES -> entry_signal_tool, drawdown_rotation, active_management)
+# ------------------------------------------------------------------------------
+MANUAL_OVERRIDES_VERSION = 1
+MANUAL_OVERRIDES_ENV = "MANUAL_OVERRIDES_FILE"
+STRICT_GATE_ENV = "MANUAL_OVERRIDES_STRICT_GATE"
+OVERRIDE_ACTIONS = ("replace", "reject", "add", "remove")
+REQUIRES_VERIFICATION = "REQUIRES_VERIFICATION"
+GATE_BUY = "BUY"
+GATE_BLOCKED = "BLOCKED"
+_REPLACED_REQUIRED = ("replace", "reject", "remove")
+_CHOSEN_REQUIRED = ("replace", "add")
+
+
+def manual_overrides_path(env=None) -> str:
+    """``MANUAL_OVERRIDES_FILE``, else ``<pipeline dir>/state/manual_overrides.json``.
+
+    One file for every portfolio: the document is keyed by ``portfolio_key``."""
+    env = os.environ if env is None else env
+    explicit = env.get(MANUAL_OVERRIDES_ENV)
+    if explicit:
+        return explicit
+    return os.path.join(pipeline_dir(env), "state", "manual_overrides.json")
+
+
+def strict_gate_enabled(env=None) -> bool:
+    """``MANUAL_OVERRIDES_STRICT_GATE`` truthy: names that only the rotation state brings in
+    (never bought, not in the portfolio file) also need verification."""
+    env = os.environ if env is None else env
+    return str(env.get(STRICT_GATE_ENV) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _canon_ticker(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip().upper()
+    return text or None
+
+
+def _iso_with_offset(value) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        moment = datetime.fromisoformat(re.sub(r"Z$", "+00:00", value.strip()))
+    except ValueError:
+        return None
+    return moment if moment.tzinfo is not None else None
+
+
+def _check_override_entry(entry, where: str):
+    """``(errors, normalized)`` for one override. ``normalized`` is None with any error."""
+    if not isinstance(entry, dict):
+        return [f"{where}: must be an object"], None
+    errors: list[str] = []
+    label = f"{where} (id {entry['id']!r})" if isinstance(entry.get("id"), str) and entry["id"].strip() else where
+
+    ident = entry.get("id")
+    if not isinstance(ident, str) or not ident.strip():
+        errors.append(f"{label}: 'id' must be a non-empty string")
+    if _iso_with_offset(entry.get("ts")) is None:
+        errors.append(f"{label}: 'ts' must be an ISO-8601 timestamp with a UTC offset, got {entry.get('ts')!r}")
+    action = entry.get("action")
+    if action not in OVERRIDE_ACTIONS:
+        errors.append(f"{label}: 'action' must be one of {', '.join(OVERRIDE_ACTIONS)}, got {action!r}")
+    approved = entry.get("approved_by")
+    if not isinstance(approved, str) or not approved.strip():
+        errors.append(f"{label}: 'approved_by' must be a non-empty string")
+
+    replaced_raw, chosen_raw = entry.get("replaced_ticker"), entry.get("chosen_ticker")
+    replaced, chosen = _canon_ticker(replaced_raw), _canon_ticker(chosen_raw)
+    if action in _REPLACED_REQUIRED and replaced is None:
+        errors.append(f"{label}: 'replaced_ticker' must be a ticker for action {action!r}")
+    if action == "add" and replaced_raw is not None:
+        errors.append(f"{label}: 'replaced_ticker' must be null for action 'add'")
+    if action in _CHOSEN_REQUIRED and chosen is None:
+        errors.append(f"{label}: 'chosen_ticker' must be a ticker for action {action!r}")
+    if action in ("reject", "remove") and chosen_raw is not None:
+        errors.append(f"{label}: 'chosen_ticker' must be null for action {action!r}")
+    if action == "replace" and replaced is not None and replaced == chosen:
+        errors.append(f"{label}: 'chosen_ticker' must differ from 'replaced_ticker'")
+
+    weight_raw = entry.get("target_weight")
+    weight = _as_float(weight_raw)
+    if action in _CHOSEN_REQUIRED:
+        if weight is None or not 0 < weight <= 1:
+            errors.append(f"{label}: 'target_weight' must be a number in (0, 1] for action {action!r}, "
+                          f"got {weight_raw!r}")
+    elif action in ("reject", "remove") and weight_raw is not None and weight != 0:
+        errors.append(f"{label}: 'target_weight' must be null for action {action!r}")
+
+    fills = entry.get("fills")
+    if fills is not None and not (isinstance(fills, list) and all(isinstance(f, str) for f in fills)):
+        errors.append(f"{label}: 'fills' must be a list of deal id strings or null")
+    for field in ("source_script", "note"):
+        if entry.get(field) is not None and not isinstance(entry.get(field), str):
+            errors.append(f"{label}: {field!r} must be a string or null")
+    if errors:
+        return errors, None
+    return [], {
+        "id": ident.strip(), "ts": entry["ts"], "action": action,
+        "replaced_ticker": replaced, "chosen_ticker": chosen,
+        "target_weight": weight if action in _CHOSEN_REQUIRED else None,
+        "source_script": entry.get("source_script"), "approved_by": approved.strip(),
+        "fills": list(fills or []), "note": entry.get("note"),
+    }
+
+
+def _scan_manual_overrides(doc) -> dict:
+    """Validate a whole document. ``errors`` are document-level and fatal (nothing in the
+    file can be trusted); ``warnings`` do not change what is applied; ``portfolios`` maps
+    each key to ``{fatal, errors, entries, named, account_id}`` (``named``: tickers written
+    in entries that failed validation, so their meaning is unknown)."""
+    out = {"errors": [], "warnings": [], "portfolios": {}}
+    if not isinstance(doc, dict):
+        out["errors"].append("top level must be a JSON object")
+        return out
+    if doc.get("schema_version") != MANUAL_OVERRIDES_VERSION:
+        out["errors"].append(
+            f"'schema_version' must be {MANUAL_OVERRIDES_VERSION}, got {doc.get('schema_version')!r}")
+        return out
+    if doc.get("updated_ts") is not None and _iso_with_offset(doc.get("updated_ts")) is None:
+        out["warnings"].append(
+            f"'updated_ts' should be an ISO-8601 timestamp with a UTC offset, got {doc.get('updated_ts')!r}")
+    portfolios = doc.get("portfolios")
+    if not isinstance(portfolios, dict):
+        out["errors"].append("'portfolios' must be an object keyed by <optimizer>_<run_ts stamp>")
+        return out
+    for key, section in portfolios.items():
+        info = {"fatal": False, "errors": [], "entries": [], "named": set(), "account_id": None}
+        out["portfolios"][key] = info
+        prefix = f"portfolios[{key!r}]"
+        if not isinstance(section, dict):
+            info["fatal"] = True
+            info["errors"].append(f"{prefix}: must be an object")
+            continue
+        account = section.get("account_id")
+        if account is not None and not isinstance(account, str):
+            out["warnings"].append(f"{prefix}: 'account_id' should be a string")
+        else:
+            info["account_id"] = account
+        entries = section.get("overrides")
+        if not isinstance(entries, list):
+            info["fatal"] = True
+            info["errors"].append(f"{prefix}: 'overrides' must be a list")
+            continue
+        seen = set()
+        for index, raw in enumerate(entries):
+            errors, normalized = _check_override_entry(raw, f"{prefix}.overrides[{index}]")
+            if normalized is not None and normalized["id"] in seen:
+                errors.append(f"{prefix}.overrides[{index}] (id {normalized['id']!r}): duplicate id")
+                normalized = None
+            if normalized is not None:
+                seen.add(normalized["id"])
+                normalized["_order"] = index
+                info["entries"].append(normalized)
+                continue
+            info["errors"] += errors
+            if isinstance(raw, dict):
+                info["named"].update(t for t in (_canon_ticker(raw.get("replaced_ticker")),
+                                                 _canon_ticker(raw.get("chosen_ticker"))) if t)
+    return out
+
+
+def validate_manual_overrides(doc) -> list[str]:
+    """Every problem of a parsed ``manual_overrides.json``; ``[]`` means it is valid.
+
+    Each message names the portfolio key, the position in ``overrides`` and the field."""
+    scan = _scan_manual_overrides(doc)
+    problems = list(scan["errors"]) + list(scan["warnings"])
+    for info in scan["portfolios"].values():
+        problems += info["errors"]
+    return problems
+
+
+def _empty_overrides(portfolio_meta, path: str, status: str = "absent") -> dict:
+    return {
+        "status": status, "path": path, "key": portfolio_key(portfolio_meta) or "hardcoded_fallback",
+        "account_id": None, "entries": [], "blocked": {}, "chosen": {}, "unverified": {},
+        "unverified_all_state": False, "errors": [], "warnings": [],
+    }
+
+
+def _resolve_override_entries(entries: list[dict]):
+    """Replay the valid entries oldest first (file order breaks ties): the latest word on a
+    ticker wins, so ``add`` after ``remove`` brings it back."""
+    blocked: dict = {}
+    chosen: dict = {}
+    ordered = sorted(entries, key=lambda e: (_iso_with_offset(e["ts"]), e["_order"]))
+    for entry in ordered:
+        action, replaced, new = entry["action"], entry["replaced_ticker"], entry["chosen_ticker"]
+        label = f"{action} by {entry['approved_by']} at {entry['ts']} (override {entry['id']})"
+        if replaced:
+            blocked[replaced] = {"id": entry["id"], "action": action, "reason": label}
+            chosen.pop(replaced, None)
+        if new:
+            chosen[new] = {"id": entry["id"], "action": action, "target_weight": entry["target_weight"],
+                           "replaced_ticker": replaced}
+            blocked.pop(new, None)
+    return blocked, chosen
+
+
+def load_manual_overrides(portfolio_meta, path: str | None = None, env=None) -> dict:
+    """Manual overrides of THIS portfolio from ``manual_overrides.json``. Never raises.
+
+    ``status`` is ``"absent"`` (no file, or nothing for this portfolio: behaviour unchanged),
+    ``"ok"`` or ``"invalid"``. Invalid input is warned about and never trusted blindly:
+    entries that pass validation still apply, and every ticker named by an entry that does
+    not is in ``unverified`` (the consumers emit ``REQUIRES_VERIFICATION`` for it instead of
+    BUY). When the file cannot be read at all, is not JSON, has another ``schema_version`` or
+    this portfolio's section is malformed, ``unverified_all_state`` is True: which tickers it
+    meant is unknown, so every ticker that comes only from the rotation / entry state needs
+    verification (``effective_targets`` lists them in ``unverified``).
+
+    Result keys: ``status, path, key, account_id, entries`` (valid, normalized),
+    ``blocked`` ({ticker: {id, action, reason}}: replaced / rejected / removed, never BUY),
+    ``chosen`` ({ticker: {id, action, target_weight, replaced_ticker}}), ``unverified``
+    ({ticker: reason}), ``unverified_all_state``, ``errors``, ``warnings``.
+    """
+    env = os.environ if env is None else env
+    path = path or manual_overrides_path(env)
+    result = _empty_overrides(portfolio_meta, path)
+    if not os.path.isfile(path):
+        return result
+
+    def fail(message: str) -> dict:
+        message = f"manual overrides {path}: {message}"
+        _warn(f"{message}. Tickers that come only from the rotation / entry state are marked "
+              f"{REQUIRES_VERIFICATION} until the file is fixed.")
+        result.update(status="invalid", unverified_all_state=True)
+        result["errors"].append(message)
+        return result
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            doc = json.load(handle)
+    except OSError as exc:
+        return fail(f"could not be read ({exc})")
+    except ValueError as exc:
+        return fail(f"is not valid JSON ({exc})")
+    scan = _scan_manual_overrides(doc)
+    if scan["errors"]:
+        return fail("; ".join(scan["errors"]))
+    for message in scan["warnings"]:
+        _warn(f"manual overrides {path}: {message}")
+        result["warnings"].append(message)
+
+    key = result["key"]
+    for other, info in scan["portfolios"].items():
+        if other != key:
+            for message in info["errors"]:
+                _warn(f"manual overrides {path}: {message} (another portfolio; ignored here)")
+    info = scan["portfolios"].get(key)
+    if info is None:
+        return result
+    result["account_id"] = info["account_id"]
+    if info["fatal"]:
+        return fail("; ".join(info["errors"]))
+    result["status"] = "ok"
+    result["entries"] = info["entries"]
+    result["blocked"], result["chosen"] = _resolve_override_entries(info["entries"])
+    if info["errors"]:
+        result["status"] = "invalid"
+        result["errors"] = list(info["errors"])
+        for message in info["errors"]:
+            _warn(f"manual overrides {path}: {message}. Its tickers are marked {REQUIRES_VERIFICATION}.")
+        for ticker in sorted(info["named"]):
+            result["unverified"][ticker] = (
+                f"named by an invalid entry of manual_overrides.json ({path})")
+        if not info["named"]:
+            result["unverified_all_state"] = True
+    return result
+
+
+def _key_for(mapping: dict, canon: str):
+    for key in mapping:
+        if _canon_ticker(str(key)) == canon:
+            return key
+    return None
+
+
+def _rotation_names(rotation_state) -> set[str]:
+    out = set()
+    for ticker, value in ((rotation_state or {}).get("target_overrides") or {}).items():
+        number = _as_float(value)
+        if number is not None and number > _ZERO_WEIGHT:
+            out.add(_canon_ticker(str(ticker)) or "")
+    out.discard("")
+    return out
+
+
+def _pending_targets(*states) -> dict:
+    out: dict = {}
+    for state in states:
+        raw = (state or {}).get("pending_targets")
+        if not isinstance(raw, dict):
+            continue
+        for ticker, value in raw.items():
+            number = _as_float(value)
+            if number is not None and number > 0:
+                out[str(ticker)] = number
+    return out
+
+
+def effective_targets(weights: dict, rotation_state=None, entry_state=None, overrides=None) -> dict:
+    """Target weights after the rotation state AND the manual overrides.
+
+    Precedence, highest first: manual overrides (``load_manual_overrides``), the rotation
+    state's ``target_overrides``, the portfolio file's ``weights``. The entry state's
+    ``pending_targets`` (and the rotation state's, if it has any) are cleaned the same way:
+    a replaced / rejected / removed ticker leaves them and a chosen one carries the override
+    target. Without overrides the result is exactly ``apply_rotation_overrides``.
+
+    Returns ``{"targets", "notes", "override_notes", "pending_targets", "blocked", "chosen",
+    "unverified", "rotation_names"}``. ``blocked`` / ``chosen`` / ``unverified`` are keyed by
+    upper-case ticker. ``unverified`` also lists, when the overrides file is unusable as a
+    whole (``unverified_all_state``), every ticker present only through the rotation state or
+    the pending targets.
+    """
+    targets, notes = apply_rotation_overrides(weights, rotation_state)
+    pending = _pending_targets(rotation_state, entry_state)
+    names = _rotation_names(rotation_state)
+    ov = overrides or {}
+    blocked, chosen = dict(ov.get("blocked") or {}), dict(ov.get("chosen") or {})
+    unverified = dict(ov.get("unverified") or {})
+    override_notes: list[str] = []
+
+    for canon, info in sorted(blocked.items()):
+        for book, label in ((targets, "target"), (pending, "pending target")):
+            found = _key_for(book, canon)
+            if found is not None:
+                del book[found]
+                override_notes.append(f"{found}: {label} removed by manual override ({info['reason']})")
+    for canon, info in sorted(chosen.items()):
+        found = _key_for(targets, canon) or canon
+        before = targets.get(found)
+        targets[found] = info["target_weight"]
+        text = (f"{found}: target {info['target_weight']:.4f} from manual override "
+                f"({info['action']}, {info['id']})")
+        override_notes.append(text if before is None else f"{text}; was {before:.4f}")
+        pending_key = _key_for(pending, canon)
+        if pending_key is not None:
+            pending[pending_key] = info["target_weight"]
+    if ov.get("unverified_all_state"):
+        state_only = set(names) | {_canon_ticker(t) for t in pending}
+        for canon in sorted(t for t in state_only if t):
+            unverified.setdefault(canon, "manual_overrides.json is invalid; the state target is unconfirmed")
+    return {
+        "targets": targets, "notes": notes, "override_notes": override_notes,
+        "pending_targets": pending, "blocked": blocked, "chosen": chosen,
+        "unverified": unverified, "rotation_names": names,
+    }
+
+
+def _held_names(holdings) -> set[str]:
+    rows = holdings or {}
+    if isinstance(rows.get("holdings"), dict):
+        rows = rows["holdings"]
+    return {t for t in (_canon_ticker(str(k)) for k in rows) if t}
+
+
+def buy_gate(ticker, effective: dict, portfolio_weights=None, holdings=None, strict=None,
+             own_picks=()) -> tuple[str, str | None]:
+    """May a signal emit BUY for ``ticker``? Returns ``(status, reason)``.
+
+    ``status`` is ``"BLOCKED"`` (replaced / rejected / removed by a manual override: never
+    BUY), ``"REQUIRES_VERIFICATION"`` or ``"BUY"``. In this order:
+
+    1. blocked by an override -> BLOCKED;
+    2. unverified (named by an invalid override entry, or state-only while the file is
+       unusable) -> REQUIRES_VERIFICATION;
+    3. chosen by an override, in the portfolio file, or in the net holdings / fills
+       (``holdings`` is ``load_portfolio_holdings`` or ``current_holdings``) -> BUY;
+    4. otherwise the ticker has no known origin -> REQUIRES_VERIFICATION. Names the rotation
+       brings in (``rotation_state`` ``target_overrides``) and ``own_picks`` (what the calling
+       script just selected itself) are the normal rotation flow and pass, unless
+       ``strict`` (default ``MANUAL_OVERRIDES_STRICT_GATE``) is on.
+    """
+    canon = _canon_ticker(str(ticker))
+    strict = strict_gate_enabled() if strict is None else strict
+    if canon in (effective.get("blocked") or {}):
+        return GATE_BLOCKED, effective["blocked"][canon]["reason"]
+    if canon in (effective.get("unverified") or {}):
+        return REQUIRES_VERIFICATION, effective["unverified"][canon]
+    if canon in (effective.get("chosen") or {}):
+        return GATE_BUY, None
+    if canon in {_canon_ticker(str(t)) for t in (portfolio_weights or {})} or canon in _held_names(holdings):
+        return GATE_BUY, None
+    if not strict and (canon in (effective.get("rotation_names") or set())
+                       or canon in {_canon_ticker(str(t)) for t in own_picks}):
+        return GATE_BUY, None
+    return REQUIRES_VERIFICATION, (
+        "not in the portfolio file, not in the net holdings / fills and not chosen in manual_overrides.json")
+
+
+def apply_buy_gate(rows, effective: dict, portfolio_weights=None, holdings=None, strict=None,
+                   own_picks=(), blocked_as: str = "drop") -> tuple[list, list]:
+    """Run ``buy_gate`` over the BUY rows of a signal. Returns ``(rows, flagged)``.
+
+    ``rows`` are dicts with ``ticker`` and ``action`` (entries, rebalances); rows that are
+    not BUY pass untouched. A BLOCKED row is dropped (``blocked_as="drop"``) or becomes a
+    HOLD at its current weight (``"hold"``, keeps one row per ticker). A REQUIRES_VERIFICATION
+    row keeps its place but ``action`` and ``status`` are ``"REQUIRES_VERIFICATION"`` and
+    ``verification_reason`` says why; the original action is in ``original_action``.
+    ``flagged`` lists ``{"ticker", "status", "reason"}`` for every row that changed.
+    """
+    out, flagged = [], []
+    for row in rows or []:
+        if not isinstance(row, dict) or str(row.get("action") or "").upper() != "BUY":
+            out.append(row)
+            continue
+        status, reason = buy_gate(row.get("ticker"), effective, portfolio_weights, holdings,
+                                  strict, own_picks)
+        if status == GATE_BUY:
+            out.append(row)
+            continue
+        flagged.append({"ticker": row.get("ticker"), "status": status, "reason": reason})
+        if status == REQUIRES_VERIFICATION:
+            out.append(dict(row, action=REQUIRES_VERIFICATION, status=REQUIRES_VERIFICATION,
+                            original_action="BUY", verification_reason=reason))
+        elif blocked_as == "hold":
+            current = row.get("current_weight")
+            out.append(dict(row, action="HOLD", target_weight=current, delta_weight=0.0,
+                            original_action="BUY", override_reason=reason))
+    return out, flagged
+
+
+def sanitize_entry_pending(estado, effective: dict):
+    """Entry state whose ``pending_targets`` follow the manual overrides: a blocked ticker
+    leaves, a chosen one carries the override target. The input is not modified; the same
+    object comes back when nothing changes."""
+    pending = (estado or {}).get("pending_targets")
+    if not pending:
+        return estado
+    blocked, chosen = effective.get("blocked") or {}, effective.get("chosen") or {}
+    cleaned, changed = {}, False
+    for ticker, value in pending.items():
+        canon = _canon_ticker(str(ticker))
+        if canon in blocked:
+            changed = True
+            continue
+        if canon in chosen and value != chosen[canon]["target_weight"]:
+            value, changed = chosen[canon]["target_weight"], True
+        cleaned[ticker] = value
+    if not changed:
+        return estado
+    out = copy.deepcopy(estado)
+    out["pending_targets"] = cleaned
+    return out
+
+
+def describe_overrides(overrides, effective: dict | None = None) -> dict | None:
+    """Short, JSON-ready summary for a signal's ``data`` (None when there is no file / entry)."""
+    ov = overrides or {}
+    if ov.get("status", "absent") == "absent":
+        return None
+    effective = effective or {}
+    return {
+        "status": ov["status"], "path": ov["path"], "key": ov["key"],
+        "blocked": {t: v["reason"] for t, v in sorted((effective.get("blocked") or ov["blocked"]).items())},
+        "chosen": {t: v["target_weight"] for t, v in sorted((effective.get("chosen") or ov["chosen"]).items())},
+        "unverified": dict(sorted((effective.get("unverified") or ov["unverified"]).items())),
+        "errors": list(ov.get("errors") or []),
+    }
 
 
 def load_fills(script: str = "entry_signal_tool", directory: str | None = None):

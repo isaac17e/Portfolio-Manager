@@ -17,16 +17,19 @@ from polygon_client import NO_OPTION_DATA, NoOptionData, PolygonClient, failure_
 from pipeline_io import (
     MIN_OPTION_DAYS,
     announce_signals_dir,
-    apply_rotation_overrides,
+    apply_buy_gate,
     cycle_today,
     entry_phase_info,
     entry_state_path,
     export_signals,
     close_empty_tranche,
+    describe_overrides,
+    effective_targets,
     fully_sold_tickers,
     invested_fraction_from_holdings,
     load_active_management_targets,
     load_fills,
+    load_manual_overrides,
     load_pause_mark,
     load_portfolio,
     load_portfolio_fills,
@@ -39,6 +42,7 @@ from pipeline_io import (
     resolve_cycle_day,
     resolve_horizon,
     resolve_risk_free_rate,
+    sanitize_entry_pending,
     signal_cycle_number,
     stage_pending_entry,
     tranche_lock,
@@ -69,7 +73,13 @@ _PORTFOLIO_META = load_portfolio(PESOS_OBJETIVO)
 # pesos que cambio: el activo que cayo queda recortado (o sale si se liquido) y
 # los nuevos entran con su parte del peso liberado, escalonados por este ciclo.
 ESTADO_ROTACION = load_rotation_state(_PORTFOLIO_META)
-PESOS_OBJETIVO, NOTAS_ROTACION = apply_rotation_overrides(_PORTFOLIO_META["weights"], ESTADO_ROTACION)
+# ARES deja en manual_overrides.json lo que Isaac cambio a mano (reemplazos,
+# rechazos, altas, bajas): manda sobre el estado de rotacion y el pendiente de entrada.
+OVERRIDES_MANUALES = load_manual_overrides(_PORTFOLIO_META)
+_EFECTIVOS_INICIALES = effective_targets(_PORTFOLIO_META["weights"], ESTADO_ROTACION, None, OVERRIDES_MANUALES)
+PESOS_OBJETIVO = _EFECTIVOS_INICIALES["targets"]
+NOTAS_ROTACION = _EFECTIVOS_INICIALES["notes"]
+NOTAS_OVERRIDES = _EFECTIVOS_INICIALES["override_notes"]
 TICKERS = list(PESOS_OBJETIVO.keys())
 # Activos cuyo peso objetivo bajo por una rotacion: no se les compra mas (la
 # rotacion vende parte del activo; seguir llenandolo la contradiria).
@@ -889,6 +899,7 @@ def _contexto(estado, warnings, excluded, dia_ciclo, ciclo, pending_cash=None, p
         "cycle": ciclo,
         "pending_cash": pending_cash or {},
         "pending_decisions": pending_decisions or {},
+        "holdings": tenencias or {},
     }
 
 
@@ -1006,6 +1017,41 @@ def construir_fila_estado(fila, pct_previo, peso_original, dia_ciclo, ciclo, his
     }
 
 
+def objetivos_efectivos(estado=None):
+    """pipeline_io.effective_targets con el estado de rotacion y los overrides vigentes."""
+    return effective_targets(_PORTFOLIO_META["weights"], ESTADO_ROTACION, estado, OVERRIDES_MANUALES)
+
+
+def _avisos_overrides():
+    """Avisos de manual_overrides.json para el signal: notas de lo aplicado, errores y
+    tickers que quedan en REQUIRES_VERIFICATION."""
+    avisos = []
+    for nota in NOTAS_OVERRIDES:
+        print(f"  [override] {nota}")
+        avisos.append(f"manual override: {nota}")
+    for error in OVERRIDES_MANUALES.get("errors") or []:
+        print(f"  [override] {error}")
+        avisos.append(f"manual overrides invalid: {error}")
+    for ticker, motivo in sorted(objetivos_efectivos()["unverified"].items()):
+        avisos.append(f"{ticker}: {motivo}; BUY becomes REQUIRES_VERIFICATION")
+    return avisos
+
+
+def aplicar_compuerta(entries, tenencias):
+    """Pasa las entries BUY por pipeline_io.apply_buy_gate. Devuelve (entries, marcadas).
+
+    Un ticker reemplazado / rechazado / quitado a mano no sale como BUY; uno sin origen
+    conocido (ni en el portafolio, ni en fills, ni elegido a mano) sale como
+    REQUIRES_VERIFICATION."""
+    salida, marcadas = apply_buy_gate(
+        entries, objetivos_efectivos(), _PORTFOLIO_META["weights"], tenencias,
+    )
+    for orden, entry in enumerate(salida, start=1):
+        if "order" in entry:
+            entry["order"] = orden
+    return salida, marcadas
+
+
 def _tramo_de_dia_anterior(bloqueo, estado, dia_calendario):
     """True when the tranche locked for today belongs to an earlier entry day than the calendar's.
 
@@ -1035,7 +1081,7 @@ def correr_entry_signal(cycle_day=None, invested_pct=None, force_new_tranche=Fal
     warnings = []
     excluded = []
 
-    estado = cargar_estado()
+    estado = sanitize_entry_pending(cargar_estado(), objetivos_efectivos())
     fills_payload = cargar_fills()
     hoy = cycle_today()
     fase = entry_phase_info(_PORTFOLIO_META, hoy)
@@ -1088,6 +1134,7 @@ def correr_entry_signal(cycle_day=None, invested_pct=None, force_new_tranche=Fal
         print(f"\n{aviso}")
         return pd.DataFrame(), hist_df, _contexto(
             estado, warnings, excluded, dia_ciclo, estado.get("ciclo"), locked=bloqueo,
+            tenencias=tenencias,
         )
     if day_warn:
         warnings.append(day_warn)
@@ -1126,6 +1173,7 @@ def correr_entry_signal(cycle_day=None, invested_pct=None, force_new_tranche=Fal
     for nota in NOTAS_ROTACION:
         print(f"  [rotacion] {nota}")
         warnings.append(f"rotation: {nota}")
+    warnings.extend(_avisos_overrides())
 
     # Ciclo 1 = fase de entrada del portafolio. Su dia 5 (por ciclo o por sesiones
     # NYSE desde el dia 1) es obligatorio: se completa el 100% del objetivo.
@@ -1142,6 +1190,8 @@ def correr_entry_signal(cycle_day=None, invested_pct=None, force_new_tranche=Fal
         warnings.append(aviso)
     elif am_targets:
         rotados = set((ESTADO_ROTACION.get("target_overrides") or {}))
+        # Lo que Isaac fijo a mano tampoco lo retoca active_management.
+        rotados |= {t for t in objetivos if str(t).strip().upper() in objetivos_efectivos()["chosen"]}
         for ticker, nuevo in sorted(am_targets.items()):
             if ticker not in objetivos or ticker in rotados:
                 continue
@@ -1412,6 +1462,10 @@ def main(argv=None):
         # Nada que preparar: se escribe la senal con el estado y no se toca el
         # estado del portafolio (el tramo pendiente conserva su signal_run_ts).
         bloqueada = construir_senal_bloqueada(ctx["locked"])
+        previas = bloqueada["existing_tranche"]
+        previas["entries"], marcadas = aplicar_compuerta(previas["entries"], ctx.get("holdings"))
+        if marcadas:
+            bloqueada["flagged_by_override"] = marcadas
         bloqueada["horizon"] = HORIZON
         export_signals(
             "entry_signal_tool", bloqueada, _PORTFOLIO_META,
@@ -1420,6 +1474,14 @@ def main(argv=None):
         return
     imprimir_resumen(resumen)
     data = construir_senal_entrada(resumen)
+    data["entries"], marcadas = aplicar_compuerta(data["entries"], ctx.get("holdings"))
+    for item in marcadas:
+        ctx["warnings"].append(f"{item['ticker']}: {item['status']} ({item['reason']})")
+    if marcadas:
+        data["flagged_by_override"] = marcadas
+    resumen_overrides = describe_overrides(OVERRIDES_MANUALES, objetivos_efectivos())
+    if resumen_overrides:
+        data["manual_overrides"] = resumen_overrides
     data["signal"] = "new_tranche"
     data["horizon"] = HORIZON
     if data.get("cycle_day") is None:
@@ -1441,9 +1503,10 @@ def main(argv=None):
         except (OSError, json.JSONDecodeError):
             run_ts = None
         if run_ts:
+            compras = [entry for entry in data["entries"] if entry.get("action") == "BUY"]
             targets = {
                 entry["ticker"]: entry["target_weight"]
-                for entry in data["entries"]
+                for entry in compras
                 if entry.get("target_weight")
             }
             # Sin datos de ningun ticker no hubo tramo real: no se bloquea el dia.
@@ -1454,7 +1517,7 @@ def main(argv=None):
                 prepared_date=cycle_today().isoformat() if produjo_tramo else None,
                 tranche={key: data[key] for key in ("entries", "waiting", "cycle_day", "cycle")},
             )
-            if produjo_tramo and not data["entries"]:
+            if produjo_tramo and not compras:
                 # Sin ordenes no llegaran fills: el dia queda cerrado ahora (si no, el
                 # estado se quedaria en el dia anterior).
                 staged = close_empty_tranche(staged, DIAS_CICLO, today=cycle_today().isoformat())
